@@ -188,6 +188,80 @@ def stats(
 
 
 @app.command()
+def fill_pageviews(
+    concurrency: int = typer.Option(8, "--concurrency", "-c", help="Concurrent Wikimedia requests."),
+    log_level: str = typer.Option("INFO", "--log-level"),
+    log_format: str = typer.Option("pretty", "--log-format"),
+) -> None:
+    """Backfill pageview data for every genre that doesn't have it yet.
+
+    Safe to run against an already-populated DB: only genres with
+    monthly_views_p30 IS NULL are processed. Interrupted runs can be
+    restarted — they resume from where they left off.
+
+    Example (run once bootstrap is done):
+        wiki-genres fill-pageviews --concurrency 12
+    """
+    configure_logging(level=log_level, fmt=log_format)
+
+    async def _run_fill() -> None:
+        import asyncio
+        from sqlalchemy import text
+        from wiki_genres.db import get_engine
+        from wiki_genres.db_migrations import apply_migrations
+        from wiki_genres.crawler.fetcher import WikiFetcher
+        from wiki_genres.loader.loader import load_pageviews
+
+        await apply_migrations()
+
+        engine = get_engine()
+        async with engine.connect() as conn:
+            rows = (await conn.execute(
+                text("""
+                    SELECT id, wikipedia_title
+                    FROM wg_genres
+                    WHERE monthly_views_p30 IS NULL
+                      AND deleted_at IS NULL
+                    ORDER BY wikipedia_title
+                """)
+            )).fetchall()
+
+        total = len(rows)
+        typer.echo(f"Genres missing pageviews: {total}")
+        if not total:
+            return
+
+        fetcher = WikiFetcher()
+        sem = asyncio.Semaphore(concurrency)
+        done = 0
+        failed = 0
+
+        async def _one(genre_id: str, title: str) -> None:
+            nonlocal done, failed
+            async with sem:
+                try:
+                    result = await fetcher.fetch_pageviews(title)
+                    if result.ok:
+                        items = result.json().get("items", [])
+                        if items:
+                            await load_pageviews(genre_id, items)
+                    done += 1
+                    if done % 100 == 0:
+                        typer.echo(f"  {done}/{total} done, {failed} failed")
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    typer.echo(f"  WARN {title}: {exc}", err=True)
+
+        tasks = [asyncio.create_task(_one(r[0], r[1])) for r in rows]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await fetcher.aclose()
+
+        typer.echo(f"Done. filled={done} failed={failed} total={total}")
+
+    _run(_run_fill())
+
+
+@app.command()
 def refetch(
     title: str = typer.Argument(help="Wikipedia page title to re-crawl."),
     log_level: str = typer.Option("INFO", "--log-level"),
