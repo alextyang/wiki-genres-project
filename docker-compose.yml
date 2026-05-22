@@ -1,0 +1,45 @@
+# Development compose file. Production deployment alongside active-listener
+# will reuse the same images but a different orchestration.
+#
+# Postgres runs on 5433 to avoid colliding with active-listener's 5432.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: wiki-genres-postgres
+    environment:
+      POSTGRES_USER: wiki_genres
+      POSTGRES_PASSWORD: wiki_genres
+      POSTGRES_DB: wiki_genres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wiki_genres -d wiki_genres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Uncomment once src/wiki_genres/api/main.py is real. For M0 we just need pg.
+  #
+  # api:
+  #   build: .
+  #   command: uvicorn wiki_genres.api.main:app --host 0.0.0.0 --port 8080
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://wiki_genres:wiki_genres@postgres:5432/wiki_genres
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #
+  # sync_worker:
+  #   build: .
+  #   command: python -m wiki_genres.sync.worker
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://wiki_genres:wiki_genres@postgres:5432/wiki_genres
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: always
