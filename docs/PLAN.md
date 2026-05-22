@@ -37,73 +37,77 @@ For every music genre that has a Wikipedia article with `{{Infobox music genre}}
 
 The previous iteration of this plan embedded the crawler inside active-listener as a one-shot manual script. Three reasons it deserves its own home:
 
-1. **Cadence mismatch.** Wikipedia edits this graph constantly. A one-shot snapshot is stale within weeks. A continuously-syncing service amortises the engineering cost across every downstream consumer.
+1. **Cadence mismatch.** Wikipedia edits this graph constantly. A one-shot snapshot is stale within weeks. A weekly re-sync amortises the engineering cost across every downstream consumer and keeps the data fresh without operator intervention.
 2. **Reusability.** The graph is interesting beyond active-listener — to anyone doing music software, journalism, or research. Making it public turns sunk effort into shared infrastructure.
-3. **Operational separation.** A crawler subscribing to Wikipedia EventStreams has a different uptime model than a music app. Letting it fail independently keeps active-listener's runtime simple.
+3. **Operational separation.** Even a small weekly sync job has different failure modes than a music app. Letting it fail independently keeps active-listener's runtime simple.
 
-The trade-off is one more service to operate. Mitigated by co-locating it on the same VM as active-listener (see §8) and keeping the surface area minimal.
+The trade-off is one more service to operate. Mitigated by co-locating it on the same VM as active-listener (see §8) and keeping the surface area minimal — a single API process plus a weekly cron job.
+
+### 2.1 Why weekly, not real-time?
+
+Music-genre articles change slowly. New genres appear, infobox tweaks happen, but the underlying graph is fairly stable week-to-week. Downstream consumers (a music player tagging tracks) tolerate week-old data without any user-visible degradation. Real-time sync (Wikipedia EventStreams) would require a persistent SSE subscriber, cursor management, a frontier worker pool, and reconnect logic — all to lower latency from days to seconds for data nobody needs in seconds. Skipped.
 
 ---
 
 ## 3. Architecture overview
 
 ```
-                  ┌─────────────────────────────────────────────┐
-                  │            UPSTREAM (Wikimedia)             │
-                  │                                             │
-                  │  ┌─────────────┐  ┌──────────────────────┐  │
-                  │  │ en.wiki API │  │ Wikidata SPARQL/API  │  │
-                  │  └──────┬──────┘  └──────────┬───────────┘  │
-                  │         │       ┌────────────┴───────────┐  │
-                  │         │       │  stream.wikimedia.org  │  │
-                  │         │       │  (EventStreams / SSE)  │  │
-                  │         │       └────────────┬───────────┘  │
-                  └─────────┼────────────────────┼──────────────┘
-                            │                    │
-              ╔═════════════▼════════════════════▼══════════════╗
-              ║                                                  ║
-              ║   wiki-genres service (single VM, dockerised)    ║
-              ║                                                  ║
-              ║   ┌────────────────┐    ┌────────────────────┐   ║
-              ║   │  api  (FastAPI)│    │  sync_worker       │   ║
-              ║   │   - /genres    │    │   - SSE subscriber │   ║
-              ║   │   - /search    │    │   - frontier queue │   ║
-              ║   │   - /healthz   │    │   - reconciler     │   ║
-              ║   └───────┬────────┘    └─────────┬──────────┘   ║
-              ║           │                       │              ║
-              ║           ▼                       ▼              ║
-              ║   ┌───────────────────────────────────────────┐  ║
-              ║   │           Postgres (graph + log)          │  ║
-              ║   └───────────────────────────────────────────┘  ║
-              ║                                                  ║
-              ║   ┌─────────────────┐   ┌────────────────────┐   ║
-              ║   │  scheduler      │   │  bootstrap_runner  │   ║
-              ║   │   - nightly     │   │   - full crawl     │   ║
-              ║   │     SPARQL diff │   │   - dump audit     │   ║
-              ║   │   - weekly      │   │   (manual / cron)  │   ║
-              ║   │     reconcile   │   └────────────────────┘   ║
-              ║   └─────────────────┘                            ║
-              ╚══════════════════════════════════════════════════╝
+                  ┌─────────────────────────────────────┐
+                  │       UPSTREAM (Wikimedia)          │
+                  │  ┌─────────────┐  ┌──────────────┐  │
+                  │  │ en.wiki API │  │ Wikidata API │  │
+                  │  └──────┬──────┘  └──────┬───────┘  │
+                  └─────────┼─────────────────┼──────────┘
+                            │                 │
+              ╔═════════════▼═════════════════▼═══════════════╗
+              ║                                                ║
+              ║   wiki-genres service (single VM, dockerised)  ║
+              ║                                                ║
+              ║   ┌────────────────┐                           ║
+              ║   │  api (FastAPI) │   ◄── always-on, reads    ║
+              ║   │   - /genres    │                           ║
+              ║   │   - /search    │                           ║
+              ║   │   - /diff      │                           ║
+              ║   │   - /healthz   │                           ║
+              ║   └───────┬────────┘                           ║
+              ║           │                                    ║
+              ║           ▼                                    ║
+              ║   ┌─────────────────────────────────────────┐  ║
+              ║   │        Postgres (graph + log)           │  ║
+              ║   └────────────────────┬────────────────────┘  ║
+              ║                        ▲                       ║
+              ║                        │                       ║
+              ║   ┌────────────────────┴────────────────────┐  ║
+              ║   │  weekly sync (cron, one-shot per run)   │  ║
+              ║   │   1. SPARQL: find new genres            │  ║
+              ║   │   2. Refetch pages with stale data      │  ║
+              ║   │   3. Re-resolve unresolved edges        │  ║
+              ║   │   4. Write snapshot diff                │  ║
+              ║   └─────────────────────────────────────────┘  ║
+              ║                                                ║
+              ║   ┌──────────────────┐                         ║
+              ║   │ bootstrap / cli  │   ◄── on-demand only    ║
+              ║   └──────────────────┘                         ║
+              ╚════════════════════════════════════════════════╝
                               │
                               ▼
-                      ┌───────────────┐
-                      │   consumers   │
-                      │ active-listener│
-                      │  others...    │
-                      └───────────────┘
+                      ┌─────────────────┐
+                      │    consumers    │
+                      │ active-listener │
+                      │   others...     │
+                      └─────────────────┘
 ```
 
-Five logical processes, one repo, one Postgres:
+Two long-running pieces and a weekly cron — that's the entire system:
 
 | Process | Purpose | Long-running? |
 |---|---|---|
 | `api` | Public HTTP API. Read-only over the graph. | Yes (FastAPI/uvicorn). |
-| `sync_worker` | Subscribes to Wikipedia EventStreams; refetches changed genre pages. | Yes (one SSE connection). |
-| `scheduler` | Cron-style periodic jobs (Wikidata SPARQL diff, reconciler, dump audit). | Yes (APScheduler). |
-| `bootstrap_runner` | Full crawl from seed set. Idempotent. Used for initial fill + monthly audit. | No (run on demand). |
-| `cli` | Operator interface — inspect frontier, kick a refetch, rebuild materialised views. | No. |
+| `sync` | Weekly job: SPARQL seed diff → refetch stale pages → resolve edges → snapshot. | No (one-shot, cron-driven). |
+| `bootstrap` | Full crawl from seed set. Idempotent. Used for initial fill, or to rebuild from scratch. | No (run on demand). |
+| `cli` | Operator interface — inspect frontier, kick a refetch, print stats. | No. |
 
-All five share one library (`src/wiki_genres/`). Different entry points; same code.
+All four share one library (`src/wiki_genres/`). Different entry points; same code. The weekly sync is literally a `bootstrap` invocation with a staleness filter — same fetcher, same parser, same loader.
 
 ---
 
@@ -205,7 +209,7 @@ wg_revisions (
     upstream_revision   bigint not null,
     fetched_at          timestamptz not null,
     content_sha256      text not null,
-    triggered_by        text not null,           -- 'bootstrap' | 'eventstream' | 'sparql' | 'reconciler' | 'manual'
+    triggered_by        text not null,           -- 'bootstrap' | 'sync' | 'manual'
     diff_summary        jsonb,                   -- {edges_added: 3, aliases_removed: 1, ...}
     primary key (genre_id, upstream_revision)
 )
@@ -214,12 +218,12 @@ wg_frontier (
     title               text primary key,
     enqueued_at         timestamptz not null,
     not_before          timestamptz not null,    -- backoff support
-    reason              text not null,           -- 'seed' | 'eventstream' | 'wikilink' | 'manual'
+    reason              text not null,           -- 'seed' | 'wikilink' | 'manual' | 'sync_stale' | 'sync_new'
     attempts            integer not null default 0
 )
 
 wg_sync_state (
-    key                 text primary key,        -- 'eventstream_offset', 'last_sparql_run', etc.
+    key                 text primary key,        -- 'last_sync_started_at', 'last_sync_finished_at', etc.
     value               jsonb not null,
     updated_at          timestamptz not null
 )
@@ -318,77 +322,39 @@ Unresolved edges are re-resolved on every reconciler pass (§6.3) — they often
 
 ---
 
-## 6. Continuous sync
+## 6. Weekly sync
 
-This is the part that justifies the service existing. Three layers running concurrently:
+One job, runs on a cron, completes in minutes. Same code as the bootstrap pipeline (§5) — just invoked with a staleness filter and the existing seed query.
 
-### 6.1 Layer 1 — EventStreams (real-time)
+### 6.1 What the job does
 
-[`stream.wikimedia.org/v2/stream/recentchange`](https://stream.wikimedia.org/v2/stream/recentchange) is a public SSE feed of every Wikimedia edit. The `sync_worker` subscribes with these filters applied client-side:
+1. **Discover new genres.** Re-run the seed SPARQL query (§5.1). Any QID not yet in `wg_genres` is enqueued onto `wg_frontier` with `reason='sync_new'`.
+2. **Refresh stale pages.** Enqueue every genre whose `last_fetched_at` is older than the staleness budget (default 7 days) with `reason='sync_stale'`. This naturally amortises the load: ~700 fetches per weekly run for a ~5k-genre graph at a 7-day budget.
+3. **Drain the frontier.** Same fetch + parse + load pipeline as the bootstrap. New pages get added; existing pages get diffed against the previous fetch and `wg_revisions` records the change.
+4. **Re-resolve unresolved edges.** Run the pass-2 resolver (`resolve_edges`) — edges that previously had `to_genre_id IS NULL` may now resolve because new genres were just loaded.
+5. **Write a snapshot.** Insert a `wg_snapshots` row summarising what changed (genres added/updated, edges added/removed, parse errors).
 
-- `wiki == 'enwiki'`
-- `namespace == 0`
-- `type in {'edit', 'new'}` (or `'log'` with `log_action == 'move'` for renames)
+### 6.2 What it does *not* do
 
-For each matching event:
+- **No real-time subscription.** Wikipedia EventStreams is out of scope. The latency cost (days, not seconds) is acceptable for the use case, and the operational cost (persistent SSE, cursor management, reconnect logic, a worker pool) is not.
+- **No deletes from upstream.** A QID disappearing from the seed query does not delete the row — it sets `wg_genres.deleted_at = NULL` only after manual confirmation via the CLI. Wikidata reclassifications happen all the time and we'd rather keep stale data than lose it silently.
 
-1. **Fast path.** If `title` is already in `wg_genres.wikipedia_title` (or any `wg_aliases.alias` / `wg_redirects.from_title`), enqueue a refetch into `wg_frontier`.
-2. **Slow path.** If the title is new to us, fire a cheap `prop=templates&tltemplates=Template:Infobox+music+genre` check. If positive, enqueue. Cache the negative result for 30 days to avoid re-checking pages that aren't genres.
+### 6.3 How it runs
 
-The frontier is drained by a small pool of workers that re-run the bootstrap parse+load pipeline for just that one page. Latency target: edit → DB updated < 60 s p95.
+Two equally good options; pick one operationally:
 
-Resilience:
-- SSE connection drops are normal. Reconnect with `Last-Event-ID` to resume from the last cursor stored in `wg_sync_state`.
-- If the stream is unavailable for > 1 hour, the reconciler (§6.3) covers the gap.
+- **System cron** on the VM: `0 6 * * 0 docker compose run --rm wiki-genres sync` (Sundays 06:00 UTC). Simplest possible setup; the sync container exits when done. The `cron` daemon is the only scheduler.
+- **APScheduler inside the API process**: same job triggered in-process. Avoids a second container, but couples the API's uptime to the sync schedule. Preferred only if the VM doesn't have cron.
 
-### 6.2 Layer 2 — Scheduled SPARQL diff (nightly)
+Either way, the sync is a single invocation of `wiki-genres sync` (a new CLI command — see §10). It writes its progress to logs and `wg_sync_state`. If it crashes mid-run, the next invocation picks up where it left off (the frontier is durable).
 
-The seed SPARQL query (§5.1) is re-run nightly. New QIDs not in `wg_genres` are enqueued onto the frontier. QIDs that vanish are *not* deleted — they're flagged for human review (`wg_genres.deleted_at` only set after manual confirmation). This catches:
+### 6.4 Catching up after downtime
 
-- Brand-new genres added to Wikidata.
-- Reclassifications (an artist being mis-flagged as a genre, then corrected — we want to *keep* the data until we understand the change).
+The sync has no built-in concept of "missed runs" because it doesn't need one. Whether it last ran 7 days or 30 days ago, the next invocation refetches the same pages — `wg_genres.last_fetched_at < now() - interval '7 days'` simply matches more rows after a longer gap. The frontier soaks up the work and processes it.
 
-### 6.3 Layer 3 — Reconciler (weekly)
+### 6.5 Optional: monthly dump audit
 
-Full graph integrity pass. For every genre:
-
-- Refetch if `last_fetched_at` is older than the staleness budget (default 30 days).
-- Re-resolve any edges with `to_genre_id IS NULL`.
-- Sanity-check: number of edges, presence of infobox, summary length.
-- Output a report into `wg_snapshots` with diffs since the last run.
-
-This is the safety net. If layer 1 or 2 silently fails, the reconciler still converges the graph eventually.
-
-### 6.4 Layer 4 — Dump audit (monthly, optional)
-
-Wikipedia publishes complete XML dumps monthly. Once the API stabilises, a `bootstrap_runner` variant can stream the dump locally and audit our DB against it for full coverage. Not on the critical path for v1.
-
-### 6.5 Sync state machine, in one diagram
-
-```
-                    new edit on enwiki
-                            │
-                            ▼
-                    EventStreams SSE  ── if title looks like a genre ──┐
-                                                                       │
-   nightly Wikidata SPARQL  ── any new QID not in DB ──────────────────┤
-                                                                       ▼
-                                                              ┌─────────────────┐
-                                                              │   wg_frontier   │
-                                                              └────────┬────────┘
-                                                                       │
-                                          weekly reconciler  ──────────┤
-                                                                       ▼
-                                                          ┌────────────────────────┐
-                                                          │   fetch + parse + load │
-                                                          │   (same code as v1     │
-                                                          │   bootstrap pipeline)  │
-                                                          └────────────┬───────────┘
-                                                                       │
-                                                                       ▼
-                                                          wg_genres / wg_edges /
-                                                          wg_aliases / wg_revisions
-```
+Wikipedia publishes complete XML dumps once a month. A dump-based variant of the bootstrap can audit our DB against the dump for full coverage (catching genres that drift in and out of the seed query). Not on the critical path; punted to post-launch.
 
 ---
 
@@ -436,11 +402,11 @@ Single VM, alongside active-listener. Containerised via `docker-compose.yml`:
 
 ```
 services:
-  postgres:    # shared with active-listener? or own instance? — TBD, see open questions
-  api:         # uvicorn, port 8080, behind nginx/Caddy
-  sync_worker: # one replica, restart=always
-  scheduler:   # one replica
+  postgres:    # own instance; shared with active-listener is an open question
+  api:         # uvicorn, port 8080, behind nginx/Caddy. The only long-running container.
 ```
+
+The weekly sync runs as a system cron job that invokes `docker compose run --rm api wiki-genres sync`. No always-on sync container.
 
 Public DNS: `wiki-genres.<domain>` (to be decided). TLS via Caddy auto-cert or the existing active-listener TLS terminator.
 
@@ -453,8 +419,9 @@ Public DNS: `wiki-genres.<domain>` (to be decided). TLS via Caddy auto-cert or t
 ### 8.3 Observability
 
 - Structured JSON logs to stdout; collected by whatever's running on the VM.
-- Per-process metrics over `/metrics` (Prometheus exposition format): SSE events received, frontier depth, fetch latency, parse errors per page, edges created/deleted per minute.
-- A simple `/v1/stats` endpoint on the public API for at-a-glance health.
+- Per-process metrics over `/metrics` (Prometheus exposition format): fetch latency, parse errors per page, edges created/deleted per sync run, time since last successful sync.
+- A simple `/v1/stats` endpoint on the public API for at-a-glance health (last sync timestamp, node/edge counts).
+- Alert if `now() - last_successful_sync > 14 days` — two missed weekly runs.
 
 ### 8.4 Cost expectation
 
@@ -482,22 +449,21 @@ The synonym question that started this — `edm-pop ↔ dance-pop` — becomes: 
 
 | Milestone | Scope | Estimate |
 |---|---|---|
-| **M0 — scaffolding** *(this commit)* | Repo skeleton, schema migration, FastAPI shell, docker-compose, CI. No data yet. | ½ day |
-| **M1 — bootstrap pipeline** | Seed SPARQL, fetcher, mwparserfromhell parser, loader. Produces a populated DB end-to-end. | 3–4 days |
+| **M0 — scaffolding** *(done)* | Repo skeleton, schema migration, FastAPI shell, docker-compose, CI. No data yet. | ½ day |
+| **M1 — bootstrap pipeline** *(done)* | Seed SPARQL, fetcher, mwparserfromhell parser, loader. Produces a populated DB end-to-end. | 3–4 days |
 | **M2 — read API** | `GET /v1/genres/{id}`, `GET /v1/resolve`, `GET /v1/search`, `GET /v1/stats`. | 2 days |
-| **M3 — sync worker** | EventStreams subscriber + frontier drainer. Real-time updates. | 2–3 days |
-| **M4 — scheduler + reconciler** | Nightly SPARQL diff, weekly full reconcile, `wg_snapshots`. | 2 days |
-| **M5 — diff API + consumer integration** | `GET /v1/diff?since=…`. active-listener pulls and integrates. | 2 days |
-| **M6 — public launch** | README, contributing guide, CI on PRs, rate limiting, public DNS. | 1–2 days |
+| **M3 — weekly sync** | `wiki-genres sync` CLI command: SPARQL diff + stale refetch + edge resolve + snapshot. Cron entry. | 1–2 days |
+| **M4 — diff API + consumer integration** | `GET /v1/diff?since=…`. active-listener pulls and integrates. | 2 days |
+| **M5 — public launch** | README, contributing guide, CI on PRs, rate limiting, public DNS. | 1–2 days |
 
-Total: ~3 weeks of focused work to v1.
+Total: ~2 weeks of focused work to v1 (down from ~3 with the original real-time architecture).
 
 ---
 
 ## 11. Risks & open questions
 
 - **Infobox coverage.** If significantly < 90% of genre articles have `{{Infobox music genre}}`, we need a prose-fallback parser. Bootstrap will surface the true number; design a fallback only if needed.
-- **EventStreams stability.** The public SSE endpoint is best-effort. The reconciler is the formal fallback; it must not be skipped.
+- **Sync run duration.** A weekly run touches ~700 pages at ≤1 req/s/host → ~15 minutes per host, parallelised across en.wiki + wikidata. Comfortable margin. If the graph grows 10×, revisit.
 - **Wikidata vs wikitext divergence.** Sometimes they disagree (e.g. Wikidata classifies "Electro" as a subgenre of "Electronic dance music"; the infobox says "Electronic"). We store both and let consumers pick. Documented behaviour, not a bug.
 - **Cycles.** Common in this graph (fusion genres, sibling scenes). Schema permits them; consumers must be cycle-aware.
 - **Shared vs separate Postgres** with active-listener — open. Shared is operationally simpler (one backup), but couples deploys and complicates open-sourcing the docker-compose. Default: separate instance, same VM.
@@ -542,10 +508,9 @@ wiki-genres-project/
 │   │   ├── __init__.py
 │   │   ├── main.py
 │   │   └── routes/
-│   ├── crawler/
-│   ├── parser/
-│   ├── loader/
-│   └── sync/
+│   ├── crawler/      # fetcher, frontier, seeds, bootstrap (and weekly sync)
+│   ├── parser/       # infobox + wikidata parsers
+│   └── loader/       # two-pass loader, resolve_edges
 ├── tests/
 └── scripts/
 ```
