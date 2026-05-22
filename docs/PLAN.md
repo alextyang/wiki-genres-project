@@ -447,14 +447,14 @@ The synonym question that started this — `edm-pop ↔ dance-pop` — becomes: 
 
 ## 10. Roadmap
 
-| Milestone | Scope | Estimate |
+| Milestone | Scope | Status |
 |---|---|---|
-| **M0 — scaffolding** *(done)* | Repo skeleton, schema migration, FastAPI shell, docker-compose, CI. No data yet. | ½ day |
-| **M1 — bootstrap pipeline** *(done)* | Seed SPARQL, fetcher, mwparserfromhell parser, loader. Produces a populated DB end-to-end. | 3–4 days |
-| **M2 — read API** | `GET /v1/genres/{id}`, `GET /v1/resolve`, `GET /v1/search`, `GET /v1/stats`. | 2 days |
-| **M3 — weekly sync** | `wiki-genres sync` CLI command: SPARQL diff + stale refetch + edge resolve + snapshot. Cron entry. | 1–2 days |
-| **M4 — diff API + consumer integration** | `GET /v1/diff?since=…`. active-listener pulls and integrates. | 2 days |
-| **M5 — public launch** | README, contributing guide, CI on PRs, rate limiting, public DNS. | 1–2 days |
+| **M0 — scaffolding** | Repo skeleton, schema migration, FastAPI shell, docker-compose, CI. | ✅ done |
+| **M1 — bootstrap pipeline** | Seed SPARQL, fetcher, mwparserfromhell parser, loader. Produces a populated DB end-to-end. | ✅ done |
+| **M2 — read API** | `GET /v1/genres/{id}`, `/edges`, `/neighbors`, `/v1/resolve`, `/v1/search`, `/v1/diff`, `/v1/stats`. | ✅ done |
+| **M3 — weekly sync** | `wiki-genres sync` CLI command: SPARQL diff + stale refetch + edge resolve + snapshot. Cron entry. | ✅ done |
+| **M4 — diff API + consumer integration** | `GET /v1/diff?since=…` (shipped in M2). active-listener integration: deferred to §9. | ✅ API done; consumer TBD |
+| **M5 — public launch** | Dockerfile, GitHub Actions CI, rate limiting, README with API docs. | ✅ done |
 
 Total: ~2 weeks of focused work to v1 (down from ~3 with the original real-time architecture).
 

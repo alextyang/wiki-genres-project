@@ -102,10 +102,10 @@ async def stats(request: Request) -> StatsResult:  # noqa: ARG001
             )).fetchone()
 
             sync_started = await session.scalar(
-                text("SELECT value->>'ts' FROM wg_sync_state WHERE key = 'last_sync_started_at'")
+                text("SELECT value#>>'{}'  FROM wg_sync_state WHERE key = 'last_sync_started_at'")
             )
             sync_finished = await session.scalar(
-                text("SELECT value->>'ts' FROM wg_sync_state WHERE key = 'last_sync_finished_at'")
+                text("SELECT value#>>'{}' FROM wg_sync_state WHERE key = 'last_sync_finished_at'")
             )
 
         return StatsResult(
