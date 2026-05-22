@@ -76,10 +76,11 @@ async def run_sync(
         snapshot_id = _snapshot_id()
         await _start_snapshot(snapshot_id)
 
-        # 1. SPARQL seed diff — find QIDs not yet in our DB.
+        # 1. SPARQL seed diff — find QIDs not yet in our DB; soft-delete disappeared ones.
         logger.info("sync_sparql_diff")
         try:
             seeds = await fetch_seeds(fetcher)
+            seed_qids = {s.wikidata_qid for s in seeds if s.wikidata_qid}
             known_qids = await _known_qids()
             new_seeds = [s for s in seeds if s.wikidata_qid not in known_qids]
             stats.new_genres_discovered = len(new_seeds)
@@ -88,6 +89,10 @@ async def run_sync(
                     [s.wikipedia_title for s in new_seeds], reason="sync_new"
                 )
                 logger.info("sync_new_genres_enqueued", count=added)
+            disappeared = known_qids - seed_qids
+            if disappeared:
+                deleted = await _soft_delete_genres(list(disappeared))
+                logger.info("sync_soft_deleted", count=deleted)
         except Exception as exc:  # noqa: BLE001
             logger.warning("sync_sparql_diff_failed", error=str(exc))
 
@@ -119,6 +124,7 @@ async def run_sync(
                         skip_wikidata=skip_wikidata,
                         qid_hint=None,
                         stats=bootstrap_stats,
+                        triggered_by="sync",
                     )
                 )
                 for item in batch
@@ -172,6 +178,22 @@ async def _known_qids() -> set[str]:
             text("SELECT wikidata_qid FROM wg_genres WHERE wikidata_qid IS NOT NULL")
         )
         return {row[0] for row in rows}
+
+
+async def _soft_delete_genres(qids: list[str]) -> int:
+    """Soft-delete genres whose QIDs are no longer in the SPARQL seed set."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text("""
+                UPDATE wg_genres
+                SET deleted_at = now()
+                WHERE wikidata_qid = ANY(:qids)
+                  AND deleted_at IS NULL
+            """),
+            {"qids": qids},
+        )
+    return result.rowcount
 
 
 async def _enqueue_stale(staleness_days: int) -> int:

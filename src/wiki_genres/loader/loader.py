@@ -12,6 +12,7 @@ Both passes are idempotent; re-running after a partial failure converges.
 
 from __future__ import annotations
 
+import json
 import re
 
 import structlog
@@ -38,26 +39,45 @@ def _genre_id(qid: str | None, title: str) -> str:
 async def load_genre(
     parsed: ParsedGenre,
     wikidata: ParsedWikidataEntity | None = None,
+    triggered_by: str = "bootstrap",
 ) -> str:
     """Upsert a genre and all its related rows. Returns the genre ``id``."""
     genre_id = _genre_id(parsed.wikidata_qid, parsed.wikipedia_title)
     engine = get_engine()
 
+    # Snapshot pre-update state so we can compute a revision diff.
+    async with engine.connect() as conn:
+        pre = (await conn.execute(
+            text("""
+                SELECT raw_wikitext_sha256,
+                       (SELECT count(*) FROM wg_edges   WHERE from_genre_id = :id) AS edge_count,
+                       (SELECT count(*) FROM wg_aliases WHERE genre_id       = :id) AS alias_count
+                FROM wg_genres WHERE id = :id
+            """),
+            {"id": genre_id},
+        )).mappings().fetchone()
+
+    old_sha = pre["raw_wikitext_sha256"] if pre else None
+    old_edges = int(pre["edge_count"]) if pre else 0
+    old_aliases = int(pre["alias_count"]) if pre else 0
+
     async with engine.begin() as conn:
-        # Core genre row.
+        # Core genre row — clear deleted_at on successful re-fetch.
         await conn.execute(
             text("""
                 insert into wg_genres (
                     id, wikidata_qid, wikipedia_title, wikipedia_url,
                     summary, infobox_color, is_seed, has_infobox,
                     raw_wikitext_sha256, upstream_revision,
-                    first_seen_at, last_fetched_at, last_changed_at
+                    first_seen_at, last_fetched_at, last_changed_at,
+                    deleted_at
                 )
                 values (
                     :id, :qid, :title, :url,
                     :summary, :color, :is_seed, :has_infobox,
                     :sha256, :revision,
-                    now(), now(), now()
+                    now(), now(), now(),
+                    null
                 )
                 on conflict (id) do update set
                     wikidata_qid        = excluded.wikidata_qid,
@@ -69,6 +89,7 @@ async def load_genre(
                     raw_wikitext_sha256 = excluded.raw_wikitext_sha256,
                     upstream_revision   = excluded.upstream_revision,
                     last_fetched_at     = now(),
+                    deleted_at          = null,
                     last_changed_at     = case
                         when wg_genres.raw_wikitext_sha256 is distinct from excluded.raw_wikitext_sha256
                         then now()
@@ -195,8 +216,70 @@ async def load_genre(
                 },
             )
 
+    # Record a revision entry when content changes on a re-fetch.
+    new_sha = parsed.raw_wikitext_sha256
+    if old_sha is not None and old_sha != new_sha and parsed.upstream_revision:
+        await _record_revision(
+            engine, genre_id, parsed, triggered_by, old_edges, old_aliases
+        )
+
     logger.debug("genre_loaded", genre_id=genre_id, title=parsed.wikipedia_title)
     return genre_id
+
+
+async def _record_revision(
+    engine, genre_id: str, parsed: ParsedGenre,
+    triggered_by: str, old_edges: int, old_aliases: int,
+) -> None:
+    """Insert a wg_revisions row capturing what changed on this fetch."""
+    async with engine.connect() as conn:
+        new_edges = (await conn.scalar(
+            text("SELECT count(*) FROM wg_edges WHERE from_genre_id = :id"),
+            {"id": genre_id},
+        )) or 0
+        new_aliases = (await conn.scalar(
+            text("SELECT count(*) FROM wg_aliases WHERE genre_id = :id"),
+            {"id": genre_id},
+        )) or 0
+
+    diff = {
+        "edges_before": old_edges,
+        "edges_after": int(new_edges),
+        "edges_delta": int(new_edges) - old_edges,
+        "aliases_before": old_aliases,
+        "aliases_after": int(new_aliases),
+        "aliases_delta": int(new_aliases) - old_aliases,
+    }
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("""
+                INSERT INTO wg_revisions (
+                    genre_id, upstream_revision, fetched_at,
+                    content_sha256, triggered_by, diff_summary
+                )
+                VALUES (
+                    :gid, :rev, now(),
+                    :sha, :by, :diff
+                )
+                ON CONFLICT (genre_id, upstream_revision) DO UPDATE SET
+                    diff_summary = excluded.diff_summary,
+                    triggered_by = excluded.triggered_by
+            """),
+            {
+                "gid": genre_id,
+                "rev": parsed.upstream_revision,
+                "sha": parsed.raw_wikitext_sha256,
+                "by": triggered_by,
+                "diff": json.dumps(diff),
+            },
+        )
+    logger.info(
+        "revision_recorded",
+        genre_id=genre_id,
+        edges_delta=diff["edges_delta"],
+        aliases_delta=diff["aliases_delta"],
+    )
 
 
 # ------------------------------------------------------------------ #

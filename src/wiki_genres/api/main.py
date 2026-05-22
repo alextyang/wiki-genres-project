@@ -5,9 +5,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from limits.storage import MemoryStorage
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -15,12 +14,17 @@ from sqlalchemy import text
 
 from wiki_genres import __version__
 from wiki_genres.api.models import StatsResult
+from wiki_genres.api.routes.admin import router as admin_router
 from wiki_genres.api.routes.diff import router as diff_router
 from wiki_genres.api.routes.genres import router as genres_router
 from wiki_genres.api.routes.resolve import router as resolve_router
 from wiki_genres.db import dispose_engine, session_scope
 
-limiter = Limiter(key_func=lambda request: request.client.host, storage_uri="memory://")
+limiter = Limiter(
+    key_func=lambda request: request.client.host,
+    default_limits=["60/minute"],
+    storage_uri="memory://",
+)
 
 
 @asynccontextmanager
@@ -46,6 +50,7 @@ app.add_middleware(SlowAPIMiddleware)
 app.include_router(genres_router)
 app.include_router(resolve_router)
 app.include_router(diff_router)
+app.include_router(admin_router)
 
 
 # ------------------------------------------------------------------ #
@@ -53,12 +58,14 @@ app.include_router(diff_router)
 # ------------------------------------------------------------------ #
 
 @app.get("/healthz", include_in_schema=False)
+@limiter.exempt
 async def healthz() -> dict[str, str]:
     """Liveness. Returns 200 unconditionally as long as the process is up."""
     return {"status": "ok", "version": __version__}
 
 
 @app.get("/readyz", include_in_schema=False)
+@limiter.exempt
 async def readyz() -> dict[str, Any]:
     """Readiness. Verifies the database is reachable."""
     try:
@@ -77,8 +84,7 @@ async def readyz() -> dict[str, Any]:
 # ------------------------------------------------------------------ #
 
 @app.get("/v1/stats", response_model=StatsResult)
-@limiter.limit("60/minute")
-async def stats(request: Request) -> StatsResult:  # noqa: ARG001
+async def stats() -> StatsResult:
     """Node/edge counts, last snapshot, last EventStreams cursor."""
     try:
         async with session_scope() as session:

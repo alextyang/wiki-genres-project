@@ -165,6 +165,7 @@ async def _process_one(
     skip_wikidata: bool,
     qid_hint: str | None,
     stats: BootstrapStats,
+    triggered_by: str = "bootstrap",
 ) -> None:
     async with sem:
         try:
@@ -174,6 +175,7 @@ async def _process_one(
                 skip_wikidata=skip_wikidata,
                 qid_hint=qid_hint,
                 stats=stats,
+                triggered_by=triggered_by,
             )
             stats.genres_processed += 1
         except Exception as exc:
@@ -189,6 +191,7 @@ async def _fetch_parse_load(
     skip_wikidata: bool,
     qid_hint: str | None,
     stats: BootstrapStats,
+    triggered_by: str = "bootstrap",
 ) -> None:
     logger.debug("processing", title=title)
 
@@ -273,7 +276,7 @@ async def _fetch_parse_load(
                 existing.add(a.lower())
 
     # --- Load to DB -------------------------------------------------------
-    await load_genre(parsed, wikidata_entity)
+    await load_genre(parsed, wikidata_entity, triggered_by=triggered_by)
 
     # --- Enqueue newly-discovered genre titles ----------------------------
     if parsed.new_genre_titles:

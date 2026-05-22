@@ -25,10 +25,11 @@ router = APIRouter(prefix="/v1/genres", tags=["genres"])
 # Helpers                                                             #
 # ------------------------------------------------------------------ #
 
-async def _get_genre_row(session, genre_id: str):
-    """Fetch the core wg_genres row by ID or Wikipedia title slug."""
+async def _get_genre_row(session, genre_id: str, include_deleted: bool = False):
+    """Fetch the core wg_genres row by ID."""
+    deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
     row = await session.execute(
-        text("SELECT * FROM wg_genres WHERE id = :id"),
+        text(f"SELECT * FROM wg_genres WHERE id = :id {deleted_filter}"),
         {"id": genre_id},
     )
     return row.mappings().fetchone()
@@ -111,6 +112,7 @@ async def list_genres(
     q: str | None = Query(None, description="Filter by title substring (case-insensitive)."),
     has_infobox: bool | None = Query(None),
     updated_since: str | None = Query(None, description="ISO 8601 timestamp."),
+    include_deleted: bool = Query(False, description="Include soft-deleted genres."),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
 ) -> PaginatedGenres:
@@ -119,6 +121,8 @@ async def list_genres(
     conditions: list[str] = []
     params: dict = {"limit": size, "offset": offset}
 
+    if not include_deleted:
+        conditions.append("deleted_at IS NULL")
     if q:
         conditions.append("wikipedia_title ILIKE :q")
         params["q"] = f"%{q}%"
