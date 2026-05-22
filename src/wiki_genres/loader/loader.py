@@ -283,6 +283,47 @@ async def _record_revision(
 
 
 # ------------------------------------------------------------------ #
+# Pageviews                                                            #
+# ------------------------------------------------------------------ #
+
+async def load_pageviews(genre_id: str, items: list[dict]) -> None:
+    """Upsert monthly pageview rows and refresh wg_genres.monthly_views_p30."""
+    parsed: list[tuple[int, int, int]] = []
+    for item in items:
+        ts = item.get("timestamp", "")
+        if len(ts) >= 6:
+            try:
+                parsed.append((int(ts[:4]), int(ts[4:6]), int(item.get("views", 0))))
+            except (ValueError, TypeError):
+                continue
+
+    if not parsed:
+        return
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        for year, month, views in parsed:
+            await conn.execute(
+                text("""
+                    INSERT INTO wg_pageviews (genre_id, year, month, views, fetched_at)
+                    VALUES (:gid, :year, :month, :views, now())
+                    ON CONFLICT (genre_id, year, month) DO UPDATE SET
+                        views      = excluded.views,
+                        fetched_at = now()
+                """),
+                {"gid": genre_id, "year": year, "month": month, "views": views},
+            )
+
+        most_recent = max(parsed, key=lambda x: (x[0], x[1]))
+        await conn.execute(
+            text("UPDATE wg_genres SET monthly_views_p30 = :v WHERE id = :id"),
+            {"id": genre_id, "v": most_recent[2]},
+        )
+
+    logger.debug("pageviews_loaded", genre_id=genre_id, months=len(parsed))
+
+
+# ------------------------------------------------------------------ #
 # Pass 2: resolve unlinked edges                                       #
 # ------------------------------------------------------------------ #
 

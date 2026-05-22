@@ -14,6 +14,7 @@ from wiki_genres.api.models import (
     GenreListItem,
     NeighborOut,
     OriginOut,
+    PageviewEntry,
     PaginatedGenres,
 )
 from wiki_genres.db import session_scope
@@ -113,6 +114,7 @@ async def list_genres(
     has_infobox: bool | None = Query(None),
     updated_since: str | None = Query(None, description="ISO 8601 timestamp."),
     include_deleted: bool = Query(False, description="Include soft-deleted genres."),
+    sort_by: str = Query("title", pattern="^(title|views)$", description="Sort by title or monthly views."),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
 ) -> PaginatedGenres:
@@ -134,6 +136,11 @@ async def list_genres(
         params["since"] = updated_since
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    order = (
+        "ORDER BY monthly_views_p30 DESC NULLS LAST, wikipedia_title"
+        if sort_by == "views"
+        else "ORDER BY wikipedia_title"
+    )
 
     async with session_scope() as session:
         total = (await session.scalar(
@@ -145,9 +152,9 @@ async def list_genres(
             text(f"""
                 SELECT id, wikidata_qid, wikipedia_title, wikipedia_url,
                        has_infobox, infobox_color, summary,
-                       last_changed_at, last_fetched_at
+                       last_changed_at, last_fetched_at, monthly_views_p30
                 FROM wg_genres {where}
-                ORDER BY wikipedia_title
+                {order}
                 LIMIT :limit OFFSET :offset
             """),
             params,
@@ -300,3 +307,28 @@ async def get_genre_neighbors(
         )
         for r in rows
     ]
+
+
+# ------------------------------------------------------------------ #
+# GET /v1/genres/{id}/pageviews                                       #
+# ------------------------------------------------------------------ #
+
+@router.get("/{genre_id}/pageviews", response_model=list[PageviewEntry])
+async def get_genre_pageviews(genre_id: str) -> list[PageviewEntry]:
+    """Monthly pageview history for a genre (most recent first)."""
+    async with session_scope() as session:
+        row = await _get_genre_row(session, genre_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Genre '{genre_id}' not found.")
+
+        rows = (await session.execute(
+            text("""
+                SELECT year, month, views
+                FROM wg_pageviews
+                WHERE genre_id = :gid
+                ORDER BY year DESC, month DESC
+            """),
+            {"gid": genre_id},
+        )).mappings().fetchall()
+
+    return [PageviewEntry(**dict(r)) for r in rows]

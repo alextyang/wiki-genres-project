@@ -24,7 +24,7 @@ from wiki_genres.crawler.frontier import (
 from wiki_genres.crawler.seeds import SeedEntry, fetch_seeds
 from wiki_genres.db import get_engine
 from wiki_genres.db_migrations import apply_migrations
-from wiki_genres.loader.loader import load_genre, log_fetch, resolve_edges
+from wiki_genres.loader.loader import load_genre, load_pageviews, log_fetch, resolve_edges
 from wiki_genres.parser.infobox import parse_genre_page
 from wiki_genres.parser.wikidata import parse_wikidata_entity
 
@@ -276,7 +276,17 @@ async def _fetch_parse_load(
                 existing.add(a.lower())
 
     # --- Load to DB -------------------------------------------------------
-    await load_genre(parsed, wikidata_entity, triggered_by=triggered_by)
+    genre_id = await load_genre(parsed, wikidata_entity, triggered_by=triggered_by)
+
+    # --- Fetch pageviews --------------------------------------------------
+    try:
+        pv_result = await fetcher.fetch_pageviews(canonical_title)
+        if pv_result.ok:
+            pv_items = pv_result.json().get("items", [])
+            if pv_items:
+                await load_pageviews(genre_id, pv_items)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("pageview_fetch_skipped", title=title, error=str(exc))
 
     # --- Enqueue newly-discovered genre titles ----------------------------
     if parsed.new_genre_titles:

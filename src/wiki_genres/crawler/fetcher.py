@@ -31,6 +31,7 @@ WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_REST = "https://en.wikipedia.org/api/rest_v1"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+WIKIMEDIA_REST = "https://wikimedia.org/api/rest_v1"
 
 
 @dataclass
@@ -71,6 +72,7 @@ class WikiFetcher:
             "en.wikipedia.org": asyncio.Lock(),
             "www.wikidata.org": asyncio.Lock(),
             "query.wikidata.org": asyncio.Lock(),
+            "wikimedia.org": asyncio.Lock(),
         }
 
     async def aclose(self) -> None:
@@ -131,6 +133,33 @@ class WikiFetcher:
         url = f"{WIKIDATA_SPARQL}?format=json&query={quote(query, safe='')}"
         # SPARQL can take 30–60 s on the public endpoint; use a longer timeout.
         return await self._get(url, host="query.wikidata.org", timeout=90.0)
+
+    async def fetch_pageviews(self, title: str, months_back: int = 12) -> FetchResult:
+        """Fetch monthly pageview counts for a Wikipedia article.
+
+        Uses the Wikimedia pageviews API, returning the last *months_back*
+        complete months of data.
+        """
+        from datetime import date
+
+        today = date.today()
+        # End = 1st of last complete month.
+        if today.month == 1:
+            end = date(today.year - 1, 12, 1)
+        else:
+            end = date(today.year, today.month - 1, 1)
+
+        # Start = months_back months before end (inclusive).
+        total = end.year * 12 + (end.month - 1) - (months_back - 1)
+        start = date(total // 12, total % 12 + 1, 1)
+
+        encoded = quote(title.replace(" ", "_"), safe="")
+        url = (
+            f"{WIKIMEDIA_REST}/metrics/pageviews/per-article"
+            f"/en.wikipedia.org/all-access/all-agents"
+            f"/{encoded}/monthly/{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
+        )
+        return await self._get(url, host="wikimedia.org")
 
     async def has_music_genre_infobox(self, title: str) -> bool:
         """Return True if the page transcludes Template:Infobox music genre."""

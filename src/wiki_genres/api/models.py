@@ -60,6 +60,7 @@ class GenreListItem(BaseModel):
     summary: str | None
     last_changed_at: datetime | None
     last_fetched_at: datetime | None
+    monthly_views_p30: int | None = None
 
 
 class GenreDetail(GenreListItem):
@@ -129,6 +130,16 @@ class DiffResult(BaseModel):
     as_of: datetime
     genres_changed: list[DiffGenreEntry]
     total: int
+
+
+# ------------------------------------------------------------------ #
+# Stats                                                               #
+# ------------------------------------------------------------------ #
+
+class PageviewEntry(BaseModel):
+    year: int
+    month: int
+    views: int
 
 
 # ------------------------------------------------------------------ #
