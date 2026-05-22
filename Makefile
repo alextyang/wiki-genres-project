@@ -1,17 +1,19 @@
-.PHONY: help install db-up db-down db-reset migrate api lint typecheck test fmt
+.PHONY: help install db-up db-down db-reset migrate bootstrap sync api lint typecheck test fmt
 
 help:
 	@echo "Common targets:"
-	@echo "  install     install Python deps via uv"
+	@echo "  install     install Python deps (uv sync)"
 	@echo "  db-up       start the dev postgres"
 	@echo "  db-down     stop the dev postgres"
 	@echo "  db-reset    drop the dev postgres volume and restart"
-	@echo "  migrate     run alembic migrations against the dev postgres"
-	@echo "  api         run the FastAPI dev server"
+	@echo "  migrate     apply SQL migrations to the dev database"
+	@echo "  bootstrap   run the full bootstrap crawl (populates DB from scratch)"
+	@echo "  sync        run the weekly sync job manually"
+	@echo "  api         run the FastAPI dev server (hot-reload)"
 	@echo "  lint        run ruff"
 	@echo "  typecheck   run mypy"
 	@echo "  test        run pytest"
-	@echo "  fmt         run ruff format"
+	@echo "  fmt         format with ruff"
 
 install:
 	uv sync --extra dev
@@ -27,7 +29,13 @@ db-reset:
 	docker compose up -d postgres
 
 migrate:
-	uv run alembic upgrade head
+	uv run wiki-genres migrate
+
+bootstrap:
+	uv run wiki-genres bootstrap --log-format pretty
+
+sync:
+	uv run wiki-genres sync --log-format pretty
 
 api:
 	uv run uvicorn wiki_genres.api.main:app --reload --host 0.0.0.0 --port 8080

@@ -26,19 +26,15 @@ _GENRE_CLASS_QIDS = [
     "Q483394",   # genre
 ]
 
-# The SPARQL query is paginated to avoid timeout on the public endpoint.
+# Paginated SPARQL query.  Uses only P31 (instance_of) — the transitive P279+
+# variant times out on Wikidata's public endpoint at the required scale.
 _SPARQL_TEMPLATE = """
-SELECT DISTINCT ?genre ?genreLabel ?article WHERE {{
+SELECT DISTINCT ?genre ?article WHERE {{
   VALUES ?genreClass {{ {class_values} }}
-  {{ ?genre wdt:P31 ?genreClass }}
-  UNION
-  {{ ?genre wdt:P31 ?sub . ?sub wdt:P279* ?genreClass }}
-  UNION
-  {{ ?genre wdt:P279+ ?genreClass }}
+  ?genre wdt:P31 ?genreClass .
   ?article schema:about ?genre ;
            schema:isPartOf <https://en.wikipedia.org/> .
   FILTER NOT EXISTS {{ ?genre wdt:P31 wd:Q5 }}
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
 }}
 ORDER BY ?genre
 LIMIT {limit}

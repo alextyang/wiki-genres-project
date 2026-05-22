@@ -128,9 +128,9 @@ class WikiFetcher:
 
     async def fetch_sparql(self, query: str) -> FetchResult:
         """Run a SPARQL query against Wikidata."""
-        # SPARQL results can be large; cache them too.
         url = f"{WIKIDATA_SPARQL}?format=json&query={quote(query, safe='')}"
-        return await self._get(url, host="query.wikidata.org")
+        # SPARQL can take 30–60 s on the public endpoint; use a longer timeout.
+        return await self._get(url, host="query.wikidata.org", timeout=90.0)
 
     async def has_music_genre_infobox(self, title: str) -> bool:
         """Return True if the page transcludes Template:Infobox music genre."""
@@ -152,7 +152,7 @@ class WikiFetcher:
     # Internal                                                             #
     # ------------------------------------------------------------------ #
 
-    async def _get(self, url: str, host: str) -> FetchResult:
+    async def _get(self, url: str, host: str, timeout: float | None = None) -> FetchResult:
         cache_key = _url_cache_key(url)
         cache_path = self._cache_dir / host / f"{cache_key}.json"
 
@@ -182,7 +182,7 @@ class WikiFetcher:
 
         t0 = time.monotonic()
         try:
-            resp = await self._client.get(url)
+            resp = await self._client.get(url, timeout=timeout)
             elapsed = int((time.monotonic() - t0) * 1000)
             content = resp.content if resp.status_code == 200 else None
             sha = hashlib.sha256(content).hexdigest() if content else None
