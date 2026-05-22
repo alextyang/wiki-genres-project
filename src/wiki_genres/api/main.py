@@ -1,8 +1,4 @@
-"""FastAPI application entrypoint.
-
-M0 ships just the health endpoints + a stub `/v1/stats` so the service shape is
-visible. Real read endpoints land in M2 (see docs/PLAN.md § 7).
-"""
+"""FastAPI application entrypoint."""
 
 from __future__ import annotations
 
@@ -10,9 +6,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from wiki_genres import __version__
+from wiki_genres.api.models import StatsResult
+from wiki_genres.api.routes.diff import router as diff_router
+from wiki_genres.api.routes.genres import router as genres_router
+from wiki_genres.api.routes.resolve import router as resolve_router
 from wiki_genres.db import dispose_engine, session_scope
 
 
@@ -25,39 +26,102 @@ async def lifespan(_app: FastAPI):  # noqa: ANN201
 app = FastAPI(
     title="wiki-genres",
     version=__version__,
-    description="Continuously-synced mirror of Wikipedia's music-genre graph.",
+    description=(
+        "Continuously-synced mirror of Wikipedia's music-genre graph. "
+        "Source: https://github.com/alextyang/wiki-genres-project"
+    ),
     lifespan=lifespan,
 )
 
+app.include_router(genres_router)
+app.include_router(resolve_router)
+app.include_router(diff_router)
 
-@app.get("/healthz")
+
+# ------------------------------------------------------------------ #
+# Health                                                              #
+# ------------------------------------------------------------------ #
+
+@app.get("/healthz", include_in_schema=False)
 async def healthz() -> dict[str, str]:
     """Liveness. Returns 200 unconditionally as long as the process is up."""
     return {"status": "ok", "version": __version__}
 
 
-@app.get("/readyz")
+@app.get("/readyz", include_in_schema=False)
 async def readyz() -> dict[str, Any]:
     """Readiness. Verifies the database is reachable."""
-    async with session_scope() as session:
-        await session.execute(text("select 1"))
-    return {"status": "ok", "database": "ok"}
+    try:
+        async with session_scope() as session:
+            await session.execute(text("select 1"))
+        return {"status": "ok", "database": "ok"}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "database": str(exc)},
+        )
 
 
-@app.get("/v1/stats")
-async def stats() -> dict[str, Any]:
-    """Surface-level counters. Returns zeros until the bootstrap pipeline lands."""
-    async with session_scope() as session:
-        # These tables don't exist until migrations run; tolerate that during M0.
-        try:
-            genres = await session.scalar(text("select count(*) from wg_genres"))
-            edges = await session.scalar(text("select count(*) from wg_edges"))
-            aliases = await session.scalar(text("select count(*) from wg_aliases"))
-        except Exception:  # noqa: BLE001
-            genres = edges = aliases = None
-    return {
-        "version": __version__,
-        "genres": genres,
-        "edges": edges,
-        "aliases": aliases,
-    }
+# ------------------------------------------------------------------ #
+# Stats                                                               #
+# ------------------------------------------------------------------ #
+
+@app.get("/v1/stats", response_model=StatsResult)
+async def stats() -> StatsResult:
+    """Node/edge counts, last snapshot, last EventStreams cursor."""
+    try:
+        async with session_scope() as session:
+            genres = await session.scalar(text("SELECT count(*) FROM wg_genres"))
+            genres_infobox = await session.scalar(
+                text("SELECT count(*) FROM wg_genres WHERE has_infobox")
+            )
+            edges = await session.scalar(text("SELECT count(*) FROM wg_edges"))
+            edges_resolved = await session.scalar(
+                text("SELECT count(*) FROM wg_edges WHERE to_genre_id IS NOT NULL")
+            )
+            aliases = await session.scalar(text("SELECT count(*) FROM wg_aliases"))
+            frontier = await session.scalar(text("SELECT count(*) FROM wg_frontier"))
+
+            snap = (await session.execute(
+                text("""
+                    SELECT id, finished_at
+                    FROM wg_snapshots
+                    ORDER BY started_at DESC LIMIT 1
+                """)
+            )).fetchone()
+
+            sync_started = await session.scalar(
+                text("SELECT value->>'ts' FROM wg_sync_state WHERE key = 'last_sync_started_at'")
+            )
+            sync_finished = await session.scalar(
+                text("SELECT value->>'ts' FROM wg_sync_state WHERE key = 'last_sync_finished_at'")
+            )
+
+        return StatsResult(
+            version=__version__,
+            genres=genres,
+            genres_with_infobox=genres_infobox,
+            edges=edges,
+            edges_resolved=edges_resolved,
+            aliases=aliases,
+            last_snapshot_id=snap[0] if snap else None,
+            last_snapshot_finished=snap[1] if snap else None,
+            last_sync_started_at=sync_started,
+            last_sync_finished_at=sync_finished,
+            frontier_depth=frontier,
+        )
+    except Exception:  # noqa: BLE001
+        # Tables may not exist if migrations haven't run yet.
+        return StatsResult(
+            version=__version__,
+            genres=None,
+            genres_with_infobox=None,
+            edges=None,
+            edges_resolved=None,
+            aliases=None,
+            last_snapshot_id=None,
+            last_snapshot_finished=None,
+            last_sync_started_at=None,
+            last_sync_finished_at=None,
+            frontier_depth=None,
+        )

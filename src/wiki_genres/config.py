@@ -52,14 +52,12 @@ class Settings(BaseSettings):
     crawler_request_interval_ms: int = Field(default=250, alias="CRAWLER_REQUEST_INTERVAL_MS")
     crawler_cache_dir: Path = Field(default=Path("./.cache"), alias="CRAWLER_CACHE_DIR")
 
-    # --- Sync worker --------------------------------------------------------
+    # --- Weekly sync --------------------------------------------------------
 
-    eventstream_url: str = Field(
-        default="https://stream.wikimedia.org/v2/stream/recentchange",
-        alias="EVENTSTREAM_URL",
-    )
-    eventstream_reconnect_delay_ms: int = Field(
-        default=2000, alias="EVENTSTREAM_RECONNECT_DELAY_MS"
+    sync_staleness_days: int = Field(
+        default=7,
+        alias="SYNC_STALENESS_DAYS",
+        description="Refetch genres older than this many days on each sync run.",
     )
 
     # --- Logging ------------------------------------------------------------

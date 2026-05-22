@@ -82,6 +82,46 @@ def bootstrap(
 
 
 @app.command()
+def sync(
+    staleness_days: int = typer.Option(
+        7, "--staleness-days", help="Refetch genres older than N days."
+    ),
+    skip_wikidata: bool = typer.Option(
+        False, "--skip-wikidata", help="Skip Wikidata entity fetches (faster)."
+    ),
+    concurrency: int = typer.Option(4, "--concurrency", "-c"),
+    log_level: str = typer.Option("INFO", "--log-level"),
+    log_format: str = typer.Option("pretty", "--log-format"),
+) -> None:
+    """Run the weekly sync: SPARQL diff + stale refetch + edge resolve + snapshot.
+
+    Designed to be called from a system cron job:
+
+        0 6 * * 0  docker compose run --rm api wiki-genres sync
+
+    The sync is idempotent — if it crashes mid-run, restarting it resumes via
+    the durable frontier table.
+    """
+    configure_logging(level=log_level, fmt=log_format)
+    from wiki_genres.crawler.sync import run_sync
+
+    stats = _run(
+        run_sync(
+            staleness_days=staleness_days,
+            skip_wikidata=skip_wikidata,
+            concurrency=concurrency,
+        )
+    )
+    typer.echo(
+        f"Done. new={stats.new_genres_discovered} stale_enqueued={stats.stale_genres_enqueued} "
+        f"processed={stats.genres_processed} failed={stats.genres_failed} "
+        f"edges_resolved={stats.edges_resolved} elapsed={stats.elapsed_seconds:.1f}s"
+    )
+    if stats.genres_failed:
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def resolve(
     log_level: str = typer.Option("INFO", "--log-level"),
 ) -> None:
