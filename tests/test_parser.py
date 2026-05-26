@@ -49,8 +49,8 @@ def test_parse_jerk_stylistic_origins() -> None:
     parsed = parse_genre_page(_JERK_WIKITEXT, "Jerk (music genre)")
     relations = [(e.relation, e.wiki_target or e.raw_label) for e in parsed.infobox_edges]
     assert ("stylistic_origin", "Hip hop music") in relations
-    assert ("stylistic_origin", "Crunk") in relations        # [[crunk]] normalised
-    assert ("stylistic_origin", "Snap music") in relations   # [[snap music]] normalised
+    assert ("stylistic_origin", "Crunk") in relations  # [[crunk]] normalised
+    assert ("stylistic_origin", "Snap music") in relations  # [[snap music]] normalised
 
 
 def test_parse_jerk_subgenre_from_hlist() -> None:
@@ -81,6 +81,8 @@ def test_parse_jerk_new_titles_includes_wikilinks() -> None:
     parsed = parse_genre_page(_JERK_WIKITEXT, "Jerk (music genre)")
     assert "Hip hop music" in parsed.new_genre_titles
     assert "Twerking" in parsed.new_genre_titles
+    assert "Southern California" not in parsed.new_genre_titles
+    assert "United States" not in parsed.new_genre_titles
 
 
 def test_parse_edm_other_names_comma_separated() -> None:

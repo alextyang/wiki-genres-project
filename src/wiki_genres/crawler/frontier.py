@@ -11,7 +11,7 @@ Concurrent dequeuing is safe thanks to ``SELECT … FOR UPDATE SKIP LOCKED``.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import text
@@ -83,7 +83,7 @@ async def requeue(title: str, reason: str, current_attempts: int) -> None:
         return
 
     delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
-    not_before = datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
+    not_before = datetime.now(tz=UTC) + timedelta(seconds=delay)
 
     engine = get_engine()
     async with engine.begin() as conn:

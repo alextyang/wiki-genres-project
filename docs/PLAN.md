@@ -1,7 +1,7 @@
 # wiki-genres: a continuously-synced mirror of Wikipedia's music-genre graph
 
 **Status:** v0 design doc. Reflects intent, not the current state of the codebase.
-**Last revised:** 2026-05-21
+**Last revised:** 2026-05-22
 **Owner:** koopakondra
 
 This document is the canonical plan for the project. Code-level decisions live in `docs/adr/`.
@@ -23,6 +23,7 @@ For every music genre that has a Wikipedia article with `{{Infobox music genre}}
 - **Typed edges** — `subgenre`, `derivative`, `stylistic_origin`, `cultural_origin`, `fusion_genre`, `regional_scene`, `local_scene`, `influenced_by`, `subclass_of`, `part_of`.
 - **Origin context** — cultural and temporal origin strings, with best-effort parsed year/region.
 - **Instruments**, **categories**, **infobox color**, lead-paragraph summary.
+- **Popularity signal** — monthly Wikipedia pageviews per genre, plus rolling 30-day / 365-day totals. Lets consumers rank or filter by attention without fetching the Pageviews API themselves.
 - **Provenance** — for every fact: source (`infobox` vs `wikidata`), fetch timestamp, content hash.
 
 ### What we are *not* building
@@ -132,7 +133,10 @@ wg_genres (
     last_fetched_at     timestamptz not null,
     last_changed_at     timestamptz not null,    -- when our local copy meaningfully changed
     upstream_revision   bigint,                  -- Wikipedia revision id
-    deleted_at          timestamptz              -- soft-delete on upstream deletion
+    deleted_at          timestamptz,             -- soft-delete on upstream deletion
+    pageviews_last_30d  bigint,                  -- denormalised rolling sum (monthly grain)
+    pageviews_last_365d bigint,                  -- denormalised rolling sum
+    pageviews_updated_at timestamptz             -- when the rolling sums were last recomputed
 )
 
 wg_redirects (
@@ -237,7 +241,19 @@ wg_snapshots (
     edges_total         integer,
     notes               text
 )
+
+wg_pageviews (
+    genre_id            text not null references wg_genres(id) on delete cascade,
+    period_start        date not null,           -- first day of the period (e.g. '2026-04-01' for April monthly)
+    granularity         text not null,           -- 'monthly' (default); 'daily' reserved for future use
+    views               bigint not null,
+    fetched_at          timestamptz not null,
+    primary key (genre_id, period_start, granularity),
+    constraint wg_pageviews_granularity_valid check (granularity in ('monthly', 'daily'))
+)
 ```
+
+`wg_pageviews` keeps raw time-series data. The two denormalised columns on `wg_genres` (`pageviews_last_30d`, `pageviews_last_365d`) are recomputed at the end of every sync run so the list/sort endpoints don't need a join. They are advisory — exact time series live in `wg_pageviews`.
 
 ### 4.3 Edge relation vocabulary
 
@@ -247,7 +263,7 @@ wg_snapshots (
 | `derivative` | infobox `derivatives` | `from` led to `to` |
 | `stylistic_origin` | infobox `stylistic_origins` | `from` emerged from `to` |
 | `cultural_origin` | infobox `cultural_origins` (when wikilinked) | `from` emerged from `to`'s culture |
-| `fusion_genre` | infobox `fusion_genres` | undirected pair (stored both ways) |
+| `fusion_genre` | infobox `fusion_genres` | source/component genre → fusion child; reverse coverage is non-display `related_genre` evidence |
 | `regional_scene` | infobox `regional_scenes` | `to` is a regional scene of `from` |
 | `local_scene` | infobox `local_scenes` | `to` is a local scene of `from` |
 | `other_name` | infobox `other_names` | `from` is also known as `to_raw_label` |
@@ -332,7 +348,8 @@ One job, runs on a cron, completes in minutes. Same code as the bootstrap pipeli
 2. **Refresh stale pages.** Enqueue every genre whose `last_fetched_at` is older than the staleness budget (default 7 days) with `reason='sync_stale'`. This naturally amortises the load: ~700 fetches per weekly run for a ~5k-genre graph at a 7-day budget.
 3. **Drain the frontier.** Same fetch + parse + load pipeline as the bootstrap. New pages get added; existing pages get diffed against the previous fetch and `wg_revisions` records the change.
 4. **Re-resolve unresolved edges.** Run the pass-2 resolver (`resolve_edges`) — edges that previously had `to_genre_id IS NULL` may now resolve because new genres were just loaded.
-5. **Write a snapshot.** Insert a `wg_snapshots` row summarising what changed (genres added/updated, edges added/removed, parse errors).
+5. **Refresh pageviews.** For each genre, fetch the trailing 13 months of monthly pageviews from the [Wikimedia Pageviews API](https://wikimedia.org/api/rest_v1/?doc#/Pageviews_data) (`/per-article/en.wikipedia/all-access/all-agents/{title}/monthly/...`). Upsert into `wg_pageviews`. Recompute `wg_genres.pageviews_last_30d` and `pageviews_last_365d` rollups. The Pageviews API tolerates ~100 req/s anon, so 5k calls run in under a minute. Failures here never block the sync — pageviews are an enrichment, not a critical fact.
+6. **Write a snapshot.** Insert a `wg_snapshots` row summarising what changed (genres added/updated, edges added/removed, pageview rows ingested, parse errors).
 
 ### 6.2 What it does *not* do
 
@@ -366,10 +383,11 @@ REST, JSON, public by default. Designed to be cacheable.
 
 | Method & path | Returns |
 |---|---|
-| `GET /v1/genres` | Paginated list. Query: `q=`, `has_infobox=`, `updated_since=`. |
-| `GET /v1/genres/{id}` | Single genre with all edges, aliases, origins, instruments. |
+| `GET /v1/genres` | Paginated list. Query: `q=`, `has_infobox=`, `updated_since=`, `sort=` (`title` default, also `pageviews_30d`, `pageviews_365d`). |
+| `GET /v1/genres/{id}` | Single genre with all edges, aliases, origins, instruments. Response includes `pageviews_last_30d` and `pageviews_last_365d`. |
 | `GET /v1/genres/{id}/edges?relation=subgenre&direction=out` | Filtered edge list. |
 | `GET /v1/genres/{id}/neighbors?depth=2` | BFS up to depth N for visualisations. |
+| `GET /v1/genres/{id}/pageviews?granularity=monthly&since=2025-01` | Pageview time series for one genre. Defaults to the last 13 months at monthly granularity. |
 | `GET /v1/resolve?alias=EDM` | Alias / redirect resolution. Returns the canonical genre. |
 | `GET /v1/search?q=hyperpop` | Full-text search over titles, aliases, summaries. |
 | `GET /v1/diff?since=2026-05-01` | Changes (genres + edges) since a timestamp. Powers incremental sync for consumers. |
@@ -455,8 +473,9 @@ The synonym question that started this — `edm-pop ↔ dance-pop` — becomes: 
 | **M3 — weekly sync** | `wiki-genres sync` CLI command: SPARQL diff + stale refetch + edge resolve + snapshot. Cron entry. | ✅ done |
 | **M4 — diff API + consumer integration** | `GET /v1/diff?since=…` (shipped in M2). active-listener integration: deferred to §9. | ✅ API done; consumer TBD |
 | **M5 — public launch** | Dockerfile, GitHub Actions CI, rate limiting, README with API docs. | ✅ done |
+| **M6 — pageviews** | `wg_pageviews` schema, Pageviews API fetcher, sync-run ingest, rolling-sum columns on `wg_genres`, `/v1/genres/{id}/pageviews` endpoint, `sort=pageviews_30d` on list. | ☐ planned |
 
-Total: ~2 weeks of focused work to v1 (down from ~3 with the original real-time architecture).
+Total: ~2 weeks of focused work to v1 (down from ~3 with the original real-time architecture). M6 adds roughly a day on top.
 
 ---
 

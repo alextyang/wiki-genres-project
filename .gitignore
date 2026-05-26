@@ -33,7 +33,9 @@ Thumbs.db
 
 # Project
 .cache/
+.claude/
 .tmp/
+.tmp-*.png
 *.log
 postgres-data/
 .venv/

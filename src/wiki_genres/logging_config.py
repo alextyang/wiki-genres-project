@@ -30,9 +30,7 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
             structlog.processors.format_exc_info,
             renderer,
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelName(level.upper())
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelName(level.upper())),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
         cache_logger_on_first_use=False,  # keep False while testing configs

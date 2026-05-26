@@ -4,7 +4,7 @@ A continuously-synced mirror of Wikipedia's music-genre graph, exposed as a publ
 
 For every music genre with a Wikipedia `{{Infobox music genre}}` article, we capture structured edges (`subgenre`, `derivative`, `stylistic_origin`, …), aliases, instruments, origin metadata, and Wikidata cross-references — kept in sync with upstream via a weekly crawl.
 
-**Data licence:** Wikipedia content is [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). Code is MIT. Every API response includes the source Wikipedia URL.
+**Data licence:** Wikipedia content is [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). Code is MIT. Genre-bearing API responses include the source Wikipedia URL.
 
 ---
 
@@ -12,7 +12,8 @@ For every music genre with a Wikipedia `{{Infobox music genre}}` article, we cap
 
 All endpoints return JSON. No authentication required. Rate limit: 60 requests/minute per IP.
 
-Interactive docs at `/docs` (Swagger UI) and `/redoc`.
+The graph explorer is served at `/explorer` and the site root redirects there.
+Interactive API docs are served at `/docs` (Swagger UI) and `/redoc`.
 
 ### Endpoints
 
@@ -20,6 +21,7 @@ Interactive docs at `/docs` (Swagger UI) and `/redoc`.
 |---|---|---|
 | `GET` | `/v1/genres` | Paginated genre list. Filters: `q=`, `has_infobox=`, `updated_since=`. |
 | `GET` | `/v1/genres/{id}` | Full genre detail with all edges, aliases, origins, instruments. |
+| `GET` | `/v1/genres/{id}/playlist` | Manually curated YouTube playlist entries for a genre. |
 | `GET` | `/v1/genres/{id}/edges` | Filtered edges. Params: `relation=`, `direction=out\|in\|both`. |
 | `GET` | `/v1/genres/{id}/neighbors` | BFS graph expansion up to `depth=` hops (max 3). |
 | `GET` | `/v1/resolve` | Resolve an alias, title, or QID to a canonical genre. Params: `title=`, `alias=`, `qid=`. |
@@ -86,8 +88,13 @@ make migrate
 # Populate the DB (~15–30 min; crawls ~5k Wikipedia genre pages)
 make bootstrap
 
+# Apply manual curation and derived relationship indexes
+make curate
+make rebuild-indexes
+
 # Start the API
 make api
+# → http://localhost:8080/explorer
 # → http://localhost:8080/docs
 ```
 
@@ -95,6 +102,34 @@ make api
 
 ```bash
 make sync
+make curate
+make rebuild-indexes
+```
+
+### Manual YouTube playlists
+
+Genre pages can have a small, manually curated YouTube playlist. The database
+stores only the genre id, playlist order, song title, artist, and YouTube URL.
+
+Add one track:
+
+```bash
+wiki-genres playlist-add wg-q188450 \
+  --title "Example Song" \
+  --artist "Example Artist" \
+  --youtube-url "https://www.youtube.com/watch?v=..."
+```
+
+Or import a CSV with these headers:
+
+```csv
+genre_id,song_title,artist,youtube_url,ordinal
+wg-q188450,Example Song,Example Artist,https://www.youtube.com/watch?v=...,0
+```
+
+```bash
+wiki-genres playlist-import ./genre-playlists.csv --replace-genres
+wiki-genres playlist-list wg-q188450
 ```
 
 Or schedule it via system cron (runs every Sunday at 06:00 UTC):
@@ -102,6 +137,46 @@ Or schedule it via system cron (runs every Sunday at 06:00 UTC):
 ```cron
 0 6 * * 0  cd /path/to/wiki-genres-project && docker compose run --rm api wiki-genres sync
 ```
+
+### Data curation and discovery
+
+The public graph intentionally excludes fetched pages that are not approved
+music genre/style entries. Reapply that filter after any crawl:
+
+```bash
+wiki-genres curate-genres
+```
+
+For broader pages that may contain genre links, such as country music overview
+pages, crawl the page links through the same strict classifier:
+
+```bash
+wiki-genres crawl-page-links \
+  "Music of Vanuatu" \
+  "Music of the Bahamas" \
+  --max-links-per-page 300 \
+  --concurrency 4
+```
+
+If a source page yields no approved genre links, the command marks that source
+page as non-genre again by default. Then rebuild all derived graph indexes:
+
+```bash
+wiki-genres index-inbound-relationships --sample 0
+wiki-genres flag-circular-relationships --sample 0
+wiki-genres index-music-reachability --sample 0
+```
+
+`index-music-reachability` treats approved `Music of ...` pages as hidden
+children of the synthetic `Music` root (`parent_source=music_country_root`).
+This supports map-based navigation without exposing every country page as a
+normal visible child in the explorer.
+
+`curate-genres` also reapplies the small set of manual display edges in
+`wiki_genres.curation`. These are reserved for high-confidence top-level
+coverage gaps and regional `Music of ...` mounts, and are stored with
+`source=manual_curation` so they remain auditable apart from upstream
+Wikipedia/Wikidata facts.
 
 ---
 

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    name="description"
+    content="Explore a continuously-synced graph of Wikipedia music genres, scenes, roots, and regional variants."
+  />
+  <meta name="application-name" content="wiki-genres explorer" />
+  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)" />
+  <meta property="og:title" content="wiki-genres explorer" />
+  <meta
+    property="og:description"
+    content="A graph-first explorer for Wikipedia's music-genre relationships."
+  />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary" />
+  <title>wiki-genres explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0"
+  />
+  <link rel="stylesheet" href="styles.css?v=311" />
+</head>
+<body>
+  <div id="app">
+
+    <section id="nav-controls" aria-label="Navigation controls">
+      <button id="nav-back-button" type="button" aria-label="Back">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M15 18l-6-6 6-6"></path>
+        </svg>
+      </button>
+      <button id="nav-forward-button" type="button" aria-label="Forward">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 18l6-6-6-6"></path>
+        </svg>
+      </button>
+    </section>
+
+    <svg id="canvas" aria-label="Genre graph explorer">
+      <!-- transparent backdrop captures drag-to-pan on empty space -->
+      <rect id="pan-target" x="0" y="0" width="100%" height="100%" fill="transparent" />
+
+      <g id="world">
+        <g id="edges-layer"></g>
+        <g id="nodes-layer"></g>
+      </g>
+    </svg>
+    <div id="timeline-year-rail" aria-hidden="true"></div>
+
+    <section id="timeline-panel" aria-label="Genre timeline map" hidden>
+      <header class="timeline-header">
+        <div>
+          <div class="timeline-kicker">Timeline</div>
+          <h2 id="timeline-title">Chronological map</h2>
+        </div>
+        <div class="timeline-actions">
+          <select id="timeline-confidence" aria-label="Timeline confidence">
+            <option value="low">All dates</option>
+            <option value="medium">Medium+</option>
+            <option value="high">High only</option>
+          </select>
+          <button id="timeline-close-button" type="button">Graph</button>
+        </div>
+      </header>
+      <svg id="timeline-canvas" role="img" aria-label="Chronological genre evolution chart"></svg>
+      <div id="timeline-status" role="status"></div>
+    </section>
+
+    <div id="mobile-panel-tabs" aria-label="Panel view">
+      <button id="mobile-detail-tab" type="button" class="active">Info</button>
+      <button id="mobile-map-tab" type="button">Map</button>
+    </div>
+
+    <aside id="map-card" aria-label="Regional map">
+      <button id="map-world-button" type="button" hidden>Return to world</button>
+      <div id="map-toolbar" aria-label="Map view controls">
+        <button id="map-list-button" type="button" aria-label="Show variations list" aria-pressed="false">
+          <span class="material-symbols-rounded mode-symbol" aria-hidden="true">format_list_bulleted</span>
+        </button>
+        <button id="map-expand-button" type="button" aria-label="Expand map" aria-expanded="false">
+          <svg class="icon-expand" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 3H3v5"></path>
+            <path d="M3 3l7 7"></path>
+            <path d="M16 3h5v5"></path>
+            <path d="M21 3l-7 7"></path>
+            <path d="M8 21H3v-5"></path>
+            <path d="M3 21l7-7"></path>
+            <path d="M16 21h5v-5"></path>
+            <path d="M21 21l-7-7"></path>
+          </svg>
+          <svg class="icon-collapse" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m14 10 7-7"></path>
+            <path d="M20 10h-6V4"></path>
+            <path d="m3 21 7-7"></path>
+            <path d="M4 14h6v6"></path>
+          </svg>
+        </button>
+      </div>
+      <h2 id="map-title">Map</h2>
+      <button id="map-reset-button" type="button" aria-label="Reset map view" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 12a9 9 0 1 0 3-6.7"></path>
+          <path d="M3 4v5h5"></path>
+        </svg>
+      </button>
+      <svg id="region-map" viewBox="0 0 320 174" role="img" aria-label="Regional genre map">
+        <defs id="map-clip-defs"></defs>
+        <rect class="map-water" x="0" y="0" width="320" height="174"></rect>
+        <g id="map-country-layer"></g>
+        <g id="map-highlight-layer"></g>
+        <g id="map-hit-layer"></g>
+        <g id="map-points"></g>
+      </svg>
+      <div id="map-list" role="list" hidden></div>
+    </aside>
+
+    <div id="right-panel">
+      <section id="search-card" aria-label="Search traversable genres">
+        <label class="visually-hidden" for="genre-search-input">Search traversable genres</label>
+        <div class="search-row">
+          <input
+            id="genre-search-input"
+            type="search"
+            spellcheck="false"
+            placeholder="Search genres"
+            aria-controls="genre-search-results"
+            aria-expanded="false"
+          />
+          <button id="random-genre-button" type="button" aria-label="Open a random traversable genre">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M16 3h5v5"></path>
+              <path d="M4 20 21 3"></path>
+              <path d="M21 16v5h-5"></path>
+              <path d="M15 15l6 6"></path>
+              <path d="M4 4l5 5"></path>
+            </svg>
+          </button>
+          <button id="cloud-toggle-button" type="button" aria-label="Open word cloud">
+            <span class="material-symbols-rounded mode-symbol" aria-hidden="true">mist</span>
+          </button>
+          <button id="timeline-toggle-button" type="button" aria-label="Open timeline map">
+            <span class="material-symbols-rounded mode-symbol" aria-hidden="true">clock_arrow_down</span>
+          </button>
+        </div>
+        <div id="genre-search-results" class="search-results" role="listbox" hidden></div>
+      </section>
+
+      <section id="youtube-card" aria-label="Genre YouTube player">
+        <div class="youtube-embed-wrap">
+          <iframe
+            id="youtube-frame"
+            aria-label="YouTube genre playlist"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen
+          ></iframe>
+          <div id="youtube-empty" class="youtube-empty" aria-label="Loading videos" role="status">
+            <svg class="youtube-spinner" viewBox="0 0 24 24" aria-hidden="true">
+              <circle class="youtube-spinner-track" cx="12" cy="12" r="8.5"></circle>
+              <g class="youtube-spinner-rotor">
+                <circle class="youtube-spinner-arc" cx="12" cy="12" r="8.5"></circle>
+                <animateTransform attributeName="transform" attributeType="XML" type="rotate" from="0 12 12" to="360 12 12" dur="0.85s" repeatCount="indefinite"></animateTransform>
+              </g>
+            </svg>
+          </div>
+        </div>
+        <div class="youtube-card-meta">
+          <div class="youtube-title-block">
+            <div id="youtube-genre-title" role="button" tabindex="0">Music</div>
+            <h2 id="youtube-song-title" hidden></h2>
+            <div id="youtube-artist-title"></div>
+            <p id="youtube-empty-message" class="youtube-empty-message" hidden></p>
+            <button id="youtube-submit-button" type="button" class="youtube-submit-button" hidden>Submit songs</button>
+          </div>
+          <div class="youtube-controls" aria-label="YouTube controls">
+            <div class="youtube-volume-control">
+              <button id="youtube-volume-button" type="button" aria-label="YouTube volume">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 9v6h4l5 4V5L8 9z"></path>
+                  <path d="M16 9.5a4 4 0 0 1 0 5"></path>
+                </svg>
+              </button>
+              <div class="youtube-volume-panel">
+                <input id="youtube-volume-input" type="range" min="0" max="100" step="1" value="70" aria-label="YouTube volume" />
+              </div>
+            </div>
+            <button id="youtube-pause-button" type="button" aria-label="Pause YouTube" disabled>
+              <svg class="icon-pause" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 5v14"></path>
+                <path d="M16 5v14"></path>
+              </svg>
+              <svg class="icon-play" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 5v14l11-7z"></path>
+              </svg>
+            </button>
+            <button id="youtube-skip-button" type="button" aria-label="Skip YouTube" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 5v14l9-7z"></path>
+                <path d="M19 5v14"></path>
+              </svg>
+            </button>
+            <button id="youtube-pin-indicator" type="button" aria-label="Pinned radio" hidden>
+              <span class="material-symbols-rounded youtube-control-symbol" aria-hidden="true">push_pin</span>
+            </button>
+            <div class="youtube-menu-control">
+              <button id="youtube-menu-button" type="button" aria-label="More YouTube options" aria-haspopup="menu" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="5" cy="12" r="1.7"></circle>
+                  <circle cx="12" cy="12" r="1.7"></circle>
+                  <circle cx="19" cy="12" r="1.7"></circle>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div id="detail-card-slot">
+        <aside id="detail-card" aria-label="Genre detail">
+          <div id="card-relation" class="card-relation"></div>
+          <div class="card-title-row">
+            <h2 id="card-title"></h2>
+            <button id="card-target-button" type="button" aria-label="Center selected node" disabled aria-hidden="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="7"></circle>
+                <circle cx="12" cy="12" r="2"></circle>
+                <path d="M12 2v3"></path>
+                <path d="M12 19v3"></path>
+                <path d="M2 12h3"></path>
+                <path d="M19 12h3"></path>
+              </svg>
+            </button>
+            <button id="card-close-button" type="button" aria-label="Close details">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M18 6 6 18"></path>
+                <path d="m6 6 12 12"></path>
+              </svg>
+            </button>
+          </div>
+          <div id="card-synonyms" class="synonym-list"></div>
+          <div id="card-meta" class="metadata-row"></div>
+          <p id="card-summary"></p>
+          <div class="card-link-row">
+            <button id="detail-feedback-button" type="button" class="feedback-link">Feedback</button>
+            <a id="card-wiki-link" href="#" target="_blank" rel="noopener" class="wiki-link">
+              Open on Wikipedia ↗
+            </a>
+          </div>
+        </aside>
+        <button id="detail-restore-button" type="button" aria-label="Show details">
+          <span class="material-symbols-rounded mode-symbol" aria-hidden="true">info</span>
+        </button>
+      </div>
+    </div>
+
+    <div id="feedback-modal" class="modal-shell" role="dialog" aria-modal="true" aria-labelledby="feedback-modal-title" hidden>
+      <div class="modal-backdrop" data-feedback-close></div>
+      <section class="feedback-modal-card">
+        <div class="feedback-modal-header">
+          <h2 id="feedback-modal-title">Feedback</h2>
+          <button id="feedback-close-button" type="button" aria-label="Close feedback">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <form id="feedback-form" class="feedback-form">
+          <div id="feedback-context" class="feedback-context"></div>
+          <label for="feedback-notes">What needs attention?</label>
+          <textarea id="feedback-notes" name="notes" rows="6" maxlength="4000" placeholder="Add context, expected behavior, or a better video link."></textarea>
+          <div class="feedback-actions">
+            <span id="feedback-status" role="status"></span>
+            <button id="feedback-submit-button" type="submit">Send feedback</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div id="youtube-context-menu" class="youtube-context-menu" role="menu" hidden>
+      <button id="youtube-pin-button" type="button" role="menuitem">
+        <span class="material-symbols-rounded youtube-menu-symbol" aria-hidden="true">push_pin</span>
+        <span>Pin Music</span>
+      </button>
+      <button id="youtube-open-button" type="button" role="menuitem">
+        <span class="material-symbols-rounded youtube-menu-symbol" aria-hidden="true">open_in_new</span>
+        <span>Open in YouTube</span>
+      </button>
+      <button id="youtube-feedback-button" type="button" role="menuitem">
+        <span class="material-symbols-rounded youtube-menu-symbol" aria-hidden="true">flag</span>
+        <span>Feedback</span>
+      </button>
+    </div>
+
+    <footer id="footer">
+      <span id="footer-depth"></span>
+      <span id="footer-zoom"></span>
+      <span id="footer-hint"></span>
+    </footer>
+
+  </div>
+
+  <script type="module" src="app.js?v=396"></script>
+</body>
+</html>

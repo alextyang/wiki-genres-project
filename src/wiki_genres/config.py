@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")  # noqa: S104
     api_port: int = Field(default=8080, alias="API_PORT")
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
+    feedback_webhook_url: str | None = Field(default=None, alias="FEEDBACK_WEBHOOK_URL")
 
     # --- Crawler ------------------------------------------------------------
 

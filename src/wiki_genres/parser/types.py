@@ -22,17 +22,17 @@ class InternalLink:
 class ParsedEdge:
     """One edge extracted from the infobox or Wikidata."""
 
-    relation: str           # vocabulary defined in wg_edges check constraint
-    raw_label: str          # verbatim label as it appears in the source
-    wiki_target: str | None # link target (Wikipedia title), if known
-    source: str             # 'infobox' | 'wikidata'
+    relation: str  # vocabulary defined in wg_edges check constraint
+    raw_label: str  # verbatim label as it appears in the source
+    wiki_target: str | None  # link target (Wikipedia title), if known
+    source: str  # 'infobox' | 'wikidata'
     ordinal: int = 0
 
 
 @dataclass
 class ParsedOrigin:
-    kind: str               # 'cultural' | 'temporal'
-    value: str              # raw string, e.g. "Late 1970s, New York City"
+    kind: str  # 'cultural' | 'temporal'
+    value: str  # raw string, e.g. "Late 1970s, New York City"
     parsed_year_start: int | None = None
     parsed_year_end: int | None = None
     parsed_region: str | None = None

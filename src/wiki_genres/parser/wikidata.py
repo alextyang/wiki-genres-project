@@ -16,16 +16,14 @@ logger = structlog.get_logger(__name__)
 
 # Wikidata property ID → edge relation name.
 _PROPERTY_RELATIONS: dict[str, str] = {
-    "P279": "subclass_of",    # subclass of
+    "P279": "subclass_of",  # subclass of
     "P737": "influenced_by",  # influenced by
-    "P361": "part_of",        # part of
-    "P31":  "instance_of",    # instance of
+    "P361": "part_of",  # part of
+    "P31": "instance_of",  # instance of
 }
 
 
-def parse_wikidata_entity(
-    entity_data: dict[str, Any], qid: str
-) -> ParsedWikidataEntity:
+def parse_wikidata_entity(entity_data: dict[str, Any], qid: str) -> ParsedWikidataEntity:
     """Parse a ``wbgetentities`` API response for one entity."""
     entities = entity_data.get("entities", {})
     entity = entities.get(qid)
@@ -76,7 +74,7 @@ def _extract_edges(entity: dict[str, Any]) -> list[ParsedEdge]:
                 ParsedEdge(
                     relation=relation,
                     raw_label=target_qid,  # resolved to title by the loader
-                    wiki_target=None,       # filled in by the loader
+                    wiki_target=None,  # filled in by the loader
                     source="wikidata",
                     ordinal=ordinal,
                 )

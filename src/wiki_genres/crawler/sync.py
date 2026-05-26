@@ -22,20 +22,20 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import text
 
 from wiki_genres.config import get_settings
-from wiki_genres.crawler.bootstrap import _process_one, BootstrapStats
+from wiki_genres.crawler.bootstrap import BootstrapStats, _process_one
 from wiki_genres.crawler.fetcher import WikiFetcher
 from wiki_genres.crawler.frontier import (
     dequeue_batch,
     enqueue_many,
     frontier_size,
 )
-from wiki_genres.crawler.seeds import SeedEntry, fetch_seeds
+from wiki_genres.crawler.seeds import fetch_seeds
 from wiki_genres.db import get_engine
 from wiki_genres.db_migrations import apply_migrations
 from wiki_genres.loader.loader import resolve_edges
@@ -170,6 +170,7 @@ async def run_sync(
 # Helpers                                                             #
 # ------------------------------------------------------------------ #
 
+
 async def _known_qids() -> set[str]:
     """Return the set of Wikidata QIDs already in wg_genres."""
     engine = get_engine()
@@ -204,6 +205,8 @@ async def _enqueue_stale(staleness_days: int) -> int:
             text("""
                 SELECT wikipedia_title FROM wg_genres
                 WHERE last_fetched_at < now() - (interval '1 day' * :days)
+                  AND deleted_at IS NULL
+                  AND is_non_genre = false
                   AND wikipedia_title NOT IN (SELECT title FROM wg_frontier)
             """),
             {"days": staleness_days},
@@ -216,7 +219,7 @@ async def _enqueue_stale(staleness_days: int) -> int:
 
 
 async def _set_sync_state(key: str) -> None:
-    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    now_iso = datetime.now(tz=UTC).isoformat()
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.execute(
@@ -230,7 +233,7 @@ async def _set_sync_state(key: str) -> None:
 
 
 def _snapshot_id() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "-sync"
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ") + "-sync"
 
 
 async def _start_snapshot(snapshot_id: str) -> None:

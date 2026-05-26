@@ -120,6 +120,35 @@ class WikiFetcher:
         )
         return await self._get(url, host="en.wikipedia.org")
 
+    async def search_titles(self, query: str, *, limit: int = 5) -> FetchResult:
+        """Search Wikipedia article titles using the MediaWiki search API."""
+        safe_limit = max(1, min(50, int(limit)))
+        url = (
+            f"{WIKIPEDIA_API}?action=query&list=search"
+            f"&srsearch={quote(query, safe='')}"
+            f"&srlimit={safe_limit}&srprop=snippet&formatversion=2&format=json"
+        )
+        return await self._get(url, host="en.wikipedia.org")
+
+    async def fetch_category_members(
+        self,
+        category_title: str,
+        *,
+        cmcontinue: str | None = None,
+        limit: int = 500,
+    ) -> FetchResult:
+        """Fetch one page of category members for a Wikipedia category."""
+        title = category_title if category_title.startswith("Category:") else f"Category:{category_title}"
+        url = (
+            f"{WIKIPEDIA_API}?action=query&list=categorymembers"
+            f"&cmtitle={quote(title, safe='')}"
+            f"&cmlimit={limit}"
+            f"&formatversion=2&format=json"
+        )
+        if cmcontinue:
+            url += f"&cmcontinue={quote(cmcontinue, safe='')}"
+        return await self._get(url, host="en.wikipedia.org")
+
     async def fetch_wikidata_entity(self, qid: str) -> FetchResult:
         """Fetch a Wikidata entity by QID."""
         url = (
@@ -170,10 +199,7 @@ class WikiFetcher:
         pages = data.get("query", {}).get("pages", [])
         for page in pages:
             templates = page.get("templates", [])
-            if any(
-                t.get("title", "").lower() == "template:infobox music genre"
-                for t in templates
-            ):
+            if any(t.get("title", "").lower() == "template:infobox music genre" for t in templates):
                 return True
         return False
 
@@ -190,7 +216,7 @@ class WikiFetcher:
             if self._from_cache:
                 cached = _read_cache(cache_path)
             if cached:
-                sha = hashlib.sha256(cached).hexdigest()
+                cached_sha = hashlib.sha256(cached).hexdigest()
                 logger.debug("cache_hit", url=url)
                 return FetchResult(
                     url=url,
@@ -198,7 +224,7 @@ class WikiFetcher:
                     content=cached,
                     elapsed_ms=0,
                     from_cache=True,
-                    content_sha256=sha,
+                    content_sha256=cached_sha,
                 )
 
         if self._from_cache:
@@ -215,9 +241,7 @@ class WikiFetcher:
             elapsed = int((time.monotonic() - t0) * 1000)
             content = resp.content if resp.status_code == 200 else None
             sha = hashlib.sha256(content).hexdigest() if content else None
-            logger.debug(
-                "fetched", url=url, status=resp.status_code, elapsed_ms=elapsed
-            )
+            logger.debug("fetched", url=url, status=resp.status_code, elapsed_ms=elapsed)
             if content:
                 _write_cache(cache_path, content)
             return FetchResult(
@@ -249,6 +273,7 @@ class WikiFetcher:
 # ------------------------------------------------------------------ #
 # Cache helpers                                                        #
 # ------------------------------------------------------------------ #
+
 
 def _url_cache_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:24]

@@ -21,9 +21,8 @@ logger = structlog.get_logger(__name__)
 
 # QIDs whose instances/subclasses we treat as music genres.
 _GENRE_CLASS_QIDS = [
-    "Q188451",   # music genre
+    "Q188451",  # music genre
     "Q2944929",  # musical style
-    "Q483394",   # genre
 ]
 
 # Paginated SPARQL query.  Uses only P31 (instance_of) — the transitive P279+
@@ -64,9 +63,7 @@ async def fetch_seeds(fetcher: WikiFetcher, page_size: int = 1000) -> list[SeedE
 
     offset = 0
     while True:
-        query = _SPARQL_TEMPLATE.format(
-            class_values=class_values, limit=page_size, offset=offset
-        )
+        query = _SPARQL_TEMPLATE.format(class_values=class_values, limit=page_size, offset=offset)
         result = await fetcher.fetch_sparql(query)
         if not result.ok:
             logger.warning(
@@ -152,4 +149,4 @@ def _url_to_title(url: str) -> str | None:
     prefix = "https://en.wikipedia.org/wiki/"
     if not url.startswith(prefix):
         return None
-    return unquote(url[len(prefix):]).replace("_", " ")
+    return unquote(url[len(prefix) :]).replace("_", " ")

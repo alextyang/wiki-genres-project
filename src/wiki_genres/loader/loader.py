@@ -36,6 +36,7 @@ def _genre_id(qid: str | None, title: str) -> str:
 # Pass 1: load one genre                                               #
 # ------------------------------------------------------------------ #
 
+
 async def load_genre(
     parsed: ParsedGenre,
     wikidata: ParsedWikidataEntity | None = None,
@@ -47,15 +48,21 @@ async def load_genre(
 
     # Snapshot pre-update state so we can compute a revision diff.
     async with engine.connect() as conn:
-        pre = (await conn.execute(
-            text("""
+        pre = (
+            (
+                await conn.execute(
+                    text("""
                 SELECT raw_wikitext_sha256,
                        (SELECT count(*) FROM wg_edges   WHERE from_genre_id = :id) AS edge_count,
                        (SELECT count(*) FROM wg_aliases WHERE genre_id       = :id) AS alias_count
                 FROM wg_genres WHERE id = :id
             """),
-            {"id": genre_id},
-        )).mappings().fetchone()
+                    {"id": genre_id},
+                )
+            )
+            .mappings()
+            .fetchone()
+        )
 
     old_sha = pre["raw_wikitext_sha256"] if pre else None
     old_edges = int(pre["edge_count"]) if pre else 0
@@ -91,7 +98,8 @@ async def load_genre(
                     last_fetched_at     = now(),
                     deleted_at          = null,
                     last_changed_at     = case
-                        when wg_genres.raw_wikitext_sha256 is distinct from excluded.raw_wikitext_sha256
+                        when wg_genres.raw_wikitext_sha256
+                            is distinct from excluded.raw_wikitext_sha256
                         then now()
                         else wg_genres.last_changed_at
                     end
@@ -219,28 +227,34 @@ async def load_genre(
     # Record a revision entry when content changes on a re-fetch.
     new_sha = parsed.raw_wikitext_sha256
     if old_sha is not None and old_sha != new_sha and parsed.upstream_revision:
-        await _record_revision(
-            engine, genre_id, parsed, triggered_by, old_edges, old_aliases
-        )
+        await _record_revision(engine, genre_id, parsed, triggered_by, old_edges, old_aliases)
 
     logger.debug("genre_loaded", genre_id=genre_id, title=parsed.wikipedia_title)
     return genre_id
 
 
 async def _record_revision(
-    engine, genre_id: str, parsed: ParsedGenre,
-    triggered_by: str, old_edges: int, old_aliases: int,
+    engine,
+    genre_id: str,
+    parsed: ParsedGenre,
+    triggered_by: str,
+    old_edges: int,
+    old_aliases: int,
 ) -> None:
     """Insert a wg_revisions row capturing what changed on this fetch."""
     async with engine.connect() as conn:
-        new_edges = (await conn.scalar(
-            text("SELECT count(*) FROM wg_edges WHERE from_genre_id = :id"),
-            {"id": genre_id},
-        )) or 0
-        new_aliases = (await conn.scalar(
-            text("SELECT count(*) FROM wg_aliases WHERE genre_id = :id"),
-            {"id": genre_id},
-        )) or 0
+        new_edges = (
+            await conn.scalar(
+                text("SELECT count(*) FROM wg_edges WHERE from_genre_id = :id"),
+                {"id": genre_id},
+            )
+        ) or 0
+        new_aliases = (
+            await conn.scalar(
+                text("SELECT count(*) FROM wg_aliases WHERE genre_id = :id"),
+                {"id": genre_id},
+            )
+        ) or 0
 
     diff = {
         "edges_before": old_edges,
@@ -286,6 +300,7 @@ async def _record_revision(
 # Pageviews                                                            #
 # ------------------------------------------------------------------ #
 
+
 async def load_pageviews(genre_id: str, items: list[dict]) -> None:
     """Upsert monthly pageview rows and refresh wg_genres.monthly_views_p30."""
     parsed: list[tuple[int, int, int]] = []
@@ -326,6 +341,7 @@ async def load_pageviews(genre_id: str, items: list[dict]) -> None:
 # ------------------------------------------------------------------ #
 # Pass 2: resolve unlinked edges                                       #
 # ------------------------------------------------------------------ #
+
 
 async def resolve_edges() -> int:
     """Attempt to fill ``to_genre_id`` for every unresolved edge.
@@ -427,8 +443,10 @@ async def _resolve_target(conn: object, edge: ParsedEdge, from_id: str) -> str |
 # Fetch-log helper                                                     #
 # ------------------------------------------------------------------ #
 
-async def log_fetch(url: str, http_status: int, content_sha256: str | None,
-                     elapsed_ms: int, via: str) -> None:
+
+async def log_fetch(
+    url: str, http_status: int, content_sha256: str | None, elapsed_ms: int, via: str
+) -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.execute(
@@ -437,6 +455,11 @@ async def log_fetch(url: str, http_status: int, content_sha256: str | None,
                                           elapsed_ms, via)
                 values (:url, now(), :status, :sha, :elapsed, :via)
             """),
-            {"url": url, "status": http_status, "sha": content_sha256,
-             "elapsed": elapsed_ms, "via": via},
+            {
+                "url": url,
+                "status": http_status,
+                "sha": content_sha256,
+                "elapsed": elapsed_ms,
+                "via": via,
+            },
         )

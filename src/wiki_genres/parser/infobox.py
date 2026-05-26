@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any
+from typing import Any, cast
 
 import mwparserfromhell
 import structlog
@@ -54,10 +54,23 @@ _ALIAS_FIELDS = {"other_names", "other_name", "also_known_as", "also known as", 
 _INSTRUMENT_FIELDS = {"instruments", "instrument", "instruments_2"}
 _COLOR_FIELDS = {"color_background", "color", "bgcolor", "colour_background"}
 _ORIGIN_TEMPORAL_FIELDS = {"origin", "cultural_origins", "cultural_origin"}
+_DISCOVERY_RELATIONS = {
+    "subgenre",
+    "derivative",
+    "fusion_genre",
+    "stylistic_origin",
+}
 
 _SKIP_LINK_PREFIXES = {
-    "File:", "Image:", "Media:", "Category:", "Wikipedia:", "WP:",
-    "Help:", "Template:", "Portal:",
+    "File:",
+    "Image:",
+    "Media:",
+    "Category:",
+    "Wikipedia:",
+    "WP:",
+    "Help:",
+    "Template:",
+    "Portal:",
 }
 
 WIKIPEDIA_BASE = "https://en.wikipedia.org/wiki/"
@@ -120,7 +133,12 @@ def parse_genre_page(
                         ordinal=ordinal,
                     )
                 )
-                if wiki_target and not _skip_link(wiki_target):
+                if (
+                    relation in _DISCOVERY_RELATIONS
+                    and wiki_target
+                    and not _skip_link(wiki_target)
+                    and "#" not in wiki_target
+                ):
                     new_titles.add(wiki_target)  # already normalised above
 
             # Cultural/temporal origin fields also feed wg_origins (prose capture).
@@ -180,6 +198,7 @@ def parse_genre_page(
 # Wikicode extraction helpers                                          #
 # ------------------------------------------------------------------ #
 
+
 def _find_infobox(wikicode: Any) -> Any | None:
     """Return the first ``Infobox music genre`` template, or None."""
     for template in wikicode.filter_templates():
@@ -219,7 +238,11 @@ def _extract_items(param_value: str) -> list[InternalLink | str]:
         if tname in {"hlist", "flatlist", "ublist", "plainlist", "ubl", "bulleted list"}:
             for tparam in template.params:
                 if not tparam.name.strip().isdigit() and tparam.name.strip() not in {
-                    "class", "style", "indent", "ul_style", "li_style"
+                    "class",
+                    "style",
+                    "indent",
+                    "ul_style",
+                    "li_style",
                 }:
                     continue
                 raw = str(tparam.value).strip()
@@ -236,7 +259,7 @@ def _extract_items(param_value: str) -> list[InternalLink | str]:
     # Third pass: if the parameter had no wikilinks at all, split free text.
     if not any(isinstance(i, InternalLink) for i in items):
         plain = _strip_wikicode(param_value)
-        items = _split_free_text(plain)
+        items = cast(list[InternalLink | str], _split_free_text(plain))
 
     return [i for i in items if _item_is_meaningful(i)]
 

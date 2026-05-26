@@ -48,6 +48,7 @@ class ReconcileResult(BaseModel):
 # POST /admin/refetch                                                 #
 # ------------------------------------------------------------------ #
 
+
 @router.post("/refetch", response_model=RefetchResult, dependencies=[Depends(verify_admin_token)])
 async def refetch(body: RefetchRequest) -> RefetchResult:
     """Enqueue a Wikipedia title for an immediate re-fetch."""
@@ -59,7 +60,10 @@ async def refetch(body: RefetchRequest) -> RefetchResult:
 # POST /admin/reconcile                                               #
 # ------------------------------------------------------------------ #
 
-@router.post("/reconcile", response_model=ReconcileResult, dependencies=[Depends(verify_admin_token)])
+
+@router.post(
+    "/reconcile", response_model=ReconcileResult, dependencies=[Depends(verify_admin_token)]
+)
 async def reconcile() -> ReconcileResult:
     """Re-run the edge resolution pass against all unresolved edges."""
     resolved = await resolve_edges()
@@ -70,12 +74,11 @@ async def reconcile() -> ReconcileResult:
 # GET /admin/stats                                                    #
 # ------------------------------------------------------------------ #
 
+
 @router.get("/frontier", dependencies=[Depends(verify_admin_token)])
 async def frontier_status() -> dict:
     """Current frontier queue depth and oldest/newest entries."""
     async with session_scope() as session:
         depth = await session.scalar(text("SELECT count(*) FROM wg_frontier"))
-        oldest = await session.scalar(
-            text("SELECT min(enqueued_at) FROM wg_frontier")
-        )
+        oldest = await session.scalar(text("SELECT min(enqueued_at) FROM wg_frontier"))
     return {"depth": depth, "oldest_enqueued_at": oldest}

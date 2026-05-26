@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import text
@@ -21,11 +22,17 @@ from wiki_genres.crawler.frontier import (
     frontier_size,
     requeue,
 )
-from wiki_genres.crawler.seeds import SeedEntry, fetch_seeds
+from wiki_genres.crawler.seeds import fetch_seeds
+from wiki_genres.curation import (
+    MANUAL_MUSIC_GENRE_TITLES,
+    MUSIC_CATEGORY_MARKERS,
+    MUSIC_GENRE_CLASS_QIDS,
+)
 from wiki_genres.db import get_engine
 from wiki_genres.db_migrations import apply_migrations
 from wiki_genres.loader.loader import load_genre, load_pageviews, log_fetch, resolve_edges
 from wiki_genres.parser.infobox import parse_genre_page
+from wiki_genres.parser.types import ParsedGenre, ParsedWikidataEntity
 from wiki_genres.parser.wikidata import parse_wikidata_entity
 
 logger = structlog.get_logger(__name__)
@@ -86,9 +93,7 @@ async def run_bootstrap(
             # Pre-populate QID map from seeds so we don't refetch page_props
             # for every seed title.
             _qid_cache: dict[str, str] = {
-                s.wikipedia_title: s.wikidata_qid
-                for s in seeds
-                if s.wikidata_qid
+                s.wikipedia_title: s.wikidata_qid for s in seeds if s.wikidata_qid
             }
 
         # 3. Process the frontier in batches.
@@ -114,9 +119,7 @@ async def run_bootstrap(
                         attempts=item["attempts"],
                         sem=sem,
                         skip_wikidata=skip_wikidata,
-                        qid_hint=(_qid_cache if not single_title else {}).get(
-                            item["title"]
-                        ),
+                        qid_hint=(_qid_cache if not single_title else {}).get(item["title"]),
                         stats=stats,
                     )
                 )
@@ -237,10 +240,7 @@ async def _fetch_parse_load(
     if cats_result.ok:
         pages = cats_result.json().get("query", {}).get("pages", [])
         if pages:
-            categories = [
-                c.get("title", "")
-                for c in pages[0].get("categories", [])
-            ]
+            categories = [c.get("title", "") for c in pages[0].get("categories", [])]
 
     # --- Fetch plain-text summary -----------------------------------------
     summary: str | None = None
@@ -269,11 +269,16 @@ async def _fetch_parse_load(
     if wikidata_entity:
         parsed.wikidata_edges = wikidata_entity.edges
         # Merge wikidata aliases that aren't already in infobox aliases.
-        existing = set(a.lower() for a in parsed.aliases)
+        existing = {a.lower() for a in parsed.aliases}
         for a in wikidata_entity.aliases:
             if a.lower() not in existing:
                 parsed.aliases.append(a)
                 existing.add(a.lower())
+
+    if not _is_music_genre_candidate(parsed, wikidata_entity):
+        stats.genres_skipped += 1
+        logger.info("genre_skipped_not_music_genre", title=canonical_title, qid=qid)
+        return
 
     # --- Load to DB -------------------------------------------------------
     genre_id = await load_genre(parsed, wikidata_entity, triggered_by=triggered_by)
@@ -296,9 +301,36 @@ async def _fetch_parse_load(
             stats.new_titles_enqueued += added
 
 
+def _is_music_genre_candidate(
+    parsed: ParsedGenre,
+    wikidata_entity: ParsedWikidataEntity | None,
+) -> bool:
+    """Return True when a fetched page belongs in the public genre graph."""
+    if parsed.has_infobox:
+        return True
+
+    if parsed.wikipedia_title in MANUAL_MUSIC_GENRE_TITLES:
+        return True
+
+    if wikidata_entity and any(
+        edge.source == "wikidata"
+        and edge.relation in {"instance_of", "subclass_of"}
+        and edge.raw_label in MUSIC_GENRE_CLASS_QIDS
+        for edge in wikidata_entity.edges
+    ):
+        return True
+
+    return any(
+        marker in category.lower()
+        for category in parsed.categories
+        for marker in MUSIC_CATEGORY_MARKERS
+    )
+
+
 async def _handle_redirect(from_title: str, wikitext: str, stats: BootstrapStats) -> None:
     """Record a Wikipedia redirect in ``wg_redirects``."""
     import re
+
     m = re.search(r"#REDIRECT\s*\[\[([^\]]+)\]\]", wikitext, re.IGNORECASE)
     if not m:
         return
@@ -329,29 +361,25 @@ async def _filter_new_titles(titles: list[str]) -> list[str]:
         return []
     engine = get_engine()
     async with engine.connect() as conn:
-        existing_genres = set(
+        existing_genres = {
             row[0]
             for row in await conn.execute(
-                text(
-                    "select wikipedia_title from wg_genres "
-                    "where wikipedia_title = any(:titles)"
-                ),
+                text("select wikipedia_title from wg_genres where wikipedia_title = any(:titles)"),
                 {"titles": titles},
             )
-        )
-        existing_frontier = set(
+        }
+        existing_frontier = {
             row[0]
             for row in await conn.execute(
                 text("select title from wg_frontier where title = any(:titles)"),
                 {"titles": titles},
             )
-        )
+        }
     return [t for t in titles if t not in existing_genres and t not in existing_frontier]
 
 
 def _snapshot_id() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "-bootstrap"
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ") + "-bootstrap"
 
 
 async def _start_snapshot(snapshot_id: str) -> None:
