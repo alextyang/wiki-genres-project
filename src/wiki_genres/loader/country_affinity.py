@@ -304,7 +304,7 @@ async def _load_promoted_child_evidence(conn: object) -> dict[tuple[str, str], l
                         parent.wikipedia_title AS parent_title,
                         child.wikipedia_title AS child_title
                     FROM wg_region_promoted_genres p
-                    JOIN wg_edges edge ON edge.from_genre_id = p.genre_id
+                    JOIN wg_relationship_traversal_edges edge ON edge.from_genre_id = p.genre_id
                     JOIN wg_genres parent ON parent.id = p.genre_id
                     JOIN wg_genres child ON child.id = edge.to_genre_id
                     JOIN wg_regions r ON r.id = p.region_id

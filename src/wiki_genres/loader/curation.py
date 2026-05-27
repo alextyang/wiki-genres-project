@@ -28,6 +28,7 @@ class CurationStats:
     changed_rows: int = 0
     forced_non_genre_rows: int = 0
     manual_edges_upserted: int = 0
+    manual_relationships_upserted: int = 0
     manual_edges_missing_titles: list[str] = field(default_factory=list)
 
 
@@ -92,6 +93,8 @@ async def apply_genre_curation(
                 SELECT g.id
                 FROM wg_genres g
                 WHERE (
+                    g.is_non_genre = false
+                    OR
                     g.has_infobox
                     OR EXISTS (
                         SELECT 1
@@ -127,9 +130,23 @@ async def apply_genre_curation(
                 WITH next_state AS (
                     SELECT
                         g.id,
-                        NOT EXISTS (
-                            SELECT 1 FROM wg_approved_genre_ids a WHERE a.id = g.id
-                        ) AS next_is_non_genre
+                        CASE
+                            WHEN EXISTS (
+                                SELECT 1
+                                FROM wg_force_non_genre_titles f
+                                WHERE f.wikipedia_title = g.wikipedia_title
+                            ) THEN true
+                            WHEN g.is_non_genre = true
+                             AND g.non_genre_reviewed_at IS NOT NULL
+                             AND g.non_genre_review_note NOT IN (
+                                'manual review: not an approved music genre/style entry',
+                                'source-page crawl found no approved genre links'
+                             ) THEN true
+                            WHEN EXISTS (
+                                SELECT 1 FROM wg_approved_genre_ids a WHERE a.id = g.id
+                            ) THEN false
+                            ELSE true
+                        END AS next_is_non_genre
                     FROM wg_genres g
                     WHERE g.deleted_at IS NULL
                 ),
@@ -197,6 +214,10 @@ async def apply_genre_curation(
 
         await conn.execute(
             text("DELETE FROM wg_edges WHERE source = :source"),
+            {"source": MANUAL_CURATION_EDGE_SOURCE},
+        )
+        await conn.execute(
+            text("DELETE FROM wg_genre_relationships WHERE source = :source"),
             {"source": MANUAL_CURATION_EDGE_SOURCE},
         )
         if MANUAL_DISPLAY_EDGES:
@@ -286,6 +307,49 @@ async def apply_genre_curation(
                 {"source": MANUAL_CURATION_EDGE_SOURCE},
             )
             stats.manual_edges_upserted = int(result.rowcount or 0)
+            result = await conn.execute(
+                text("""
+                    INSERT INTO wg_genre_relationships (
+                        from_genre_id,
+                        to_genre_id,
+                        to_raw_label,
+                        relationship_type,
+                        source,
+                        ordinal,
+                        confidence,
+                        evidence,
+                        review_run_id,
+                        status
+                    )
+                    SELECT
+                        parent_g.id,
+                        child_g.id,
+                        child_g.wikipedia_title,
+                        CASE m.relation
+                            WHEN 'subgenre' THEN 'subgenres'
+                            WHEN 'derivative' THEN 'derived_genres'
+                            WHEN 'fusion_genre' THEN 'fusion_descendants'
+                            ELSE 'sibling_or_adjacent_genres'
+                        END,
+                        :source,
+                        m.ordinal,
+                        'high',
+                        'Manual curation display edge.',
+                        'manual_curation',
+                        'active'
+                    FROM wg_manual_display_edges m
+                    JOIN wg_genres parent_g
+                      ON parent_g.wikipedia_title = m.parent_title
+                     AND parent_g.deleted_at IS NULL
+                     AND parent_g.is_non_genre = false
+                    JOIN wg_genres child_g
+                      ON child_g.wikipedia_title = m.child_title
+                     AND child_g.deleted_at IS NULL
+                     AND child_g.is_non_genre = false
+                """),
+                {"source": MANUAL_CURATION_EDGE_SOURCE},
+            )
+            stats.manual_relationships_upserted = int(result.rowcount or 0)
 
         await conn.execute(
             text("""
@@ -301,7 +365,7 @@ async def apply_genre_curation(
                     :nodes,
                     (
                         SELECT count(*)
-                        FROM wg_edges e
+                        FROM wg_relationship_detail_edges e
                         JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                         LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                         WHERE from_g.is_non_genre = false
@@ -333,6 +397,7 @@ async def apply_genre_curation(
         changed_rows=stats.changed_rows,
         forced_non_genre_rows=stats.forced_non_genre_rows,
         manual_edges_upserted=stats.manual_edges_upserted,
+        manual_relationships_upserted=stats.manual_relationships_upserted,
         manual_edges_missing_titles=stats.manual_edges_missing_titles,
     )
     return stats

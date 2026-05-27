@@ -40,6 +40,7 @@ class DirectionGuardStats:
     cleared_existing: int = 0
     ignored: int = 0
     skipped_promoted_region_node: int = 0
+    skipped_reviewed_schema: bool = False
     dry_run: bool = False
     sample: list[DirectionEdge] = field(default_factory=list)
 
@@ -99,6 +100,25 @@ async def guard_genre_direction(
                 {"reason": DIRECTION_GUARD_REASON},
             )
             stats.cleared_existing = int(result.rowcount or 0)
+
+        reviewed_schema_active = await conn.scalar(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM wg_genre_relationships
+                    WHERE status = 'active'
+                )
+            """)
+        )
+        if reviewed_schema_active:
+            stats.skipped_reviewed_schema = True
+            logger.info(
+                "genre_direction_guard_skipped",
+                reason="reviewed_relationship_schema_active",
+                cleared_existing=stats.cleared_existing,
+                dry_run=dry_run,
+            )
+            return stats
 
         skipped = await conn.scalar(
             text("""

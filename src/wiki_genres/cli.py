@@ -231,6 +231,8 @@ def guard_genre_direction(
 
     mode = "dry-run" if dry_run else "write"
     typer.echo(f"genre direction guard ({mode})")
+    if stats.skipped_reviewed_schema:
+        typer.echo("  skipped: reviewed relationship schema is active")
     typer.echo(f"  display edges scanned:        {stats.edges_scanned}")
     typer.echo(f"  skipped promoted region nodes:{stats.skipped_promoted_region_node}")
     typer.echo(f"  cleared existing:             {stats.cleared_existing}")
@@ -870,6 +872,7 @@ def curate_genres(
     typer.echo(f"  changed rows:     {stats.changed_rows}")
     typer.echo(f"  forced non-genre: {stats.forced_non_genre_rows}")
     typer.echo(f"  manual edges:     {stats.manual_edges_upserted}")
+    typer.echo(f"  manual relations: {stats.manual_relationships_upserted}")
     if stats.manual_edges_missing_titles:
         typer.echo(f"  missing manual titles: {', '.join(stats.manual_edges_missing_titles)}")
 

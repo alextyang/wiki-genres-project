@@ -144,16 +144,36 @@ async def index_genre_merge_candidates(
                                 LEAST(e1.to_genre_id, e2.to_genre_id) AS left_genre_id,
                                 GREATEST(e1.to_genre_id, e2.to_genre_id) AS right_genre_id,
                                 count(DISTINCT e1.from_genre_id) AS shared_parent_count
-                            FROM wg_edges e1
-                            JOIN wg_edges e2
+                            FROM wg_relationship_traversal_edges e1
+                            JOIN wg_relationship_traversal_edges e2
                               ON e1.from_genre_id = e2.from_genre_id
                              AND e1.to_genre_id < e2.to_genre_id
                             JOIN active_genres g1 ON g1.id = e1.to_genre_id
                             JOIN active_genres g2 ON g2.id = e2.to_genre_id
                             WHERE e1.is_ignored = false
                               AND e2.is_ignored = false
-                              AND e1.relation IN ('subgenre', 'derivative', 'fusion_genre')
-                              AND e2.relation IN ('subgenre', 'derivative', 'fusion_genre')
+                              AND e1.relation IN (
+                                  'broader_genres',
+                                  'subgenres',
+                                  'derived_genres',
+                                  'fusion_components',
+                                  'fusion_descendants',
+                                  'regional_variations',
+                                  'subgenre',
+                                  'derivative',
+                                  'fusion_genre'
+                              )
+                              AND e2.relation IN (
+                                  'broader_genres',
+                                  'subgenres',
+                                  'derived_genres',
+                                  'fusion_components',
+                                  'fusion_descendants',
+                                  'regional_variations',
+                                  'subgenre',
+                                  'derivative',
+                                  'fusion_genre'
+                              )
                             GROUP BY 1, 2
                         ),
                         graph_child_pairs AS (
@@ -161,16 +181,36 @@ async def index_genre_merge_candidates(
                                 LEAST(e1.from_genre_id, e2.from_genre_id) AS left_genre_id,
                                 GREATEST(e1.from_genre_id, e2.from_genre_id) AS right_genre_id,
                                 count(DISTINCT e1.to_genre_id) AS shared_child_count
-                            FROM wg_edges e1
-                            JOIN wg_edges e2
+                            FROM wg_relationship_traversal_edges e1
+                            JOIN wg_relationship_traversal_edges e2
                               ON e1.to_genre_id = e2.to_genre_id
                              AND e1.from_genre_id < e2.from_genre_id
                             JOIN active_genres g1 ON g1.id = e1.from_genre_id
                             JOIN active_genres g2 ON g2.id = e2.from_genre_id
                             WHERE e1.is_ignored = false
                               AND e2.is_ignored = false
-                              AND e1.relation IN ('subgenre', 'derivative', 'fusion_genre')
-                              AND e2.relation IN ('subgenre', 'derivative', 'fusion_genre')
+                              AND e1.relation IN (
+                                  'broader_genres',
+                                  'subgenres',
+                                  'derived_genres',
+                                  'fusion_components',
+                                  'fusion_descendants',
+                                  'regional_variations',
+                                  'subgenre',
+                                  'derivative',
+                                  'fusion_genre'
+                              )
+                              AND e2.relation IN (
+                                  'broader_genres',
+                                  'subgenres',
+                                  'derived_genres',
+                                  'fusion_components',
+                                  'fusion_descendants',
+                                  'regional_variations',
+                                  'subgenre',
+                                  'derivative',
+                                  'fusion_genre'
+                              )
                             GROUP BY 1, 2
                         ),
                         all_pairs AS (
@@ -417,13 +457,25 @@ async def export_tree_review_batches(
                                     e.evidence_relation,
                                     e.source,
                                     e.ordinal
-                                FROM wg_edges e
+                                FROM wg_relationship_neighbor_edges e
                                 JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                                 JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                                 WHERE e.is_ignored = false
                                   AND e.from_genre_id = ANY(:node_ids)
                                   AND e.to_genre_id = ANY(:node_ids)
-                                  AND e.relation IN ('subgenre', 'derivative', 'fusion_genre', 'related_genre')
+                                  AND e.relation IN (
+                                      'broader_genres',
+                                      'subgenres',
+                                      'derived_genres',
+                                      'fusion_components',
+                                      'fusion_descendants',
+                                      'regional_variations',
+                                      'sibling_or_adjacent_genres',
+                                      'subgenre',
+                                      'derivative',
+                                      'fusion_genre',
+                                      'related_genre'
+                                  )
                                 ORDER BY from_g.wikipedia_title, to_g.wikipedia_title, e.relation, e.source, e.ordinal
                             """),
                             {"node_ids": node_ids},

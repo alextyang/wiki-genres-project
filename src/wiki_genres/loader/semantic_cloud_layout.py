@@ -1226,7 +1226,8 @@ async def _fetch_region_genres(conn: object, *, region_id: str) -> list[Semantic
                             region_tree.region_depth + 1 AS region_depth,
                             1 AS relation_rank
                         FROM region_tree
-                        JOIN wg_edges edge ON edge.from_genre_id = region_tree.promoted_genre_id
+                        JOIN wg_relationship_traversal_edges edge
+                          ON edge.from_genre_id = region_tree.promoted_genre_id
                         JOIN wg_genres child ON child.id = edge.to_genre_id
                         WHERE region_tree.region_id <> :region_id
                           AND region_tree.promoted_title ~* '\\mmusic\\s+(of|in)\\M'

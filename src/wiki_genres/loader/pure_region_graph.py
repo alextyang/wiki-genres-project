@@ -35,6 +35,12 @@ REGION_EDGE_RELATIONS = {
     "instance_of",
     "regional_scene",
     "local_scene",
+    "broader_genres",
+    "subgenres",
+    "regional_variations",
+    "subgenre",
+    "derivative",
+    "fusion_genre",
 }
 
 INVERTED_REGION_EDGE_RELATIONS = {
@@ -456,7 +462,7 @@ async def _insert_pure_region_relationships(
                             least(from_map.confidence, to_map.confidence) AS confidence,
                             from_map.mapping_type AS from_mapping_type,
                             to_map.mapping_type AS to_mapping_type
-                        FROM wg_edges e
+                        FROM wg_relationship_traversal_edges e
                         JOIN wg_region_node_mappings from_map
                           ON from_map.genre_id = e.from_genre_id
                         JOIN wg_region_node_mappings to_map
@@ -540,7 +546,7 @@ async def _insert_pure_region_relationships(
                     :source_direction,
                     :confidence,
                     jsonb_build_object(
-                        'source', 'wg_edges',
+                        'source', 'relationship_projection',
                         'from_mapping_type', CAST(:from_mapping_type AS text),
                         'to_mapping_type', CAST(:to_mapping_type AS text)
                     ),
