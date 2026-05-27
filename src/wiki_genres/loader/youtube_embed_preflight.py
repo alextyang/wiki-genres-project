@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from sqlalchemy import text
@@ -21,9 +21,24 @@ from sqlalchemy import text
 from wiki_genres.db import session_scope
 from wiki_genres.db_migrations import apply_migrations
 
-
 YOUTUBE_OEMBED = "https://www.youtube.com/oembed?format=json&url="
 YOUTUBE_EMBED = "https://www.youtube.com/embed/"
+YOUTUBEI_PLAYER = "https://www.youtube.com/youtubei/v1/player"
+YOUTUBEI_KEY_BOOTSTRAP_VIDEO_ID = "dQw4w9WgXcQ"
+YOUTUBEI_ANDROID_CLIENT = {
+    "hl": "en",
+    "gl": "US",
+    "clientName": "ANDROID",
+    "clientVersion": "20.10.38",
+    "androidSdkVersion": 35,
+    "userAgent": "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
+}
+YOUTUBEI_BOT_OR_INTEGRITY_REASONS = (
+    "bot",
+    "reload",
+    "sign in",
+    "please sign in",
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,13 @@ class EmbedShortfall:
     needed_count: int
 
 
+@dataclass(frozen=True)
+class YoutubeiProbeResult:
+    is_embeddable: bool | None
+    http_status: int | None
+    error: str = ""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -86,6 +108,7 @@ def extract_video_id(youtube_url: str) -> str:
 
 
 _PLAYER_RESPONSE_RE = re.compile(r"ytInitialPlayerResponse\s*=\s*", re.DOTALL)
+_INNERTUBE_API_KEY_RE = re.compile(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"')
 
 
 def _parse_player_response(html: str) -> dict[str, Any] | None:
@@ -102,8 +125,17 @@ def _parse_player_response(html: str) -> dict[str, Any] | None:
     return parsed
 
 
+def _parse_innertube_api_key(html: str) -> str:
+    match = _INNERTUBE_API_KEY_RE.search(html)
+    return match.group(1) if match else ""
+
+
 def _is_embed_playable(player_response: dict[str, Any]) -> tuple[bool, str]:
-    status = (player_response.get("playabilityStatus") or {}) if isinstance(player_response, dict) else {}
+    status = (
+        (player_response.get("playabilityStatus") or {})
+        if isinstance(player_response, dict)
+        else {}
+    )
     code = str(status.get("status") or "")
     if code and code != "OK":
         reason = str(status.get("reason") or code).strip()
@@ -112,6 +144,37 @@ def _is_embed_playable(player_response: dict[str, Any]) -> tuple[bool, str]:
         reason = str(status.get("reason") or "playableInEmbed=false").strip()
         return False, reason or "playableInEmbed=false"
     return True, ""
+
+
+def _is_youtubei_player_decisive(player_response: dict[str, Any]) -> tuple[bool | None, str]:
+    """Return decisive embed-relevant blocks from youtubei/v1/player.
+
+    Browser-shaped WEB_EMBEDDED_PLAYER requests can false-negative without
+    YouTube's live playback integrity tokens. The worker uses the mobile player
+    response as a conservative probe: explicit non-embeddable and unavailable
+    states are actionable, while generic bot/integrity responses remain unknown.
+    """
+    status = (
+        (player_response.get("playabilityStatus") or {})
+        if isinstance(player_response, dict)
+        else {}
+    )
+    code = str(status.get("status") or "")
+    reason = str(status.get("reason") or code).strip()
+    normalized_reason = reason.lower()
+
+    if code == "OK":
+        if status.get("playableInEmbed") is False:
+            return False, "youtubei playableInEmbed=false"
+        return None, ""
+
+    if not code:
+        return None, "youtubei missing playabilityStatus"
+
+    if any(marker in normalized_reason for marker in YOUTUBEI_BOT_OR_INTEGRITY_REASONS):
+        return None, f"youtubei {code}: {reason or code}"
+
+    return False, f"youtubei {code}: {reason or code}"
 
 
 def _decision_for_http(result: PreflightResult) -> PreflightResult:
@@ -136,7 +199,10 @@ def _nullable_bool(value: object) -> bool | None:
     return bool(value)
 
 
-async def _fetch_oembed(client: httpx.AsyncClient, youtube_url: str) -> tuple[bool, int | None, str, str, str]:
+async def _fetch_oembed(
+    client: httpx.AsyncClient,
+    youtube_url: str,
+) -> tuple[bool, int | None, str, str, str]:
     url = f"{YOUTUBE_OEMBED}{quote(youtube_url, safe='')}"
     try:
         resp = await client.get(url)
@@ -153,7 +219,10 @@ async def _fetch_oembed(client: httpx.AsyncClient, youtube_url: str) -> tuple[bo
     return True, resp.status_code, "", title, author
 
 
-async def _fetch_embed_playability(client: httpx.AsyncClient, video_id: str) -> tuple[bool, int | None, str]:
+async def _fetch_embed_playability(
+    client: httpx.AsyncClient,
+    video_id: str,
+) -> tuple[bool, int | None, str]:
     url = f"{YOUTUBE_EMBED}{quote(video_id, safe='')}"
     try:
         resp = await client.get(url)
@@ -167,6 +236,78 @@ async def _fetch_embed_playability(client: httpx.AsyncClient, video_id: str) -> 
         return True, resp.status_code, ""
     ok, reason = _is_embed_playable(parsed)
     return ok, resp.status_code, reason
+
+
+async def _fetch_youtubei_api_key(client: httpx.AsyncClient) -> str:
+    url = f"{YOUTUBE_EMBED}{YOUTUBEI_KEY_BOOTSTRAP_VIDEO_ID}"
+    try:
+        resp = await client.get(url)
+    except httpx.HTTPError:
+        return ""
+    if resp.status_code != 200:
+        return ""
+    return _parse_innertube_api_key(resp.text)
+
+
+async def _fetch_youtubei_playability(
+    client: httpx.AsyncClient,
+    video_id: str,
+    api_key: str,
+) -> YoutubeiProbeResult:
+    if not api_key:
+        return YoutubeiProbeResult(
+            is_embeddable=None,
+            http_status=None,
+            error="youtubei missing api key",
+        )
+
+    user_agent = str(YOUTUBEI_ANDROID_CLIENT["userAgent"])
+    payload = {
+        "context": {"client": YOUTUBEI_ANDROID_CLIENT},
+        "videoId": video_id,
+        "contentCheckOk": True,
+        "racyCheckOk": True,
+        "thirdParty": {"embedUrl": "http://127.0.0.1:8765/explorer/"},
+    }
+    try:
+        resp = await client.post(
+            YOUTUBEI_PLAYER,
+            params={"key": api_key, "prettyPrint": "false"},
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": user_agent,
+            },
+        )
+    except httpx.HTTPError as exc:
+        return YoutubeiProbeResult(
+            is_embeddable=None,
+            http_status=None,
+            error=f"youtubei error: {exc}",
+        )
+
+    if resp.status_code != 200:
+        return YoutubeiProbeResult(
+            is_embeddable=None,
+            http_status=resp.status_code,
+            error=f"youtubei status {resp.status_code}",
+        )
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return YoutubeiProbeResult(
+            is_embeddable=None,
+            http_status=resp.status_code,
+            error="youtubei invalid json",
+        )
+
+    decision, reason = _is_youtubei_player_decisive(data)
+    return YoutubeiProbeResult(
+        is_embeddable=decision,
+        http_status=resp.status_code,
+        error=reason,
+    )
 
 
 async def _preflight_youtube_urls(
@@ -222,11 +363,18 @@ async def _preflight_youtube_urls(
 
     to_check = [url for url in unique_urls if force or url not in cached]
 
-    limits = httpx.Limits(max_connections=max(10, concurrency * 2), max_keepalive_connections=max(10, concurrency))
+    limits = httpx.Limits(
+        max_connections=max(10, concurrency * 2),
+        max_keepalive_connections=max(10, concurrency),
+    )
     timeout = httpx.Timeout(12.0, connect=8.0)
     semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
-    async def _check_one(url: str, client: httpx.AsyncClient) -> PreflightResult:
+    async def _check_one(
+        url: str,
+        client: httpx.AsyncClient,
+        youtubei_api_key: str,
+    ) -> PreflightResult:
         async with semaphore:
             checked_at = _now()
             ok, status, err, title, author = await _fetch_oembed(client, url)
@@ -252,6 +400,22 @@ async def _preflight_youtube_urls(
                     oembed_author=author,
                 )
 
+            youtubei = await _fetch_youtubei_playability(client, video_id, youtubei_api_key)
+            if youtubei.is_embeddable is False:
+                return PreflightResult(
+                    youtube_url=url,
+                    is_embeddable=False,
+                    checked_at=checked_at,
+                    http_status=(
+                        youtubei.http_status
+                        if youtubei.http_status is not None
+                        else status
+                    ),
+                    error=youtubei.error,
+                    oembed_title=title,
+                    oembed_author=author,
+                )
+
             playable, embed_status, embed_err = await _fetch_embed_playability(client, video_id)
             http_status = embed_status if embed_status is not None else status
             return PreflightResult(
@@ -271,7 +435,8 @@ async def _preflight_youtube_urls(
         timeout=timeout,
         limits=limits,
     ) as client:
-        tasks = [_check_one(url, client) for url in to_check]
+        youtubei_api_key = await _fetch_youtubei_api_key(client) if to_check else ""
+        tasks = [_check_one(url, client, youtubei_api_key) for url in to_check]
         if tasks:
             checked_results = [_decision_for_http(r) for r in await asyncio.gather(*tasks)]
 

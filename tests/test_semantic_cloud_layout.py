@@ -8,6 +8,27 @@ from wiki_genres.loader.semantic_cloud_layout import (
 )
 
 
+def test_semantic_cloud_label_metrics_store_text_and_padded_boxes() -> None:
+    genre = SemanticGenre(
+        genre_id="wg-rb",
+        title="Rhythm and blues",
+        summary=None,
+        monthly_views_p30=100,
+        depth_from_music=2,
+        root_genre_id="wg-root",
+        root_title="Rhythm and blues",
+        child_connection_count=3,
+        parent_connection_count=2,
+        has_playlist=True,
+    )
+
+    assert genre.text_width == genre.width
+    assert genre.text_height == genre.height
+    assert genre.box_width > genre.text_width
+    assert genre.box_height > genre.text_height
+    assert genre.box_pad_x > genre.box_pad_y
+
+
 def test_semantic_cloud_filters_wikipedia_maintenance_terms() -> None:
     genre = SemanticGenre(
         genre_id="wg-test",

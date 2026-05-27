@@ -8,8 +8,7 @@
     content="Explore a continuously-synced graph of Wikipedia music genres, scenes, roots, and regional variants."
   />
   <meta name="application-name" content="wiki-genres explorer" />
-  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
-  <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#0d0d0d" />
   <meta property="og:title" content="wiki-genres explorer" />
   <meta
     property="og:description"
@@ -24,24 +23,44 @@
     rel="stylesheet"
     href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0"
   />
-  <link rel="stylesheet" href="styles.css?v=311" />
+  <link rel="stylesheet" href="styles.css?v=531" />
 </head>
-<body>
+<body class="app-booting">
+  <div id="boot-loading" aria-live="polite" aria-hidden="true">
+    <div class="boot-loading-spinner"></div>
+  </div>
+  <script>
+    window.__wikiGenresBootWatchdog = window.setTimeout(function () {
+      document.body.classList.remove("app-booting");
+      var loader = document.getElementById("boot-loading");
+      if (loader) loader.setAttribute("aria-hidden", "true");
+      console.warn("[wiki-genres] boot watchdog cleared the loading mask");
+    }, 9000);
+  </script>
   <div id="app">
 
     <section id="nav-controls" aria-label="Navigation controls">
-      <button id="nav-back-button" type="button" aria-label="Back">
+      <button id="nav-back-button" type="button" aria-label="Back" data-tooltip="Back">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M15 18l-6-6 6-6"></path>
         </svg>
       </button>
-      <button id="nav-forward-button" type="button" aria-label="Forward">
+      <button id="nav-forward-button" type="button" aria-label="Forward" data-tooltip="Forward">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M9 18l6-6-6-6"></path>
         </svg>
       </button>
+      <button id="cloud-toggle-button" type="button" class="mode-toggle-button" aria-label="Open word cloud">
+        <span class="material-symbols-rounded mode-symbol" aria-hidden="true">mist</span>
+        <span class="mode-toggle-label">Cloud</span>
+      </button>
+      <button id="timeline-toggle-button" type="button" class="mode-toggle-button" aria-label="Open timeline map">
+        <span class="material-symbols-rounded mode-symbol" aria-hidden="true">clock_arrow_down</span>
+        <span class="mode-toggle-label">Timeline</span>
+      </button>
     </section>
 
+    <canvas id="cloud-label-canvas" aria-hidden="true"></canvas>
     <svg id="canvas" aria-label="Genre graph explorer">
       <!-- transparent backdrop captures drag-to-pan on empty space -->
       <rect id="pan-target" x="0" y="0" width="100%" height="100%" fill="transparent" />
@@ -73,17 +92,16 @@
     </section>
 
     <div id="mobile-panel-tabs" aria-label="Panel view">
-      <button id="mobile-detail-tab" type="button" class="active">Info</button>
-      <button id="mobile-map-tab" type="button">Map</button>
+      <button id="mobile-detail-tab" type="button" class="active">Details</button>
+      <button id="mobile-map-tab" type="button">Radio</button>
     </div>
-
     <aside id="map-card" aria-label="Regional map">
-      <button id="map-world-button" type="button" hidden>Return to world</button>
+      <button id="map-world-button" type="button" hidden>Return to global</button>
       <div id="map-toolbar" aria-label="Map view controls">
-        <button id="map-list-button" type="button" aria-label="Show variations list" aria-pressed="false">
+        <button id="map-list-button" type="button" aria-label="Show variations list" aria-pressed="false" data-tooltip="Show variations list" hidden>
           <span class="material-symbols-rounded mode-symbol" aria-hidden="true">format_list_bulleted</span>
         </button>
-        <button id="map-expand-button" type="button" aria-label="Expand map" aria-expanded="false">
+        <button id="map-expand-button" type="button" aria-label="Expand map" aria-expanded="false" data-tooltip="Expand map">
           <svg class="icon-expand" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M8 3H3v5"></path>
             <path d="M3 3l7 7"></path>
@@ -102,8 +120,23 @@
           </svg>
         </button>
       </div>
+      <button id="map-parent-label" type="button" hidden aria-label="Return to parent genre">
+        <span class="material-symbols-rounded mode-symbol" aria-hidden="true">arrow_back</span>
+        <span id="map-parent-label-text"></span>
+      </button>
       <h2 id="map-title">Map</h2>
-      <button id="map-reset-button" type="button" aria-label="Reset map view" hidden>
+      <label class="visually-hidden" for="map-list-search-input">Search map regions</label>
+      <input
+        id="map-list-search-input"
+        type="search"
+        spellcheck="false"
+        placeholder="Search regions"
+        hidden
+      />
+      <button id="map-list-search-button" type="button" aria-label="Search map list" data-tooltip="Search map list" hidden>
+        <span class="material-symbols-rounded mode-symbol" aria-hidden="true">search</span>
+      </button>
+      <button id="map-reset-button" type="button" aria-label="Reset map view" data-tooltip="Reset map view" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M3 12a9 9 0 1 0 3-6.7"></path>
           <path d="M3 4v5h5"></path>
@@ -132,7 +165,7 @@
             aria-controls="genre-search-results"
             aria-expanded="false"
           />
-          <button id="random-genre-button" type="button" aria-label="Open a random traversable genre">
+          <button id="random-genre-button" type="button" aria-label="Open a random traversable genre" data-tooltip="Open a random genre">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M16 3h5v5"></path>
               <path d="M4 20 21 3"></path>
@@ -141,17 +174,17 @@
               <path d="M4 4l5 5"></path>
             </svg>
           </button>
-          <button id="cloud-toggle-button" type="button" aria-label="Open word cloud">
-            <span class="material-symbols-rounded mode-symbol" aria-hidden="true">mist</span>
-          </button>
-          <button id="timeline-toggle-button" type="button" aria-label="Open timeline map">
-            <span class="material-symbols-rounded mode-symbol" aria-hidden="true">clock_arrow_down</span>
-          </button>
         </div>
         <div id="genre-search-results" class="search-results" role="listbox" hidden></div>
       </section>
 
       <section id="youtube-card" aria-label="Genre YouTube player">
+        <button id="youtube-close-button" type="button" aria-label="Close radio" data-tooltip="Close radio">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18"></path>
+            <path d="m6 6 12 12"></path>
+          </svg>
+        </button>
         <div class="youtube-embed-wrap">
           <iframe
             id="youtube-frame"
@@ -175,7 +208,7 @@
             <h2 id="youtube-song-title" hidden></h2>
             <div id="youtube-artist-title"></div>
             <p id="youtube-empty-message" class="youtube-empty-message" hidden></p>
-            <button id="youtube-submit-button" type="button" class="youtube-submit-button" hidden>Submit songs</button>
+            <button id="youtube-submit-button" type="button" class="youtube-submit-button" hidden>Know this genre?</button>
           </div>
           <div class="youtube-controls" aria-label="YouTube controls">
             <div class="youtube-volume-control">
@@ -225,7 +258,7 @@
           <div id="card-relation" class="card-relation"></div>
           <div class="card-title-row">
             <h2 id="card-title"></h2>
-            <button id="card-target-button" type="button" aria-label="Center selected node" disabled aria-hidden="true">
+            <button id="card-target-button" type="button" aria-label="Center selected node" data-tooltip="Center selected node" disabled aria-hidden="true">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <circle cx="12" cy="12" r="7"></circle>
                 <circle cx="12" cy="12" r="2"></circle>
@@ -235,7 +268,7 @@
                 <path d="M19 12h3"></path>
               </svg>
             </button>
-            <button id="card-close-button" type="button" aria-label="Close details">
+            <button id="card-close-button" type="button" aria-label="Close details" data-tooltip="Close details">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M18 6 6 18"></path>
                 <path d="m6 6 12 12"></path>
@@ -252,7 +285,7 @@
             </a>
           </div>
         </aside>
-        <button id="detail-restore-button" type="button" aria-label="Show details">
+        <button id="detail-restore-button" type="button" aria-label="Show details" data-tooltip="Show details">
           <span class="material-symbols-rounded mode-symbol" aria-hidden="true">info</span>
         </button>
       </div>
@@ -263,7 +296,7 @@
       <section class="feedback-modal-card">
         <div class="feedback-modal-header">
           <h2 id="feedback-modal-title">Feedback</h2>
-          <button id="feedback-close-button" type="button" aria-label="Close feedback">
+          <button id="feedback-close-button" type="button" aria-label="Close feedback" data-tooltip="Close feedback">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M18 6 6 18"></path>
               <path d="m6 6 12 12"></path>
@@ -299,12 +332,15 @@
 
     <footer id="footer">
       <span id="footer-depth"></span>
-      <span id="footer-zoom"></span>
+      <span id="footer-zoom" class="zoom-progress-track" tabindex="0">
+        <span id="footer-zoom-fill" class="zoom-progress-fill"></span>
+        <span id="footer-zoom-label" class="zoom-progress-label"></span>
+      </span>
       <span id="footer-hint"></span>
     </footer>
 
   </div>
 
-  <script type="module" src="app.js?v=396"></script>
+  <script type="module" src="app.js?v=578"></script>
 </body>
 </html>

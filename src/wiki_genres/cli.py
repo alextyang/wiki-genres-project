@@ -559,6 +559,11 @@ def index_semantic_cloud_layout(
             "Omit for the general Music cloud."
         ),
     ),
+    region_id: str | None = typer.Option(
+        None,
+        "--region-id",
+        help="Optional country/region id to build a region-scoped cloud.",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -586,6 +591,7 @@ def index_semantic_cloud_layout(
     stats = _run(
         build_semantic_cloud_layout(
             root_genre_id=root_genre_id,
+            region_id=region_id,
             dry_run=dry_run,
             sample_size=sample,
             iterations=iterations,
@@ -623,6 +629,11 @@ def compact_semantic_cloud_radial(
         None,
         "--root-genre-id",
         help="Optional scoped cloud layout id. Omit for the general Music cloud.",
+    ),
+    region_id: str | None = typer.Option(
+        None,
+        "--region-id",
+        help="Optional country/region cloud layout id.",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -671,6 +682,7 @@ def compact_semantic_cloud_radial(
     stats = _run(
         compact_semantic_cloud_layout_radially(
             root_genre_id=root_genre_id,
+            region_id=region_id,
             dry_run=dry_run,
             sample_size=sample,
             lanes=lanes,
@@ -695,6 +707,138 @@ def compact_semantic_cloud_radial(
                 f"  {row['title']}: ({row['x']}, {row['y']}) -> "
                 f"({row['radial_x']}, {row['radial_y']}) ratio={row['radius_ratio']}"
             )
+
+
+@app.command("cache-wikipedia-page-content")
+def cache_wikipedia_page_content(
+    from_cache: bool = typer.Option(
+        False,
+        "--from-cache",
+        help="Only use the local HTTP cache; do not fetch missing pages.",
+    ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="Maximum active genre pages to inspect/cache.",
+    ),
+    log_level: str = typer.Option("INFO", "--log-level"),
+    log_format: str = typer.Option("pretty", "--log-format"),
+) -> None:
+    """Store active genre-page wikitext in the local DB content cache."""
+    configure_logging(level=log_level, fmt=log_format)
+    from wiki_genres.db import get_engine
+    from sqlalchemy import text
+    from wiki_genres.loader.country_affinity import ensure_wikipedia_page_content_cache
+
+    async def _cache_pages():
+        engine = get_engine()
+        async with engine.connect() as conn:
+            titles = list(
+                (
+                    await conn.execute(
+                        text("""
+                            SELECT wikipedia_title
+                            FROM wg_genres
+                            WHERE deleted_at IS NULL
+                              AND is_non_genre = false
+                            ORDER BY wikipedia_title
+                            LIMIT coalesce(:limit_value, 2147483647)
+                        """),
+                        {"limit_value": limit},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        stats = await ensure_wikipedia_page_content_cache(
+            titles=titles,
+            from_cache=from_cache,
+        )
+        return titles, stats
+
+    titles, stats = _run(_cache_pages())
+    typer.echo("wikipedia page content cache")
+    typer.echo(f"  titles:         {len(titles)}")
+    typer.echo(f"  already cached: {stats.content_cached}")
+    typer.echo(f"  fetched:        {stats.content_fetched}")
+    typer.echo(f"  failed:         {stats.content_failed}")
+
+
+@app.command("index-country-affinities")
+def index_country_affinities_command(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    fetch_missing_content: bool = typer.Option(
+        False,
+        "--fetch-missing-content",
+        help="Fetch/store missing active genre wikitext before scoring content mentions.",
+    ),
+    from_cache: bool = typer.Option(
+        False,
+        "--from-cache",
+        help="When fetching missing content, only use the local HTTP cache.",
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1),
+    min_score: float = typer.Option(0.55, "--min-score", min=0.0, max=1.0),
+    min_confidence: float = typer.Option(0.5, "--min-confidence", min=0.0, max=1.0),
+    sample: int = typer.Option(25, "--sample", min=0),
+    log_level: str = typer.Option("INFO", "--log-level"),
+    log_format: str = typer.Option("pretty", "--log-format"),
+) -> None:
+    """Interpret all genres against country regions and write affinity rows."""
+    configure_logging(level=log_level, fmt=log_format)
+    from wiki_genres.loader.country_affinity import index_country_affinities
+
+    stats = _run(
+        index_country_affinities(
+            dry_run=dry_run,
+            fetch_missing_content=fetch_missing_content,
+            from_cache=from_cache,
+            limit=limit,
+            min_score=min_score,
+            min_confidence=min_confidence,
+            sample_size=sample,
+        )
+    )
+    mode = "dry-run" if dry_run else "write"
+    typer.echo(f"country affinities ({mode})")
+    typer.echo(f"  genres:           {stats.genres_seen}")
+    typer.echo(f"  countries:        {stats.countries_seen}")
+    typer.echo(f"  affinities:       {stats.affinities_written}")
+    typer.echo(f"  deleted existing: {stats.deleted_existing}")
+    typer.echo(f"  cached pages:     {stats.content_cached}")
+    typer.echo(f"  fetched pages:    {stats.content_fetched}")
+    typer.echo(f"  failed pages:     {stats.content_failed}")
+    if stats.source_distribution:
+        typer.echo("  sources:")
+        for key, value in sorted(stats.source_distribution.items()):
+            typer.echo(f"    {key}: {value}")
+    if stats.sample:
+        typer.echo("sample affinities:")
+        for item in stats.sample:
+            typer.echo(f"  {item}")
+
+
+@app.command("country-affinity-report")
+def country_affinity_report_command(
+    region_id: str | None = typer.Option(None, "--region-id"),
+    limit: int = typer.Option(25, "--limit", min=1),
+    log_level: str = typer.Option("INFO", "--log-level"),
+    log_format: str = typer.Option("pretty", "--log-format"),
+) -> None:
+    """Summarize country-affinity coverage by country."""
+    configure_logging(level=log_level, fmt=log_format)
+    from wiki_genres.loader.country_affinity import country_affinity_report
+
+    rows = _run(country_affinity_report(region_id=region_id, limit=limit))
+    typer.echo("country affinity report")
+    for row in rows:
+        typer.echo(
+            f"  {row['canonical_name']} ({row['region_id']}): "
+            f"{row['affinities']} affinities, {row['needs_review']} needs review"
+        )
+        if row.get("sources"):
+            typer.echo(f"    sources: {row['sources']}")
 
 
 @app.command("curate-genres")

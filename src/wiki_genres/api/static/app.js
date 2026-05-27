@@ -15,7 +15,7 @@ import {
   geoNaturalEarth1,
   geoPath,
 } from "https://esm.sh/d3-geo@3.1.1";
-import { feature } from "https://esm.sh/topojson-client@3.1.0";
+import { feature, mesh as topoMesh } from "https://esm.sh/topojson-client@3.1.0";
 
 const ROOT_KEY = "__music_root__";
 const ROOT_TITLES = [
@@ -57,6 +57,9 @@ const CHILD_CLEARANCE_RATIO = 0.96;
 const CHILD_CLEARANCE_MAX_WAIT_MS = 1000;
 const SELECTED_EDGE_LENGTHEN_MS = 760;
 const FETCH_RETRY_DELAYS_MS = [350, 900, 1800];
+const FETCH_TIMEOUT_MS = 12000;
+const STREAM_CONNECT_TIMEOUT_MS = 15000;
+const STREAM_READ_TIMEOUT_MS = 15000;
 const ROOT_RESOLVE_CONCURRENCY = 4;
 const PARENT_TRACE_STEP_MS = 85;
 const PARENT_TRACE_LINK_MS = 110;
@@ -107,6 +110,7 @@ const MANUAL_LENGTH_MAX_OFFSET = 360;
 const RENDER_STABILIZE_ALPHA = 0.035;
 const RENDER_STABILIZE_VELOCITY = 0.16;
 const RENDER_STABILIZE_DEADBAND_PX = 0.42;
+const GRAPH_RENDER_COORD_PRECISION = 10;
 const TRACE_JITTER_SUPPRESS_ALPHA = 0.16;
 const TRACE_JITTER_STEP_PX = 9;
 const TRACE_JITTER_VELOCITY = 1.25;
@@ -120,15 +124,29 @@ const CURRENT_NODE_SCALE = 1.5;
 const ANCESTOR_TRIM_THRESHOLD = 10;
 const TRIM_ANIMATION_MS = 360;
 const DETAIL_CARD_REAPPEAR_DELAY_MS = 1050;
-const STORAGE_ROOTS_KEY = "wiki-genres:root-genres:v4";
+const STORAGE_ROOTS_KEY = "wiki-genres:root-genres:v5";
+const EXPLORER_SELECTION_STORAGE_KEY = "wiki-genres:explorer-selection:v1";
 const YOUTUBE_PLAYBACK_STORAGE_KEY = "wiki-genres:youtube-playback:v1";
-const YOUTUBE_VOLUME_STORAGE_KEY = "wiki-genres:youtube-volume:v1";
-const YOUTUBE_AUTOPLAY_STORAGE_KEY = "wiki-genres:youtube-autoplay-paused:v1";
-const WORLD_ATLAS_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json";
+const YOUTUBE_AUTOPLAY_STORAGE_KEY = "wiki-genres:youtube-should-autoplay:v1";
+const YOUTUBE_LEGACY_AUTOPLAY_PAUSED_KEY = "wiki-genres:youtube-autoplay-paused:v1";
+const YOUTUBE_LEGACY_VOLUME_STORAGE_KEY = "wiki-genres:youtube-volume:v1";
+const WORLD_ATLAS_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-50m.json";
 const US_ATLAS_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3.0.1/states-10m.json";
 const MAP_VIEWBOX_DEFAULT = { x: 0, y: 0, w: 320, h: 174 };
 const MAP_MIN_ZOOM = 1;
 const MAP_MAX_ZOOM = 6;
+const MAP_FIT_PADDING = 9;
+const MAP_VIEWBOX_ANIM_MS = 420;
+const MAP_FOCUS_MIN_OVERLAP = 18;
+const MAP_FOCUS_OVERSCROLL = 16;
+const MAP_PAN_SETTLE_DELAY_MS = 90;
+const MAP_BUFFER_BASE_PX = 12;
+const MAP_BUFFER_MAX_PX = 34;
+const MAP_BUFFER_SMALL_RADIUS_PX = 20;
+const MAP_BUFFER_SMALL_RADIUS_GAIN = 0.85;
+const MAP_BUFFER_SELECTABLE_BONUS = 0.18;
+const MAP_BUFFER_LARGE_AREA_PENALTY = 0.035;
+const MAP_HOVER_SWITCH_SCORE_MARGIN = 0.22;
 const MAP_DEFINITIONS = {
   world: {
     url: WORLD_ATLAS_URL,
@@ -209,16 +227,84 @@ const MODE_ICONS = {
 };
 
 function setModeButtonIcon(button, iconName) {
-  if (!button || button.dataset.iconName === iconName) return;
-  const symbol = document.createElement("span");
-  symbol.className = "material-symbols-rounded mode-symbol";
-  symbol.setAttribute("aria-hidden", "true");
+  if (!button) return;
+  let symbol = button.querySelector(".mode-symbol");
+  if (!symbol) {
+    symbol = document.createElement("span");
+    symbol.className = "material-symbols-rounded mode-symbol";
+    symbol.setAttribute("aria-hidden", "true");
+    button.prepend(symbol);
+  }
   symbol.textContent = MODE_ICONS[iconName] || "";
-  button.replaceChildren(symbol);
   button.dataset.iconName = iconName;
 }
 
+function setModeButtonLabel(button, label) {
+  if (!button) return;
+  let labelEl = button.querySelector(".mode-toggle-label");
+  if (!labelEl) {
+    labelEl = document.createElement("span");
+    labelEl.className = "mode-toggle-label";
+    button.append(labelEl);
+  }
+  labelEl.textContent = label;
+}
+
+function setModeButtonState(button, { icon, label, ariaLabel }) {
+  if (!button) return;
+  setModeButtonIcon(button, icon);
+  setModeButtonLabel(button, label);
+  button.setAttribute("aria-label", ariaLabel || label);
+}
+
+function readExplorerSelectionState(store = sessionStorage) {
+  try {
+    const parsed = JSON.parse(store.getItem(EXPLORER_SELECTION_STORAGE_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      mode: typeof parsed.mode === "string" ? parsed.mode : "",
+      path: typeof parsed.path === "string" ? parsed.path : "",
+      timelineSelected: typeof parsed.timelineSelected === "string" ? parsed.timelineSelected : "",
+      cloudRoot: typeof parsed.cloudRoot === "string" ? parsed.cloudRoot : "",
+      cloudRegion: typeof parsed.cloudRegion === "string" ? parsed.cloudRegion : "",
+      cloudSelected: typeof parsed.cloudSelected === "string" ? parsed.cloudSelected : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeExplorerSelectionState(url = new URL(window.location.href), store = sessionStorage) {
+  try {
+    store.setItem(EXPLORER_SELECTION_STORAGE_KEY, JSON.stringify({
+      mode: (url.searchParams.get("mode") || "").trim(),
+      path: (url.searchParams.get("path") || "").trim(),
+      timelineSelected: (url.searchParams.get("timeline_selected") || "").trim(),
+      cloudRoot: (url.searchParams.get("cloud_root") || "").trim(),
+      cloudRegion: (url.searchParams.get("cloud_region") || "").trim(),
+      cloudSelected: (url.searchParams.get("cloud_selected") || "").trim(),
+    }));
+  } catch {}
+}
+
+function resolvedExplorerUrlState() {
+  const url = new URL(window.location.href);
+  const explicitMode = url.searchParams.get("mode");
+  return {
+    url,
+    mode: (explicitMode || "").trim(),
+    rawPath: (url.searchParams.get("path") || "").trim(),
+    selectedTimeline: (url.searchParams.get("timeline_selected") || "").trim() || null,
+    cloudRoot: (url.searchParams.get("cloud_root") || "").trim() || null,
+    cloudRegion: (url.searchParams.get("cloud_region") || "").trim() || null,
+    selectedCloud: (url.searchParams.get("cloud_selected") || "").trim() || null,
+  };
+}
+
 const svg = document.getElementById("canvas");
+const bootLoading = document.getElementById("boot-loading");
+const cloudLabelCanvas = document.getElementById("cloud-label-canvas");
+const cloudLabelCtx = cloudLabelCanvas?.getContext?.("2d") || null;
 const panTarget = document.getElementById("pan-target");
 const world = document.getElementById("world");
 const edgesG = document.getElementById("edges-layer");
@@ -254,7 +340,9 @@ const timelineCloseButton = document.getElementById("timeline-close-button");
 const timelineYearRail = document.getElementById("timeline-year-rail");
 const mobilePanelTabs = document.getElementById("mobile-panel-tabs");
 const youtubeCard = document.getElementById("youtube-card");
-const youtubeFrame = document.getElementById("youtube-frame");
+const youtubeCloseButton = document.getElementById("youtube-close-button");
+let youtubeFrame = document.getElementById("youtube-frame");
+const youtubeFrameHost = youtubeFrame?.parentElement || null;
 const youtubeGenreTitle = document.getElementById("youtube-genre-title");
 const youtubeSongTitle = document.getElementById("youtube-song-title");
 const youtubeArtistTitle = document.getElementById("youtube-artist-title");
@@ -280,12 +368,18 @@ const feedbackNotes = document.getElementById("feedback-notes");
 const feedbackStatus = document.getElementById("feedback-status");
 const feedbackSubmitButton = document.getElementById("feedback-submit-button");
 const feedbackCloseButton = document.getElementById("feedback-close-button");
+const mobileDetailTab = document.getElementById("mobile-detail-tab");
+const mobileMapTab = document.getElementById("mobile-map-tab");
 const mapCard = document.getElementById("map-card");
 const mapTitle = document.getElementById("map-title");
+const mapParentLabel = document.getElementById("map-parent-label");
+const mapParentLabelText = document.getElementById("map-parent-label-text");
 const mapWorldButton = document.getElementById("map-world-button");
 const mapListButton = document.getElementById("map-list-button");
 const mapExpandButton = document.getElementById("map-expand-button");
 const mapResetButton = document.getElementById("map-reset-button");
+const mapListSearchInput = document.getElementById("map-list-search-input");
+const mapListSearchButton = document.getElementById("map-list-search-button");
 const regionMap = document.getElementById("region-map");
 const mapList = document.getElementById("map-list");
 const mapClipDefs = document.getElementById("map-clip-defs");
@@ -293,11 +387,12 @@ const mapCountryLayer = document.getElementById("map-country-layer");
 const mapHighlightLayer = document.getElementById("map-highlight-layer");
 const mapHitLayer = document.getElementById("map-hit-layer");
 const mapPoints = document.getElementById("map-points");
-const mobileDetailTab = document.getElementById("mobile-detail-tab");
-const mobileMapTab = document.getElementById("mobile-map-tab");
 const footerDepth = document.getElementById("footer-depth");
 const footerZoom = document.getElementById("footer-zoom");
+let footerZoomFill = document.getElementById("footer-zoom-fill");
+let footerZoomLabel = document.getElementById("footer-zoom-label");
 const footerHint = document.getElementById("footer-hint");
+let footerZoomDragging = false;
 
 const nodes = new Map();
 const edges = [];
@@ -306,6 +401,7 @@ const childrenCache = new Map();
 const regionalCache = new Map();
 const mapContextCache = new Map();
 const reachableParentsCache = new Map();
+let rootChildrenPromise = null;
 const layoutPressureDebug = {
   maxOverlap: 0,
   clusterBoosts: [],
@@ -329,21 +425,36 @@ let activeLeafKey = null;
 let restoringUrl = false;
 let trimCleanupTimer = null;
 let mapToken = 0;
+let scheduledMapCardUpdateFrame = 0;
+let scheduledMapCardUpdateTimer = 0;
+let scheduledMapCardUpdateToken = 0;
 let mapViewBox = { ...MAP_VIEWBOX_DEFAULT };
+let mapAutoViewBox = { ...MAP_VIEWBOX_DEFAULT };
+let mapAutoViewFeatureKeys = [];
+let mapViewBoxAnimFrame = 0;
+let mapViewManuallyAdjusted = false;
+let mapPanFocusActive = false;
+let mapPanSettleTimer = 0;
 let mapGesturePointers = new Map();
 let mapGestureLast = null;
 let mapGestureMoved = false;
 let hoveredMapCountry = null;
+let hoveredMapCountries = new Set();
 let mapDefaultLabel = "";
+let mapDefaultVariationCount = 0;
 let mapDisplayedWorldOverride = false;
 let mapListMode = false;
 let mapListViewState = null;
 let mapListRenderToken = 0;
 let mapListScrollFrame = 0;
+let mapListDetailHidden = false;
+let mapListSearchQuery = "";
+let mapListSearchOpen = false;
 let graphIsStill = true;
 let graphStillTimer = null;
 let hoveredNodeKey = null;
 let detailCardNodeKey = null;
+let detailIndicatorPreviewKey = null;
 let detailCardSuppressed = false;
 let holdDetailCardDuringLocate = false;
 let detailCardMovementUntil = 0;
@@ -351,33 +462,84 @@ let detailCardMovementTimer = 0;
 let manualUiDimPending = false;
 let manualUiDimUntil = 0;
 let manualUiDimTimer = 0;
+let manualMovementGesture = null;
+let manualWheelDistance = 0;
+let manualWheelLastAt = 0;
 let uiHoverRestoreUntil = 0;
 let uiHoverRestoreTimer = 0;
 let uiHovering = false;
 const uiHoverRoots = new Set();
+let activePointerButtons = 0;
 let lastPointerClientX = Number.NaN;
 let lastPointerClientY = Number.NaN;
 let detailCardRenderedKey = null;
-let detailCardTransitionToken = 0;
-let detailCardTransitionTimer = 0;
+let detailCardIdleTimer = 0;
+let detailCardHoverSwapActive = false;
+let detailCardContentSwapTimer = 0;
+let detailCardContentSwapToken = 0;
+let detailCardHeightResetTimer = 0;
+let detailCardTransitionClone = null;
+let detailCardTransitionCleanupTimer = 0;
 let hoverCardToken = 0;
+let hoverCardDelayTimer = 0;
+let pendingHoverCardKey = null;
 let searchTimer = null;
 let searchToken = 0;
 let searchBusy = false;
 let cloudMode = false;
 let cloudData = null;
 let cloudRootGenreId = null;
+let cloudRegionId = null;
 let cloudSelectedGenreId = null;
 let cloudNodeEls = new Map();
+let cloudTextEls = new Map();
 let cloudNodeById = new Map();
 let cloudScene = null;
 let cloudVisibleNodeIds = new Set();
 let cloudRenderFrame = null;
+let cloudSceneDomPrepared = false;
+let cloudRenderedLayerScale = null;
+let cloudRenderedTextScale = 0;
+let cloudRenderedWindowSignature = "";
+let cloudCanvasFrame = 0;
+let cloudCanvasDpr = 1;
+let cloudCanvasNodes = [];
+let cloudCanvasHitNodes = [];
+let cloudCanvasVisibleIds = new Set();
+let cloudCanvasAlphaById = new Map();
+let cloudRenderSnapshot = null;
+let cloudRenderTransition = null;
+let cloudPresentationById = new Map();
+let cloudPresentationLastAt = 0;
+let cloudPresentationTargetSignature = "";
+let cloudSelectedLabelAlphaById = new Map();
+let cloudHoverUnderlineAlphaById = new Map();
+let cloudRelationshipAlphaById = new Map();
+let cloudBackgroundCache = null;
+let cloudBackgroundBuildTimer = 0;
+let cloudBackgroundBuildSignature = "";
+let cloudFadeFrame = 0;
+let cloudCanvasFadeFrame = 0;
+let cloudSelectedLabelFadeFrame = 0;
+let cloudHoverUnderlineFadeFrame = 0;
+let cloudRelationshipFadeFrame = 0;
+let cloudLabelSpriteCache = new Map();
+let cloudCanvasStyleCache = null;
+let cloudHoveredNodeId = null;
+let cloudHoverCardDelayTimer = 0;
+let pendingCloudHoverCardKey = null;
+let cloudInitialRenderPending = false;
+let cloudSelectedMarker = null;
+let cloudSelectedMarkerFrame = 0;
+let cloudClickEnabled = true;
+let cloudClickEnableTimer = 0;
+let cloudClickEnableAt = 0;
 let cloudBounds = null;
 let cloudRequestToken = 0;
 let cloudFetchTimer = 0;
 let cloudStreamController = null;
 let cloudLastFetchAt = 0;
+let cloudLastEffectiveLodScale = 0;
 let cloudQueuedFetch = false;
 let cloudLastFetchSignature = "";
 let cloudQueuedFetchSignature = "";
@@ -436,9 +598,18 @@ let timelineVisibility = {
   clusters: [],
 };
 
-const MAP_LIST_HEADER_HEIGHT = 24;
-const MAP_LIST_ITEM_HEIGHT = 42;
+const MAP_LIST_HEADER_HEIGHT = 26;
+const MAP_LIST_ITEM_HEIGHT = 56;
 const MAP_LIST_OVERSCAN_PX = 160;
+const MAP_LIST_CONTENT_TOP_PAD = 6;
+const MAP_LIST_CONTENT_BOTTOM_PAD = 10;
+const MAP_LIST_ICON_WIDTH = 38;
+const MAP_LIST_ICON_HEIGHT = 26;
+const MAP_LIST_TOP_INSET = 40;
+const MAP_LIST_PARENT_TOP_INSET = 64;
+const MAP_LIST_BOTTOM_INSET = 10;
+const MAP_LIST_MIN_CARD_HEIGHT = 180;
+const MAP_LIST_DETAIL_GAP_PX = 18;
 
 function timelineIsInteracting() {
   return Date.now() < timelineInteractUntil || document.body.classList.contains("is-panning-canvas");
@@ -482,6 +653,8 @@ let youtubeStatePollTimer = 0;
 let youtubeTrackLoading = false;
 let youtubeErroredUrls = new Set();
 let youtubeReportedFailureTokens = new Set();
+let youtubePlaybackErrorExhausted = false;
+let youtubeDevPlaybackStatus = "";
 let youtubeResumeSeconds = 0;
 let youtubeLastKnownSeconds = 0;
 let youtubeTrackStartedAt = 0;
@@ -501,21 +674,61 @@ let youtubeVolumePanelMounted = false;
 let youtubeApiLoading = false;
 let youtubeApiReady = false;
 let youtubePlayer = null;
+let youtubeDeferredLoadIndex = null;
+const YOUTUBE_REPORTABLE_ERROR_CODES = new Set(["2", "5", "100", "101", "150"]);
 let feedbackKind = "relationship";
 let historyNavigating = false;
 let appHistoryEntries = [];
 let appHistoryIndex = -1;
 let appNavigatingHistory = false;
 const mapFeaturePromises = new Map();
+const mapTopologyPromises = new Map();
 let activeMapKey = null;
+let activeMapTopology = null;
+let activeMapTopologyObject = null;
+let activeMapPath = null;
+let mapParentTargetKey = null;
+let mapParentTargetCloud = null;
+let mapContextOwnerKey = null;
 const countryElsByName = new Map();
 const countryHighlightElsByName = new Map();
 const countryHitElsByName = new Map();
+const countryAreaByName = new Map();
+const countryBoundsByName = new Map();
+const countryBoundarySamplesByName = new Map();
 const mapItemsByCountryName = new Map();
+const mapHoverCountriesByCountryName = new Map();
+const mapSuperregionCountriesByGroupKey = new Map();
+const mapSuperregionGroupKeyByCountryName = new Map();
+const mapSuperregionBorderElsByGroupKey = new Map();
+const mapCountryRenderStateByName = new Map();
+const mapSuperregionRenderStateByKey = new Map();
 const MIN_VIEW_SCALE = 0.12;
 const MAX_VIEW_SCALE = 3.0;
-const UI_HOVER_SELECTOR = "#nav-controls, #map-card, #right-panel, #timeline-panel, #mobile-panel-tabs, #detail-restore-button, #youtube-context-menu, .youtube-volume-panel, #feedback-modal";
+const GRAPH_MIN_VIEW_SCALE = 0.25;
+const GRAPH_MAX_VIEW_SCALE = 1.0;
+const GRAPH_AUTO_MIN_VIEW_SCALE = 0.4;
+const GRAPH_AUTO_MAX_VIEW_SCALE = 0.7;
+const CLOUD_MAX_VIEW_SCALE = 1.1;
+const UI_HOVER_SELECTOR = "#nav-controls, #map-card, #right-panel, #timeline-panel, #mobile-panel-tabs, #detail-restore-button, #footer-zoom, #youtube-context-menu, .youtube-volume-panel, #feedback-modal";
 const UI_HOVER_RESTORE_HOLD_MS = 950;
+const DETAIL_CARD_RADIO_IDLE_MS = 45000;
+const DETAIL_HOVER_SWAP_DELAY_MS = 300;
+const CLOUD_HOVER_DETAIL_SWAP_DELAY_MS = DETAIL_HOVER_SWAP_DELAY_MS + 140;
+const CLOUD_HOVER_UNDERLINE_FADE_IN_MS = 260;
+const CLOUD_HOVER_UNDERLINE_FADE_OUT_MS = 180;
+const GRAPH_LABEL_Y = 0;
+const TIMELINE_LABEL_Y = 0;
+const UI_TOOLTIP_DELAY_MS = 360;
+const UI_TOOLTIP_GAP_PX = 8;
+const DETAIL_CARD_HEIGHT_STABILIZE_MS = 140;
+const DETAIL_CARD_HEIGHT_ANIMATION_MS = 190;
+const MAP_DEFERRED_UPDATE_DELAY_MS = 90;
+const MANUAL_UI_DIM_DRAG_DISTANCE_PX = 18;
+const MANUAL_UI_DIM_DRAG_TIME_MS = 220;
+const MANUAL_UI_DIM_DRAG_MIN_DISTANCE_PX = 5;
+const MANUAL_UI_DIM_WHEEL_DISTANCE_PX = 28;
+const MANUAL_UI_DIM_WHEEL_WINDOW_MS = 240;
 const TIMELINE_MIN_SERVER_RANK = 0.04;
 const TIMELINE_RANK_PREFETCH = 0.075;
 const TIMELINE_ZOOM_PREFETCH_MIN_SCALE = 0.18;
@@ -530,8 +743,57 @@ const TIMELINE_EXTRA_EDGE_MAX = 8;
 const TIMELINE_NON_CORE_SIDE_EDGE_LIMIT = 1;
 const TIMELINE_PLACEMENT_MAX_SCREEN_OFFSET = 180;
 const CLOUD_FONT_SIZE = 13;
-const CLOUD_LABEL_PAD_PX = 5;
+const CLOUD_LABEL_PAD_PX = 6.5;
+const CLOUD_LABEL_PAD_Y_PX = 4;
+const CLOUD_SELECTED_LABEL_EXTRA_PAD_PX = 3;
 const CLOUD_VIEWPORT_MARGIN_PX = 180;
+const CLOUD_DOM_WINDOW_MARGIN_PX = 96;
+const CLOUD_DOM_WINDOW_TILE_PX = 220;
+const CLOUD_CANVAS_HIT_PAD_PX = 6;
+const CLOUD_CANVAS_TRANSITION_MS = 520;
+const CLOUD_CANVAS_FADE_IN_MS = CLOUD_CANVAS_TRANSITION_MS;
+const CLOUD_CANVAS_FADE_OUT_MS = 95;
+const CLOUD_PRESENTATION_EPSILON = 0.006;
+const CLOUD_SELECTED_LABEL_FADE_IN_MS = 220;
+const CLOUD_SELECTED_LABEL_FADE_OUT_MS = 170;
+const CLOUD_RELATIONSHIP_ALPHA_FADE_MS = 320;
+const CLOUD_RELATIONSHIP_ALPHA_FLOOR = 0.0275;
+const CLOUD_RELATIONSHIP_ALPHA_DISTANCE_STEPS = 4;
+const CLOUD_CATALOG_PREVIEW_NODE_LIMIT = 180;
+const CLOUD_LAYER_READY_EPSILON = 0.026;
+const CLOUD_SPATIAL_CELL_PX = 320;
+const CLOUD_CLICK_IDLE_ENABLE_MS = 300;
+const CLOUD_SELECTED_MARKER_RADIUS_PX = 4.5;
+const CLOUD_SELECTED_MARKER_VIEWPORT_MARGIN_PX = 6;
+const CLOUD_SELECTED_MARKER_CLEARANCE_PX = 0.75;
+const CLOUD_SELECTED_MARKER_FADE_OUT_MS = 110;
+const CLOUD_SELECTED_MARKER_FADE_IN_MS = 150;
+const CLOUD_BACKGROUND_OPTIONS = {
+  fieldWidth: 420,
+  graphNeighborLimit: 32,
+  largeContributorLimit: 24,
+  mediumContributorLimit: 10,
+  hueBucketCount: 18,
+  selfWeight: 1.0,
+  graphWeight: 0.6,
+  largeFieldWeight: 0.64,
+  mediumFieldWeight: 0.36,
+  spatialSigmaLargeRatio: 0.105,
+  spatialSigmaMediumRatio: 0.036,
+  densityLow: 0.32,
+  densityHigh: 4.2,
+  darkBaseAlpha: 0.14,
+  lightBaseAlpha: 0.095,
+  darkTargetLightness: 0.34,
+  lightTargetLightness: 0.82,
+  darkChromaScale: 0.44,
+  lightChromaScale: 0.34,
+  darkChromaMax: 0.09,
+  lightChromaMax: 0.065,
+  noiseScale: 0.006,
+  warpStrength: 3.0,
+  noiseSeed: 1337,
+};
 
 function vw() { return svg.clientWidth || window.innerWidth; }
 function vh() { return svg.clientHeight || window.innerHeight; }
@@ -558,12 +820,230 @@ function setStatus(text = "") {
   footerHint.textContent = text;
 }
 
+function ensureFooterZoomFill() {
+  if (!footerZoom) return null;
+  if (!footerZoomFill || footerZoomFill.parentElement !== footerZoom) {
+    footerZoom.replaceChildren();
+    footerZoomFill = document.createElement("span");
+    footerZoomFill.id = "footer-zoom-fill";
+    footerZoomFill.className = "zoom-progress-fill";
+    footerZoomLabel = document.createElement("span");
+    footerZoomLabel.id = "footer-zoom-label";
+    footerZoomLabel.className = "zoom-progress-label";
+    footerZoom.appendChild(footerZoomFill);
+    footerZoom.appendChild(footerZoomLabel);
+    return footerZoomFill;
+  }
+  if (!footerZoomLabel || footerZoomLabel.parentElement !== footerZoom) {
+    footerZoomLabel = document.createElement("span");
+    footerZoomLabel.id = "footer-zoom-label";
+    footerZoomLabel.className = "zoom-progress-label";
+    footerZoom.appendChild(footerZoomLabel);
+  }
+  for (const child of Array.from(footerZoom.childNodes)) {
+    if (child !== footerZoomFill && child !== footerZoomLabel) child.remove();
+  }
+  return footerZoomFill;
+}
+
 function updateFooterZoom() {
-  footerZoom.textContent = `Zoom ${viewScale.toFixed(2)}x`;
+  const fill = ensureFooterZoomFill();
+  const minScale = currentMinViewScale();
+  const maxScale = currentMaxViewScale();
+  const progress = clamp((viewScale - minScale) / Math.max(0.0001, maxScale - minScale), 0, 1);
+  footerZoom.style.setProperty("--zoom-progress", progress.toFixed(4));
+  if (fill) fill.style.transform = `scaleX(${progress.toFixed(4)})`;
+  if (footerZoomLabel) footerZoomLabel.textContent = `Zoom ${Math.round(progress * 100)}%`;
+  footerZoom.setAttribute("role", "progressbar");
+  footerZoom.setAttribute("aria-valuemin", "0");
+  footerZoom.setAttribute("aria-valuemax", "100");
+  footerZoom.setAttribute("aria-valuenow", String(Math.round(progress * 100)));
+  footerZoom.setAttribute("aria-label", `Zoom ${Math.round(progress * 100)} percent`);
+  footerZoom.title = `Zoom ${viewScale.toFixed(2)}x`;
+}
+
+function footerZoomProgressFromClientX(clientX) {
+  if (!footerZoom) return null;
+  const rect = footerZoom.getBoundingClientRect();
+  if (!rect.width) return null;
+  return clamp((clientX - rect.left) / rect.width, 0, 1);
+}
+
+function setViewScaleAroundViewportCenter(nextScale) {
+  const viewport = cameraViewportRect();
+  const mx = (viewport.left + viewport.right) / 2;
+  const my = (viewport.top + viewport.bottom) / 2;
+  const wx = (mx - viewTx) / viewScale;
+  const wy = (my - viewTy) / viewScale;
+  viewScale = clampViewScale(nextScale);
+  viewTx = mx - wx * viewScale;
+  viewTy = my - wy * viewScale;
+  writeWorldTransform();
+}
+
+function setZoomFromFooterProgress(progress) {
+  const minScale = currentMinViewScale();
+  const maxScale = currentMaxViewScale();
+  const nextScale = minScale + (maxScale - minScale) * clamp(progress, 0, 1);
+  followMode = false;
+  stopPanInertia();
+  if (panAnimTimer) clearInterval(panAnimTimer);
+  markGraphMoving(360);
+  setViewScaleAroundViewportCenter(nextScale);
+  if (timelineMode) markTimelineInteracting();
+  scheduleGraphStill(520);
+}
+
+function setZoomFromFooterClientX(clientX) {
+  const progress = footerZoomProgressFromClientX(clientX);
+  if (progress == null) return;
+  setZoomFromFooterProgress(progress);
+}
+
+function currentZoomProgress() {
+  const minScale = currentMinViewScale();
+  const maxScale = currentMaxViewScale();
+  return clamp((viewScale - minScale) / Math.max(0.0001, maxScale - minScale), 0, 1);
+}
+
+function currentMaxViewScale() {
+  if (!cloudMode && !timelineMode) return GRAPH_MAX_VIEW_SCALE;
+  return cloudMode ? CLOUD_MAX_VIEW_SCALE : MAX_VIEW_SCALE;
+}
+
+function currentMinViewScale() {
+  return (!cloudMode && !timelineMode) ? GRAPH_MIN_VIEW_SCALE : MIN_VIEW_SCALE;
+}
+
+function clampViewScale(scale) {
+  return Math.max(currentMinViewScale(), Math.min(currentMaxViewScale(), scale));
+}
+
+function graphAutoViewScale(scale = viewScale) {
+  if (cloudMode || timelineMode) return clampViewScale(scale);
+  return Math.max(GRAPH_AUTO_MIN_VIEW_SCALE, Math.min(GRAPH_AUTO_MAX_VIEW_SCALE, scale));
+}
+
+function finiteBounds(bounds) {
+  if (!bounds) return null;
+  const minX = Number(bounds.minX);
+  const maxX = Number(bounds.maxX);
+  const minY = Number(bounds.minY);
+  const maxY = Number(bounds.maxY);
+  if (![minX, maxX, minY, maxY].every(Number.isFinite)) return null;
+  if (maxX <= minX || maxY <= minY) return null;
+  return { minX, maxX, minY, maxY };
+}
+
+function apiBounds(bounds) {
+  if (!bounds) return null;
+  return finiteBounds({
+    minX: bounds.min_x ?? bounds.minX,
+    maxX: bounds.max_x ?? bounds.maxX,
+    minY: bounds.min_y ?? bounds.minY,
+    maxY: bounds.max_y ?? bounds.maxY,
+  });
+}
+
+function graphContentBounds() {
+  const renderNodes = [...nodes.values()].filter(node => node && node.isRevealed !== false && !node.isTrimming);
+  if (!renderNodes.length) return null;
+  const bounds = renderNodes.reduce((acc, node) => {
+    const x = Number(nodeRenderX(node));
+    const y = Number(nodeRenderY(node));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return acc;
+    const box = nodeBox(node, 60, 44);
+    acc.minX = Math.min(acc.minX, x - box.w / 2);
+    acc.maxX = Math.max(acc.maxX, x + box.w / 2);
+    acc.minY = Math.min(acc.minY, y - box.h / 2);
+    acc.maxY = Math.max(acc.maxY, y + box.h / 2);
+    return acc;
+  }, { minX: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY, minY: Number.POSITIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY });
+  return finiteBounds(bounds);
+}
+
+function timelineContentBounds() {
+  const streamBounds = apiBounds(timelineData?.stats?.bounds);
+  if (streamBounds) return streamBounds;
+  const sourceNodes = timelineData?.nodes || [];
+  if (!sourceNodes.length) return null;
+  return finiteBounds(sourceNodes.reduce((acc, node) => {
+    const x = Number(node.renderX ?? node.x);
+    const y = Number(node.renderY ?? node.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return acc;
+    acc.minX = Math.min(acc.minX, x - 170);
+    acc.maxX = Math.max(acc.maxX, x + 170);
+    acc.minY = Math.min(acc.minY, y - 70);
+    acc.maxY = Math.max(acc.maxY, y + 70);
+    return acc;
+  }, { minX: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY, minY: Number.POSITIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY }));
+}
+
+function currentContentBounds() {
+  if (cloudMode) return cloudStatsBounds(cloudData) || cloudBounds;
+  if (timelineMode) return timelineContentBounds();
+  return graphContentBounds();
+}
+
+function cameraViewportRect() {
+  if (!cloudMode && !timelineMode) {
+    return {
+      left: 0,
+      right: Math.max(1, vw() - reservedRight()),
+      top: 0,
+      bottom: Math.max(1, vh() - reservedBottom()),
+    };
+  }
+  return { left: 0, right: vw(), top: 0, bottom: vh() };
+}
+
+function clampAxisTranslate(tx, minWorld, maxWorld, scale, viewportMin, viewportMax, padding) {
+  const minTx = viewportMin + padding - maxWorld * scale;
+  const maxTx = viewportMax - padding - minWorld * scale;
+  if (minTx > maxTx) {
+    return (viewportMin + viewportMax) / 2 - ((minWorld + maxWorld) / 2) * scale;
+  }
+  return Math.max(minTx, Math.min(maxTx, tx));
+}
+
+function clampViewTranslation() {
+  const bounds = finiteBounds(currentContentBounds());
+  if (!bounds) return;
+  const scale = Math.max(0.001, viewScale);
+  const viewport = cameraViewportRect();
+  const viewportWidth = Math.max(1, viewport.right - viewport.left);
+  const viewportHeight = Math.max(1, viewport.bottom - viewport.top);
+  const padX = Math.min(Math.max(80, viewportWidth * 0.18), 220);
+  const padY = Math.min(Math.max(70, viewportHeight * 0.18), 180);
+  viewTx = clampAxisTranslate(viewTx, bounds.minX, bounds.maxX, scale, viewport.left, viewport.right, padX);
+  viewTy = clampAxisTranslate(viewTy, bounds.minY, bounds.maxY, scale, viewport.top, viewport.bottom, padY);
 }
 
 function setBusy(isBusy) {
   document.body.classList.toggle("is-loading", isBusy);
+  updateDetailCardVisibility();
+}
+
+function setCloudInitialLoading(isLoading) {
+  cloudInitialRenderPending = Boolean(isLoading);
+  document.body.classList.toggle("cloud-loading", cloudInitialRenderPending);
+  if (bootLoading) bootLoading.setAttribute("aria-hidden", cloudInitialRenderPending ? "false" : "true");
+  if (window.__wikiGenresCloudCullDebug) {
+    window.__wikiGenresCloudCullDebug.cloudLoading = cloudInitialRenderPending;
+  }
+}
+
+function finishCloudInitialLoadingAfterPaint() {
+  if (!cloudInitialRenderPending) return;
+  requestAnimationFrame(() => {
+    scheduleCloudCanvasRender();
+    requestAnimationFrame(() => {
+      if (cloudMode) scheduleCloudCanvasRender();
+      requestAnimationFrame(() => {
+        setCloudInitialLoading(false);
+      });
+    });
+  });
 }
 
 function detailCardMovementActive() {
@@ -575,7 +1055,16 @@ function manualUiDimExplicitActive() {
 }
 
 function uiHoverRestoreActive() {
-  return !document.body.classList.contains("is-panning-canvas") && Date.now() < uiHoverRestoreUntil;
+  return !pointerDragActive() && Date.now() < uiHoverRestoreUntil;
+}
+
+function pointerDragActive() {
+  return activePointerButtons > 0 || document.body.classList.contains("is-panning-canvas");
+}
+
+function setActivePointerButtons(buttons = 0) {
+  activePointerButtons = Math.max(0, Number(buttons) || 0);
+  document.body.classList.toggle("is-pointer-down", activePointerButtons > 0);
 }
 
 function updateLastPointerPosition(clientX, clientY) {
@@ -585,7 +1074,7 @@ function updateLastPointerPosition(clientX, clientY) {
 }
 
 function liveUiHoverRoot() {
-  if (document.body.classList.contains("is-panning-canvas")) return null;
+  if (pointerDragActive()) return null;
   if (!Number.isFinite(lastPointerClientX) || !Number.isFinite(lastPointerClientY)) return null;
   const hovered = document.elementFromPoint(lastPointerClientX, lastPointerClientY);
   const root = hovered?.closest?.(UI_HOVER_SELECTOR) || null;
@@ -594,7 +1083,7 @@ function liveUiHoverRoot() {
 }
 
 function isUiHoverTarget(target) {
-  if (document.body.classList.contains("is-panning-canvas")) return false;
+  if (pointerDragActive()) return false;
   return target instanceof Element && Boolean(target.closest(UI_HOVER_SELECTOR));
 }
 
@@ -610,8 +1099,13 @@ function uiHoverActive() {
   return false;
 }
 
+function uiHoverRestoring() {
+  if (pointerDragActive()) return false;
+  return uiHoverActive() || uiHoverRestoreActive();
+}
+
 function triggerUiHoverRestoreHold(duration = UI_HOVER_RESTORE_HOLD_MS) {
-  if (document.body.classList.contains("is-panning-canvas")) return;
+  if (pointerDragActive()) return;
   uiHoverRestoreUntil = Math.max(uiHoverRestoreUntil, Date.now() + duration);
   window.clearTimeout(uiHoverRestoreTimer);
   const delay = Math.max(0, uiHoverRestoreUntil - Date.now()) + 20;
@@ -622,24 +1116,30 @@ function triggerUiHoverRestoreHold(duration = UI_HOVER_RESTORE_HOLD_MS) {
 }
 
 function manualUiDimActive() {
+  if (cloudMode) return false;
   if (!manualUiDimPending) return false;
-  if (uiHoverRestoreActive()) return false;
-  if (uiHoverActive()) return false;
-  if (manualUiDimExplicitActive()) return true;
-  if (graphIsStill) return false;
-  return !hoveredNodeKey && !youtubeCardHovered;
+  return manualUiDimExplicitActive() || !graphIsStill || detailCardMovementActive();
 }
 
 function updateManualUiDimClass() {
+  document.body.classList.toggle("ui-hover-restoring", uiHoverRestoring());
   const active = manualUiDimActive();
   document.body.classList.toggle("ui-manual-moving", active);
-  if (!active && graphIsStill && !manualUiDimExplicitActive()) {
+  if (!active) {
+    setDetailCardHoverSwapActive(false);
+  }
+  if (!active && !manualUiDimExplicitActive()) {
     manualUiDimPending = false;
   }
 }
 
 function applyDetailCardMovingClass() {
   document.body.classList.toggle("detail-card-moving", detailCardMovementActive());
+}
+
+function setDetailCardHoverSwapActive(active) {
+  detailCardHoverSwapActive = Boolean(active);
+  document.body.classList.toggle("detail-card-hover-swap-active", detailCardHoverSwapActive);
 }
 
 function markDetailCardMoving(duration = 620) {
@@ -666,15 +1166,82 @@ function markManualUiMoving(duration = 620) {
   }, delay);
 }
 
+function beginManualMovementGesture(clientX, clientY) {
+  manualMovementGesture = {
+    startX: clientX,
+    startY: clientY,
+    lastX: clientX,
+    lastY: clientY,
+    startedAt: Date.now(),
+    cumulative: 0,
+    dimmed: false,
+  };
+}
+
+function clearManualMovementGesture() {
+  manualMovementGesture = null;
+}
+
+function markManualUiMovingAfterGestureThreshold(clientX, clientY, duration = 620) {
+  if (!manualMovementGesture) beginManualMovementGesture(clientX, clientY);
+  const gesture = manualMovementGesture;
+  const dx = clientX - gesture.startX;
+  const dy = clientY - gesture.startY;
+  const step = Math.hypot(clientX - gesture.lastX, clientY - gesture.lastY);
+  gesture.lastX = clientX;
+  gesture.lastY = clientY;
+  gesture.cumulative += step;
+  const directDistance = Math.hypot(dx, dy);
+  const elapsed = Date.now() - gesture.startedAt;
+  if (
+    gesture.dimmed ||
+    directDistance >= MANUAL_UI_DIM_DRAG_DISTANCE_PX ||
+    (elapsed >= MANUAL_UI_DIM_DRAG_TIME_MS && gesture.cumulative >= MANUAL_UI_DIM_DRAG_MIN_DISTANCE_PX)
+  ) {
+    gesture.dimmed = true;
+    markManualUiMoving(duration);
+  }
+}
+
+function markManualUiMovingAfterWheelThreshold(event, duration = 620) {
+  const now = Date.now();
+  if (now - manualWheelLastAt > MANUAL_UI_DIM_WHEEL_WINDOW_MS) {
+    manualWheelDistance = 0;
+  }
+  manualWheelLastAt = now;
+  const lineScale = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+  const pageScale = event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? Math.max(1, vh() * 0.85) : lineScale;
+  manualWheelDistance += (Math.abs(event.deltaX) + Math.abs(event.deltaY)) * pageScale;
+  if (manualWheelDistance >= MANUAL_UI_DIM_WHEEL_DISTANCE_PX) {
+    markManualUiMoving(duration);
+  }
+}
+
+function isManualGraphDragTarget(target) {
+  if (!(target instanceof Element)) return false;
+  if (target.closest(UI_HOVER_SELECTOR)) return false;
+  return Boolean(target.closest("#canvas"));
+}
+
 function updateDetailCardVisibility() {
-  if (detailCardSuppressed) {
+  syncDetailNodeIndicators();
+  updateDetailRestoreButtonEligibility();
+  if (
+    document.body.classList.contains("is-loading") ||
+    document.body.classList.contains("app-booting") ||
+    detailCardSuppressed ||
+    (mapListMode && mapListDetailHidden)
+  ) {
+    clearDetailCardIdleTimer();
+    cancelDetailCardContentSwap();
+    setDetailCardHoverSwapActive(false);
     document.body.classList.remove("detail-card-visible");
     document.body.classList.remove("detail-card-moving");
     updateManualUiDimClass();
     return;
   }
   const modeHasCard = cloudMode
-    ? Boolean(cloudSelectedGenreId)
+    ? Boolean(detailCardNodeKey || cloudSelectedGenreId)
     : timelineMode
     ? timelineDetailCardOpen
     : Boolean(currentDetailFallbackNode());
@@ -692,17 +1259,25 @@ function updateDetailCardVisibility() {
     youtubeCardHovered
       ? Boolean(youtubePlaybackNode)
       : cloudMode
-      ? Boolean(cloudSelectedGenreId)
+      ? Boolean(detailCardNodeKey || cloudSelectedGenreId)
       : timelineMode
       ? timelineDetailCardOpen
       : graphIsStill || Boolean(hoveredNodeKey) || holdDetailCardDuringLocate || graphMovingWithCard
   );
+  if (!document.body.classList.contains("detail-card-visible")) {
+    clearDetailCardIdleTimer();
+    cancelDetailCardContentSwap();
+    setDetailCardHoverSwapActive(false);
+  } else {
+    scheduleDetailCardIdleReturn();
+  }
   updateManualUiDimClass();
 }
 
 function setGraphStill(isStill) {
   graphIsStill = isStill;
   updateDetailCardVisibility();
+  syncDetailNodeIndicators();
 }
 
 function clearGraphStillTimer() {
@@ -731,6 +1306,74 @@ function setHoveredNode(key = null) {
   updateDetailCardVisibility();
 }
 
+function detailKeyForTimelineNodeId(nodeId) {
+  return nodeId ? `timeline-${nodeId}` : "";
+}
+
+function detailKeyForCloudNodeId(nodeId) {
+  return nodeId ? `cloud-${nodeId}` : "";
+}
+
+function cloudNodeIdFromDetailKey(key = "") {
+  return String(key || "").startsWith("cloud-") ? String(key).slice(6) : "";
+}
+
+function activeDetailIndicatorKey() {
+  return detailIndicatorPreviewKey || detailCardNodeKey || "";
+}
+
+function detailCardIndicatorKey() {
+  return detailCardNodeKey || "";
+}
+
+function cloudDetailIndicatorKey() {
+  return activeDetailIndicatorKey();
+}
+
+function effectiveDetailIndicatorKey() {
+  return (!detailIndicatorPreviewKey && !graphIsStill) ? "" : activeDetailIndicatorKey();
+}
+
+function syncDetailNodeIndicators() {
+  const graphIndicatorKey = activeDetailIndicatorKey();
+  for (const [nodeKey, el] of nodeEls.entries()) {
+    const isDetailNode = nodeKey === graphIndicatorKey;
+    el.classList.toggle(
+      "node-detail-preview",
+      isDetailNode
+    );
+  }
+  for (const [nodeId, el] of timelineNodeElById.entries()) {
+    const isDetailNode = detailKeyForTimelineNodeId(nodeId) === detailCardIndicatorKey();
+    el.classList.toggle(
+      "timeline-node-detail-preview",
+      isDetailNode
+    );
+  }
+  for (const [nodeId, el] of cloudNodeEls.entries()) {
+    el.classList.toggle(
+      "cloud-node-detail-preview",
+      detailKeyForCloudNodeId(nodeId) === cloudDetailIndicatorKey()
+    );
+  }
+  if (cloudMode) {
+    updateCloudHoverUnderlineAlphaTargets(cloudCanvasNodes);
+    scheduleCloudCanvasRender();
+  }
+}
+
+function setDetailCardNodeKey(key = null) {
+  const nextKey = key || null;
+  detailCardNodeKey = nextKey;
+  if (detailIndicatorPreviewKey === nextKey) detailIndicatorPreviewKey = null;
+  syncDetailNodeIndicators();
+}
+
+function setDetailIndicatorPreviewKey(key = null) {
+  detailIndicatorPreviewKey = key || null;
+  syncDetailNodeIndicators();
+}
+
 function setUiHover(root, isHovered) {
   if (!root) return;
   if (isHovered) {
@@ -752,13 +1395,23 @@ function allowDetailCardForManualSelection() {
 function suppressDetailCardUntilSelection() {
   detailCardSuppressed = true;
   hoveredNodeKey = null;
-  detailCardNodeKey = null;
+  cancelScheduledHoverCard();
+  setDetailCardNodeKey(null);
   hoverCardToken++;
+  clearDetailCardIdleTimer();
   updateDetailCardVisibility();
 }
 
 function currentDetailFallbackNode() {
-  if (cloudMode) return selectedCloudNode();
+  if (cloudMode) {
+    const hoveredDetailId = cloudNodeIdFromDetailKey(detailCardNodeKey);
+    if (hoveredDetailId) {
+      return cloudNodeById.get(hoveredDetailId) ||
+        cloudScene?.nodesById?.get(hoveredDetailId) ||
+        selectedCloudNode();
+    }
+    return selectedCloudNode();
+  }
   if (timelineMode) return selectedTimelineNode();
   return (
     (hoveredNodeKey && nodes.get(hoveredNodeKey)) ||
@@ -768,14 +1421,27 @@ function currentDetailFallbackNode() {
   );
 }
 
+function nodeHasRestorableDetail(node) {
+  return Boolean(node && !isMusicCoreNode(node) && (node.genreId || node.id || node.wikipedia_url));
+}
+
+function updateDetailRestoreButtonEligibility() {
+  const node = youtubeCardHovered
+    ? playbackDetailNode()
+    : currentDetailFallbackNode();
+  document.body.classList.toggle("detail-restore-available", nodeHasRestorableDetail(node));
+}
+
 function restoreDetailCardFromButton() {
+  setMobileCardsHidden(false);
+  if (mapListMode) setMapListMode(false);
   detailCardSuppressed = false;
   youtubeCardHovered = false;
   if (timelineMode && timelineSelectedGenreId) timelineDetailCardOpen = true;
   if (!cloudMode && !timelineMode) graphIsStill = true;
   const node = currentDetailFallbackNode();
   if (node) {
-    detailCardNodeKey = node.key || detailCardNodeKey;
+    setDetailCardNodeKey(node.key || detailCardNodeKey);
     updateCard(node);
   }
   updateDetailCardVisibility();
@@ -800,31 +1466,83 @@ function clearHoveredMapItemForNode(node) {
   if (countryName) clearMapHoveredCountry(countryName);
 }
 
+function cancelScheduledHoverCard(nodeKey = null) {
+  if (nodeKey && pendingHoverCardKey && pendingHoverCardKey !== nodeKey) return;
+  const canceledKey = pendingHoverCardKey || nodeKey;
+  window.clearTimeout(hoverCardDelayTimer);
+  hoverCardDelayTimer = 0;
+  pendingHoverCardKey = null;
+  if (
+    detailIndicatorPreviewKey &&
+    (!nodeKey || detailIndicatorPreviewKey === nodeKey || detailIndicatorPreviewKey === canceledKey)
+  ) {
+    setDetailIndicatorPreviewKey(null);
+  }
+}
+
+function scheduleHoverCard(nodeKey) {
+  cancelScheduledHoverCard();
+  if (detailCardSuppressed || !nodeKey) return;
+  if (!graphNodeAllowsHoverDetail(nodes.get(nodeKey), nodeEls.get(nodeKey))) return;
+  setDetailIndicatorPreviewKey(nodeKey);
+  pendingHoverCardKey = nodeKey;
+  hoverCardDelayTimer = window.setTimeout(() => {
+    hoverCardDelayTimer = 0;
+    const wantedKey = pendingHoverCardKey;
+    pendingHoverCardKey = null;
+    if (hoveredNodeKey !== wantedKey) return;
+    if (!graphNodeAllowsHoverDetail(nodes.get(wantedKey), nodeEls.get(wantedKey))) return;
+    void showHoverCard(wantedKey);
+  }, prefersReducedMotion() ? 0 : DETAIL_HOVER_SWAP_DELAY_MS);
+}
+
+function scheduleTimelineHoverCard(node) {
+  const key = detailKeyForTimelineNodeId(node?.id);
+  cancelScheduledHoverCard();
+  if (!key || detailCardSuppressed) return;
+  if (!timelineNodeAllowsHoverDetail(timelineNodeElById.get(node.id))) return;
+  setDetailIndicatorPreviewKey(key);
+  pendingHoverCardKey = key;
+  hoverCardDelayTimer = window.setTimeout(() => {
+    hoverCardDelayTimer = 0;
+    if (pendingHoverCardKey !== key) return;
+    pendingHoverCardKey = null;
+    if (!timelineNodeAllowsHoverDetail(timelineNodeElById.get(node.id))) return;
+    void showTimelineHoverCard(node);
+  }, prefersReducedMotion() ? 0 : DETAIL_HOVER_SWAP_DELAY_MS);
+}
+
 async function showHoverCard(nodeKey) {
   if (detailCardSuppressed) return;
+  if (!graphNodeAllowsHoverDetail(nodes.get(nodeKey), nodeEls.get(nodeKey))) return;
   const token = ++hoverCardToken;
   const node = nodes.get(nodeKey);
   if (!node) return;
-  detailCardNodeKey = nodeKey;
-  updateCard(node);
-  if (!node.genreId || node.isUnresolved) return;
+  setDetailCardNodeKey(nodeKey);
+  if (!node.genreId || node.isUnresolved) {
+    updateCard(node, { hoverSwap: true });
+    return;
+  }
 
   try {
     const hydrated = await hydrateNodeDetail(node);
     if (token !== hoverCardToken || detailCardNodeKey !== nodeKey) return;
-    updateCard(hydrated);
     if (!relationshipLine(hydrated)) {
       hydrated.parentRelationshipRows = await getReachableParents(hydrated.genreId).catch(() => []);
       if (token !== hoverCardToken || detailCardNodeKey !== nodeKey) return;
-      updateCard(hydrated);
     }
+    updateCard(hydrated, { hoverSwap: true });
   } catch (err) {
     console.error("[wiki-genres] hover detail failed", err);
+    if (token === hoverCardToken && detailCardNodeKey === nodeKey) {
+      updateCard(node, { hoverSwap: true });
+    }
   }
 }
 
 function restoreSelectedCardAfterHover(nodeKey) {
   if (hoveredNodeKey !== nodeKey) return;
+  cancelScheduledHoverCard(nodeKey);
   hoveredNodeKey = null;
   updateDetailCardVisibility();
 }
@@ -833,13 +1551,68 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, prefersReducedMotion() ? 0 : ms));
 }
 
+function requestTimeoutError(url, timeoutMs, phase = "request") {
+  const err = new Error(`${phase} timed out after ${timeoutMs}ms: ${url}`);
+  err.name = "TimeoutError";
+  return err;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const { timeoutMs: _timeoutMs, readTimeoutMs: _readTimeoutMs, ...fetchOptions } = options;
+  const controller = new AbortController();
+  let didTimeout = false;
+  let timeoutId = 0;
+  const parentSignal = fetchOptions.signal;
+  const abortFromParent = () => controller.abort(parentSignal.reason);
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else if (parentSignal) {
+    parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  }
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = window.setTimeout(() => {
+      didTimeout = true;
+      controller.abort(requestTimeoutError(url, timeoutMs));
+    }, timeoutMs);
+  }
+  try {
+    return await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (didTimeout) throw requestTimeoutError(url, timeoutMs);
+    throw err;
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    if (parentSignal) parentSignal.removeEventListener("abort", abortFromParent);
+  }
+}
+
+async function readStreamChunkWithTimeout(reader, url, timeoutMs = STREAM_READ_TIMEOUT_MS) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return reader.read();
+  let timeoutId = 0;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timeoutId = window.setTimeout(() => {
+          reject(requestTimeoutError(url, timeoutMs, "stream read"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+}
+
 async function fetchJson(url, options = {}) {
   let lastError = null;
   for (let attempt = 0; attempt <= FETCH_RETRY_DELAYS_MS.length; attempt++) {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       ...options,
       headers: { Accept: "application/json", ...(options.headers || {}) },
-    });
+    }, options.timeoutMs ?? FETCH_TIMEOUT_MS);
     if (res.ok) return res.json();
 
     const msg = await res.text().catch(() => "");
@@ -856,10 +1629,10 @@ async function fetchJson(url, options = {}) {
 }
 
 async function streamNdjson(url, options = {}) {
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     signal: options.signal,
     headers: { Accept: "application/x-ndjson", ...(options.headers || {}) },
-  });
+  }, options.timeoutMs ?? STREAM_CONNECT_TIMEOUT_MS);
   if (!res.ok) {
     const msg = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText}${msg ? `: ${msg}` : ""}`);
@@ -877,8 +1650,11 @@ async function streamNdjson(url, options = {}) {
   while (true) {
     let readResult;
     try {
-      readResult = await reader.read();
+      readResult = await readStreamChunkWithTimeout(reader, url, options.readTimeoutMs ?? STREAM_READ_TIMEOUT_MS);
     } catch (err) {
+      if (err?.name === "TimeoutError") {
+        await reader.cancel(err).catch(() => {});
+      }
       if (finalData) return finalData;
       throw err;
     }
@@ -1017,7 +1793,46 @@ function fallbackParentRelationshipLine(node) {
     .find(Boolean) || "";
 }
 
+function cloudContextGenreId() {
+  return cloudScene?.stats?.selected_genre_id ||
+    cloudSelectedGenreId ||
+    cloudRootGenreId ||
+    ROOT_KEY;
+}
+
+function cloudContextLabel(contextId = cloudContextGenreId()) {
+  if (!contextId || contextId === ROOT_KEY) return "Music";
+  const detail = detailCache.get(contextId);
+  if (detail?.label) return detail.label;
+  const node = cloudNodeById.get(contextId) || cloudScene?.nodesById?.get(contextId);
+  if (node?.label) return node.label;
+  if (node?.wikipedia_title) return labelFromTitle(node.wikipedia_title);
+  return "Music";
+}
+
+function cloudRelationLine(node) {
+  if (!cloudMode || !node) return "";
+  const genreId = node.genreId || node.id;
+  const contextId = cloudContextGenreId();
+  if (!genreId || !contextId) return "";
+  const cloudNode = cloudNodeById.get(genreId) || cloudScene?.nodesById?.get(genreId) || null;
+  const rawDistance = genreId === contextId
+    ? 0
+    : Number.isFinite(Number(cloudNode?.selected_distance))
+      ? Number(cloudNode.selected_distance)
+      : Number.isFinite(Number(node.selected_distance))
+        ? Number(node.selected_distance)
+        : null;
+  if (rawDistance == null) return "";
+  const steps = Math.max(0, Math.round(rawDistance));
+  return `${steps} ${steps === 1 ? "step" : "steps"} from ${cloudContextLabel(contextId)}`;
+}
+
 function relationshipLine(node) {
+  if (cloudMode) {
+    const cloudLine = cloudRelationLine(node);
+    if (cloudLine) return cloudLine;
+  }
   const parent = node.parentKey ? nodes.get(node.parentKey) : null;
   if (node?.key === ROOT_KEY) return "";
   if (!parent) return fallbackParentRelationshipLine(node);
@@ -1149,7 +1964,7 @@ function youtubePlaybackStore() {
   } catch {
     // Ignore malformed local storage and start fresh.
   }
-  return { version: 2, playlistKey: "", entry: null };
+  return { version: 3, playlistKey: "", entry: null };
 }
 
 function writeYoutubePlaybackStore(store) {
@@ -1184,33 +1999,48 @@ function youtubeCurrentSeconds() {
   return youtubeLastKnownSeconds || youtubeResumeSeconds || 0;
 }
 
-function readYoutubeVolume() {
+function cleanupLegacyYoutubePlaybackMemory() {
   try {
-    const value = Number(localStorage.getItem(YOUTUBE_VOLUME_STORAGE_KEY));
-    if (Number.isFinite(value)) return clamp(value, 0, 100);
+    localStorage.removeItem(YOUTUBE_LEGACY_VOLUME_STORAGE_KEY);
   } catch {
-    // Use the default below if local storage is unavailable.
+    // Playback memory cleanup is best-effort.
   }
+}
+
+function readYoutubeVolume() {
+  cleanupLegacyYoutubePlaybackMemory();
   return 70;
 }
 
-function readYoutubeUserPaused() {
+function readYoutubeShouldAutoplay() {
   try {
-    return localStorage.getItem(YOUTUBE_AUTOPLAY_STORAGE_KEY) === "1";
+    const stored = localStorage.getItem(YOUTUBE_AUTOPLAY_STORAGE_KEY);
+    if (stored === "0") return false;
+    if (stored === "1") return true;
+
+    const legacyPaused = localStorage.getItem(YOUTUBE_LEGACY_AUTOPLAY_PAUSED_KEY);
+    if (legacyPaused === "1" || legacyPaused === "0") {
+      const shouldAutoplay = legacyPaused !== "1";
+      localStorage.setItem(YOUTUBE_AUTOPLAY_STORAGE_KEY, shouldAutoplay ? "1" : "0");
+      localStorage.removeItem(YOUTUBE_LEGACY_AUTOPLAY_PAUSED_KEY);
+      return shouldAutoplay;
+    }
   } catch {
-    return false;
+    // Autoplay preference persistence is best-effort.
   }
+  return true;
+}
+
+function readYoutubeUserPaused() {
+  return !readYoutubeShouldAutoplay();
 }
 
 function setYoutubeUserPaused(isPaused) {
   youtubeUserPaused = Boolean(isPaused);
   try {
-    if (youtubeUserPaused) {
-      localStorage.setItem(YOUTUBE_AUTOPLAY_STORAGE_KEY, "1");
-      clearYoutubePlaybackStore();
-    } else {
-      localStorage.setItem(YOUTUBE_AUTOPLAY_STORAGE_KEY, "0");
-    }
+    localStorage.setItem(YOUTUBE_AUTOPLAY_STORAGE_KEY, youtubeUserPaused ? "0" : "1");
+    localStorage.removeItem(YOUTUBE_LEGACY_AUTOPLAY_PAUSED_KEY);
+    localStorage.removeItem(YOUTUBE_LEGACY_VOLUME_STORAGE_KEY);
   } catch {
     // Autoplay preference persistence is best-effort.
   }
@@ -1264,13 +2094,7 @@ function fadeYoutubeVolume(toVolume, duration = 360) {
 
 function setYoutubeVolume(value, { persist = true } = {}) {
   youtubeVolume = clamp(Number(value) || 0, 0, 100);
-  if (persist) {
-    try {
-      localStorage.setItem(YOUTUBE_VOLUME_STORAGE_KEY, String(youtubeVolume));
-    } catch {
-      // Volume persistence is best-effort.
-    }
-  }
+  cleanupLegacyYoutubePlaybackMemory();
   fadeYoutubeVolume(youtubeVolume, 180);
 }
 
@@ -1329,25 +2153,21 @@ function persistYoutubePlayback() {
   if (youtubeTrackLoading || youtubePaused || youtubeUserPaused || !youtubeIsPlaying) return;
   const seconds = youtubeCurrentSeconds();
   writeYoutubePlaybackStore({
-    version: 2,
+    version: 3,
     playlistKey: youtubePlaylistKey,
     entry: {
       itemUrls: youtubeItems.map(item => item.url),
       index: clamp(youtubeIndex, 0, youtubeItems.length - 1),
       seconds,
-      activePlaying: true,
-      updatedAt: Date.now(),
     },
   });
 }
 
-function restoredYoutubePlayback(playlistKey, items) {
+function restoredYoutubePlayback(playlistKey, items, store = youtubePlaybackStore()) {
   if (!playlistKey || !items.length) return null;
-  const store = youtubePlaybackStore();
   if (store.playlistKey !== playlistKey) return null;
   const entry = store.entry;
   if (!entry || !Array.isArray(entry.itemUrls)) return null;
-  if (entry.activePlaying !== true) return null;
   const available = new Map(items.map(item => [item.url, item]));
   const restored = [];
   const seen = new Set();
@@ -1404,18 +2224,6 @@ function youtubeUrlParts(rawUrl) {
   }
 }
 
-function youtubeVideoIdsForItems(items) {
-  const seen = new Set();
-  const ids = [];
-  for (const item of items || []) {
-    const videoId = youtubeUrlParts(item?.url)?.videoId || "";
-    if (!videoId || seen.has(videoId)) continue;
-    seen.add(videoId);
-    ids.push(videoId);
-  }
-  return ids;
-}
-
 function youtubeEmbedUrl(rawUrl, playlistItems = [], playlistStartIndex = 0, startSeconds = 0, { autoplay = true } = {}) {
   const parts = youtubeUrlParts(rawUrl);
   if (!parts) return "";
@@ -1428,31 +2236,13 @@ function youtubeEmbedUrl(rawUrl, playlistItems = [], playlistStartIndex = 0, sta
     rel: "0",
   });
 
-  if (parts.playlistId) params.set("list", parts.playlistId);
   if (startSeconds > 1) params.set("start", String(Math.floor(startSeconds)));
 
   if (!parts.videoId && parts.playlistId) {
+    params.set("list", parts.playlistId);
     return `https://www.youtube-nocookie.com/embed/videoseries?${params.toString()}`;
   }
   if (!parts.videoId) return "";
-
-  if (!parts.playlistId) {
-    const videoIds = youtubeVideoIdsForItems(playlistItems);
-    if (videoIds.length > 1) {
-      const start = clamp(playlistStartIndex, 0, videoIds.length - 1);
-      const queue = [...videoIds.slice(start), ...videoIds.slice(0, start)];
-      if (queue[0] !== parts.videoId) {
-        const selectedIndex = queue.indexOf(parts.videoId);
-        if (selectedIndex > 0) {
-          queue.splice(selectedIndex, 1);
-          queue.unshift(parts.videoId);
-        } else if (selectedIndex < 0) {
-          queue.unshift(parts.videoId);
-        }
-      }
-      params.set("playlist", queue.join(","));
-    }
-  }
 
   return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(parts.videoId)}?${params.toString()}`;
 }
@@ -1486,6 +2276,12 @@ function ensureYoutubeApi() {
   window.onYouTubeIframeAPIReady = () => {
     if (typeof previousReady === "function") previousReady();
     youtubeApiReady = true;
+    if (youtubeDeferredLoadIndex !== null) {
+      const index = youtubeDeferredLoadIndex;
+      youtubeDeferredLoadIndex = null;
+      loadYoutubeIndex(index);
+      return;
+    }
     attachYoutubePlayer();
   };
   const script = document.createElement("script");
@@ -1494,7 +2290,22 @@ function ensureYoutubeApi() {
   document.head.appendChild(script);
 }
 
+function ensureYoutubeFrameElement() {
+  if (youtubeFrame?.isConnected) return youtubeFrame;
+  if (!youtubeFrameHost) return youtubeFrame;
+  const frame = document.createElement("iframe");
+  frame.id = "youtube-frame";
+  frame.setAttribute("aria-label", "YouTube genre playlist");
+  frame.setAttribute("allow", "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
+  frame.setAttribute("allowfullscreen", "");
+  const overlay = youtubeFrameHost.querySelector(".youtube-empty");
+  youtubeFrameHost.insertBefore(frame, overlay || youtubeFrameHost.firstChild);
+  youtubeFrame = frame;
+  return youtubeFrame;
+}
+
 function attachYoutubePlayer() {
+  ensureYoutubeFrameElement();
   if (!youtubeApiReady || !youtubeFrame?.src || youtubePlayer || !window.YT?.Player) return;
   youtubePlayer = new window.YT.Player(youtubeFrame, {
     events: {
@@ -1508,6 +2319,18 @@ function attachYoutubePlayer() {
   });
 }
 
+function clearYoutubeFrameSource() {
+  youtubeDeferredLoadIndex = null;
+  try {
+    youtubePlayer?.destroy?.();
+  } catch {
+    // The iframe may already have been detached by YouTube.
+  }
+  youtubePlayer = null;
+  ensureYoutubeFrameElement();
+  if (youtubeFrame) youtubeFrame.removeAttribute("src");
+}
+
 function youtubePlayerState() {
   try {
     return youtubePlayer?.getPlayerState?.();
@@ -1516,9 +2339,86 @@ function youtubePlayerState() {
   }
 }
 
+function youtubeCurrentVideoLooksPlayable() {
+  try {
+    const duration = youtubePlayer?.getDuration?.();
+    if (Number.isFinite(duration) && duration > 0) return true;
+  } catch {
+    // Fall through to other player metadata checks.
+  }
+  try {
+    const loadedFraction = youtubePlayer?.getVideoLoadedFraction?.();
+    if (Number.isFinite(loadedFraction) && loadedFraction > 0) return true;
+  } catch {
+    // Fall through to player video data below.
+  }
+  try {
+    const data = youtubePlayer?.getVideoData?.();
+    const videoId = String(data?.video_id || data?.videoId || "").trim();
+    const title = String(data?.title || "").trim();
+    return Boolean(videoId && title);
+  } catch {
+    return false;
+  }
+}
+
+function youtubeVideoIdFromUrl(rawUrl) {
+  return youtubeUrlParts(rawUrl)?.videoId || "";
+}
+
+function youtubePlayerCurrentVideoId() {
+  try {
+    const data = youtubePlayer?.getVideoData?.();
+    const dataId = String(data?.video_id || data?.videoId || "").trim();
+    if (dataId) return dataId;
+  } catch {
+    // Fall through to getVideoUrl.
+  }
+  try {
+    return youtubeVideoIdFromUrl(youtubePlayer?.getVideoUrl?.() || "");
+  } catch {
+    return "";
+  }
+}
+
+function youtubeErrorMatchesCurrentTrack() {
+  const expectedId = youtubeVideoIdFromUrl(youtubeItems[youtubeIndex]?.url || "");
+  const actualId = youtubePlayerCurrentVideoId();
+  return Boolean(!expectedId || !actualId || expectedId === actualId);
+}
+
+function youtubeNormalizedErrorCode(error) {
+  const value = String(error ?? "").trim();
+  if (!value) return "";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? String(numeric) : value;
+}
+
+function youtubeErrorIsReportable(error) {
+  return YOUTUBE_REPORTABLE_ERROR_CODES.has(youtubeNormalizedErrorCode(error));
+}
+
+function youtubeDevErrorScoringEnabled() {
+  return ["localhost", "127.0.0.1", "0.0.0.0"].includes(window.location.hostname);
+}
+
+function youtubeDevPlaybackDiagnosticsEnabled() {
+  return youtubeDevErrorScoringEnabled();
+}
+
+function markYoutubeTrackInteractive() {
+  if (!youtubeTrackLoading) return;
+  youtubeTrackLoading = false;
+  youtubePlayRequested = false;
+  youtubeDevPlaybackStatus = "";
+  window.clearTimeout(youtubeReadyTimer);
+  updateYoutubeTrackText();
+  updateYoutubeControls();
+}
+
 function syncYoutubePlaybackState() {
   const state = youtubePlayerState();
-  if (state === window.YT?.PlayerState?.PLAYING || (state === window.YT?.PlayerState?.BUFFERING && youtubePlayRequested)) {
+  if (state === window.YT?.PlayerState?.PLAYING) {
     youtubeIsPlaying = true;
     youtubeAutoplayBlocked = false;
     youtubePaused = false;
@@ -1528,10 +2428,19 @@ function syncYoutubePlaybackState() {
     updateYoutubeControls();
     return true;
   }
-  if (state === window.YT?.PlayerState?.PAUSED) {
+  if (state === window.YT?.PlayerState?.PAUSED || state === window.YT?.PlayerState?.CUED) {
+    const wasLoading = youtubeTrackLoading;
+    if (wasLoading) {
+      if (!youtubePlayRequested) {
+        markYoutubeTrackInteractive();
+      }
+      updateYoutubeTrackText();
+      updateYoutubeControls();
+      return false;
+    }
     youtubeIsPlaying = false;
     youtubePaused = true;
-    if (!youtubeTrackLoading) setYoutubeUserPaused(true);
+    if (!wasLoading) setYoutubeUserPaused(true);
     updateYoutubeTrackText();
     updateYoutubeControls();
   }
@@ -1553,14 +2462,20 @@ function startYoutubeStatePolling(duration = 6500) {
 function handleYoutubeStateChange(event) {
   if (!youtubeItems.length) return;
   if (
-    event?.data === window.YT?.PlayerState?.PLAYING ||
-    (event?.data === window.YT?.PlayerState?.BUFFERING && youtubePlayRequested)
+    event?.data === window.YT?.PlayerState?.PLAYING
   ) {
     syncYoutubePlaybackState();
-  } else if (event?.data === window.YT?.PlayerState?.PAUSED) {
+  } else if (event?.data === window.YT?.PlayerState?.PAUSED || event?.data === window.YT?.PlayerState?.CUED) {
+    const wasLoading = youtubeTrackLoading;
     youtubeIsPlaying = false;
     youtubePaused = true;
-    if (!youtubeTrackLoading) setYoutubeUserPaused(true);
+    if (wasLoading) {
+      if (!youtubePlayRequested) {
+        markYoutubeTrackInteractive();
+      }
+    } else {
+      setYoutubeUserPaused(true);
+    }
     updateYoutubeTrackText();
     updateYoutubeControls();
   }
@@ -1572,10 +2487,15 @@ function handleYoutubeStateChange(event) {
 }
 
 function handleYoutubeError(event) {
-  failCurrentYoutubeTrack(event?.data ?? "player_error");
+  if (!youtubeTrackLoading) return;
+  youtubeDevPlaybackStatus = `YouTube error ${youtubeNormalizedErrorCode(event?.data) || "unknown"}; trying next...`;
+  failCurrentYoutubeTrack(event?.data ?? "player_error", {
+    report: youtubeDevErrorScoringEnabled() && youtubeErrorIsReportable(event?.data),
+  });
 }
 
 function reportYoutubePlaybackError(item, error, token) {
+  if (!youtubeDevErrorScoringEnabled()) return;
   const genreId =
     item?.genreId ||
     nodes.get(activeLeafKey)?.genreId ||
@@ -1611,12 +2531,12 @@ function reportYoutubePlaybackError(item, error, token) {
   }).catch(() => {});
 }
 
-function failCurrentYoutubeTrack(error = "unknown") {
+function failCurrentYoutubeTrack(error = "unknown", { report = youtubeErrorIsReportable(error) } = {}) {
   const token = youtubeLoadToken;
   const currentItem = youtubeItems[youtubeIndex] || null;
   const currentUrl = currentItem?.url || "";
   if (currentUrl) youtubeErroredUrls.add(currentUrl);
-  reportYoutubePlaybackError(currentItem, error, token);
+  if (report) reportYoutubePlaybackError(currentItem, error, token);
   window.clearTimeout(youtubeErrorTimer);
   window.clearTimeout(youtubeReadyTimer);
   window.clearInterval(youtubeStatePollTimer);
@@ -1626,6 +2546,7 @@ function failCurrentYoutubeTrack(error = "unknown") {
   youtubeIsPlaying = false;
   youtubeAutoplayBlocked = false;
   youtubePlayRequested = false;
+  youtubeDevPlaybackStatus = `Error ${youtubeNormalizedErrorCode(error) || "unknown"}; trying next...`;
   updateYoutubeTrackText({ loading: true });
   updateYoutubeControls({ loading: true });
   youtubeErrorTimer = window.setTimeout(() => {
@@ -1650,22 +2571,27 @@ function markYoutubeAutoplayBlocked() {
   youtubeIsPlaying = false;
   youtubeAutoplayBlocked = true;
   youtubePlayRequested = false;
+  youtubeDevPlaybackStatus = "Playable embed found; autoplay blocked or not started.";
   window.clearTimeout(youtubeReadyTimer);
-  setYoutubeUserPaused(true);
-  updateYoutubeTrackText({ loading: true });
-  updateYoutubeControls({ loading: true });
+  youtubeTrackLoading = false;
+  updateYoutubeTrackText();
+  updateYoutubeControls();
 }
 
-function scheduleYoutubeReadyTimeout(delay = 5000) {
+function scheduleYoutubeReadyTimeout(delay = 5000, token = youtubeLoadToken) {
   window.clearTimeout(youtubeReadyTimer);
   youtubeReadyTimer = window.setTimeout(() => {
+    if (token !== youtubeLoadToken) return;
     if (youtubeTrackLoading) {
       if (!syncYoutubePlaybackState()) {
         const state = youtubePlayerState();
-        if (youtubeStateAllowsManualPlay(state)) {
-          markYoutubeAutoplayBlocked();
-        } else {
-          failCurrentYoutubeTrack("ready_timeout");
+        const looksPlayable = youtubeCurrentVideoLooksPlayable();
+        if (youtubePlayRequested) {
+          if (looksPlayable) {
+            markYoutubeAutoplayBlocked();
+          }
+        } else if (youtubeStateAllowsManualPlay(state) || looksPlayable) {
+          markYoutubeTrackInteractive();
         }
       }
     }
@@ -1675,6 +2601,7 @@ function scheduleYoutubeReadyTimeout(delay = 5000) {
 function markYoutubeTrackReady() {
   if (!youtubeTrackLoading) return;
   youtubeTrackLoading = false;
+  youtubeDevPlaybackStatus = "";
   window.clearTimeout(youtubeReadyTimer);
   youtubeLastKnownSeconds = youtubeResumeSeconds || youtubeLastKnownSeconds || 0;
   youtubeTrackStartedAt = Date.now() - (youtubeLastKnownSeconds * 1000);
@@ -1692,13 +2619,34 @@ function markYoutubeTrackReady() {
   updateYoutubeControls();
 }
 
+function showYoutubePlaybackErrorState() {
+  youtubeItems = [];
+  youtubeIndex = 0;
+  youtubeDeferredLoadIndex = null;
+  youtubeResumeSeconds = 0;
+  youtubeLastKnownSeconds = 0;
+  youtubeTrackStartedAt = 0;
+  youtubeTrackLoading = false;
+  youtubePaused = true;
+  youtubeIsPlaying = false;
+  youtubeAutoplayBlocked = false;
+  youtubePlayRequested = false;
+  youtubePlaybackErrorExhausted = true;
+  youtubeDevPlaybackStatus = "";
+  window.clearTimeout(youtubeErrorTimer);
+  window.clearTimeout(youtubeReadyTimer);
+  window.clearInterval(youtubeStatePollTimer);
+  youtubeStatePollTimer = 0;
+  youtubeCommand("pauseVideo");
+  clearYoutubeFrameSource();
+  updateYoutubeTrackText({ noPlaylist: true, genreName: youtubeGenreTitle?.textContent || "this genre" });
+  updateYoutubeControls({ noPlaylist: true });
+}
+
 function loadNextYoutubeIndex({ direction = 1 } = {}) {
   if (!youtubeItems.length) return;
   if (youtubeItems.length < 2) {
-    youtubeItems = [];
-    youtubeTrackLoading = false;
-    updateYoutubeTrackText({ noPlaylist: true, genreName: youtubeGenreTitle?.textContent || "this genre" });
-    updateYoutubeControls({ noPlaylist: true });
+    showYoutubePlaybackErrorState();
     return;
   }
   const total = youtubeItems.length;
@@ -1711,18 +2659,33 @@ function loadNextYoutubeIndex({ direction = 1 } = {}) {
     updateYoutubeControls();
     return;
   }
-  youtubeItems = [];
-  youtubeTrackLoading = false;
-  updateYoutubeTrackText({ noPlaylist: true, genreName: youtubeGenreTitle?.textContent || "this genre" });
-  updateYoutubeControls({ noPlaylist: true });
+  showYoutubePlaybackErrorState();
 }
 
 function youtubeCommand(command, args = []) {
+  ensureYoutubeFrameElement();
   if (!youtubeFrame?.contentWindow) return;
   youtubeFrame.contentWindow.postMessage(
     JSON.stringify({ event: "command", func: command, args }),
     "https://www.youtube-nocookie.com"
   );
+}
+
+function youtubeLoadVideoWithApi(item, startSeconds = 0, shouldAutoplay = true) {
+  ensureYoutubeFrameElement();
+  const parts = youtubeUrlParts(item?.url);
+  if (!youtubePlayer || !youtubeFrame?.src || !parts?.videoId) return false;
+  const payload = {
+    videoId: parts.videoId,
+    startSeconds: Math.max(0, Math.floor(Number(startSeconds) || 0)),
+  };
+  const command = shouldAutoplay ? "loadVideoById" : "cueVideoById";
+  try {
+    youtubePlayer?.[command]?.(payload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function loadYoutubeIndex(index) {
@@ -1735,10 +2698,7 @@ function loadYoutubeIndex(index) {
     if (youtubeItems.length > 1) {
       loadNextYoutubeIndex();
     } else {
-      youtubeItems = [];
-      youtubeTrackLoading = false;
-      updateYoutubeTrackText({ noPlaylist: true, genreName: youtubeGenreTitle?.textContent || "this genre" });
-      updateYoutubeControls({ noPlaylist: true });
+      showYoutubePlaybackErrorState();
     }
     return;
   }
@@ -1747,8 +2707,10 @@ function loadYoutubeIndex(index) {
   const src = youtubeEmbedUrl(item?.url, youtubeItems, youtubeIndex, startSeconds, {
     autoplay: shouldAutoplay,
   });
+  ensureYoutubeFrameElement();
   if (!youtubeFrame || !src) return;
-  youtubeFrame.src = src;
+  youtubePlaybackErrorExhausted = false;
+  youtubeDevPlaybackStatus = "";
   youtubeLastKnownSeconds = startSeconds;
   youtubeTrackStartedAt = 0;
   youtubeTrackLoading = true;
@@ -1756,17 +2718,48 @@ function loadYoutubeIndex(index) {
   youtubeIsPlaying = false;
   youtubeAutoplayBlocked = false;
   youtubePlayRequested = shouldAutoplay;
+  youtubeDevPlaybackStatus = shouldAutoplay
+    ? "Requesting autoplay; waiting for play or error..."
+    : "Autoplay disabled; waiting for cue...";
   applyYoutubeVolume(lowYoutubeVolume());
-  ensureYoutubeApi();
-  attachYoutubePlayer();
+  if (!youtubePlayer && !window.YT?.Player) {
+    youtubeDeferredLoadIndex = youtubeIndex;
+    youtubeDevPlaybackStatus = "Waiting for YouTube iframe API...";
+    ensureYoutubeApi();
+    updateYoutubeTrackText({ loading: true });
+    updateYoutubeControls({ loading: true });
+    return;
+  }
+  const loadedViaApi = youtubeLoadVideoWithApi(item, startSeconds, shouldAutoplay);
+  if (!loadedViaApi) {
+    youtubeDevPlaybackStatus = "Mounting iframe; waiting for player event...";
+    if (youtubePlayer) clearYoutubeFrameSource();
+    youtubeFrame.src = src;
+    ensureYoutubeApi();
+    attachYoutubePlayer();
+  } else {
+    youtubeDevPlaybackStatus = shouldAutoplay
+      ? "loadVideoById sent; waiting for play or error..."
+      : "cueVideoById sent; waiting for cue...";
+  }
   if (shouldAutoplay) {
     window.setTimeout(() => {
       if (youtubeUserPaused) return;
       applyYoutubeVolume(lowYoutubeVolume());
-      youtubeCommand("playVideo");
+      if (loadedViaApi) {
+        try {
+          youtubePlayer?.playVideo?.();
+        } catch {
+          youtubeCommand("playVideo");
+        }
+      } else {
+        youtubeCommand("playVideo");
+      }
       startYoutubeStatePolling();
     }, 800);
     scheduleYoutubeReadyTimeout();
+  } else {
+    scheduleYoutubeReadyTimeout(3500);
   }
   updateYoutubeTrackText({ loading: true });
   updateYoutubeControls({ loading: true });
@@ -1774,18 +2767,19 @@ function loadYoutubeIndex(index) {
 
 function updateYoutubeControls({ noPlaylist = false, loading = false } = {}) {
   const hasEmbed = youtubeItems.some(item => youtubeEmbedUrl(item.url, [item], 0));
-  const pendingPlayback = Boolean(hasEmbed && !youtubeHasActivePlayback());
-  loading = Boolean(loading || youtubeTrackLoading || pendingPlayback);
+  loading = Boolean(loading || youtubeTrackLoading);
   noPlaylist = noPlaylist && !loading;
   if (youtubeCard) {
     youtubeCard.classList.toggle("youtube-empty-state", loading);
     youtubeCard.classList.toggle("youtube-no-playlist-state", noPlaylist);
+    youtubeCard.classList.toggle("youtube-playback-error-state", noPlaylist && youtubePlaybackErrorExhausted);
+    youtubeCard.classList.toggle("youtube-dev-diagnostics-state", youtubeDevPlaybackDiagnosticsEnabled());
   }
   document.body.classList.toggle("youtube-no-playlist-active", noPlaylist);
   if (youtubeVolumeInput) youtubeVolumeInput.disabled = !hasEmbed || noPlaylist;
   if (youtubePauseButton) {
     const isPausedState = !loading && (!youtubeIsPlaying || youtubePaused || youtubeUserPaused);
-    youtubePauseButton.disabled = !hasEmbed;
+    youtubePauseButton.disabled = !hasEmbed || loading;
     youtubePauseButton.classList.toggle("is-playing", youtubeIsPlaying && !youtubePaused);
     youtubePauseButton.classList.toggle("is-paused", isPausedState);
     youtubePauseButton.classList.toggle("autoplay-blocked", youtubeAutoplayBlocked);
@@ -1794,16 +2788,18 @@ function updateYoutubeControls({ noPlaylist = false, loading = false } = {}) {
       youtubeIsPlaying && !youtubePaused ? "Pause YouTube" : "Play YouTube"
     );
   }
-  if (youtubeSkipButton) youtubeSkipButton.disabled = youtubeItems.length < 2 || loading;
-  if (!hasEmbed && youtubeFrame) youtubeFrame.removeAttribute("src");
+  if (youtubeSkipButton) youtubeSkipButton.disabled = youtubeItems.length < 2;
+  if (!hasEmbed) clearYoutubeFrameSource();
   updateYoutubePinUi();
 }
 
 function clearYoutubePlaybackSurface() {
   youtubeItems = [];
   youtubeIndex = 0;
+  youtubeDeferredLoadIndex = null;
   youtubeResumeSeconds = 0;
   youtubeTrackLoading = false;
+  youtubePlaybackErrorExhausted = false;
   youtubePaused = true;
   youtubeIsPlaying = false;
   youtubeAutoplayBlocked = false;
@@ -1815,11 +2811,11 @@ function clearYoutubePlaybackSurface() {
   window.clearInterval(youtubeStatePollTimer);
   youtubeStatePollTimer = 0;
   youtubeCommand("pauseVideo");
-  if (youtubeFrame) youtubeFrame.removeAttribute("src");
+  clearYoutubeFrameSource();
   if (youtubeSongTitle) {
     youtubeSongTitle.textContent = "";
     youtubeSongTitle.hidden = true;
-    youtubeSongTitle.classList.remove("youtube-loading-title", "youtube-openable-title");
+    youtubeSongTitle.classList.remove("youtube-loading-title", "youtube-dev-loading-title", "youtube-openable-title");
     youtubeSongTitle.removeAttribute("role");
     youtubeSongTitle.removeAttribute("tabindex");
     youtubeSongTitle.removeAttribute("title");
@@ -1841,7 +2837,7 @@ function hideYoutubeCardForSelection() {
   updateYoutubeControls();
   if (youtubeCard) {
     youtubeCard.classList.add("youtube-card-hidden");
-    youtubeCard.classList.remove("youtube-empty-state", "youtube-no-playlist-state");
+    youtubeCard.classList.remove("youtube-empty-state", "youtube-no-playlist-state", "youtube-playback-error-state");
   }
   document.body.classList.remove("youtube-no-playlist-active");
 }
@@ -1849,14 +2845,19 @@ function hideYoutubeCardForSelection() {
 function updateYoutubeTrackText({ noPlaylist = false, loading = false, genreName = "" } = {}) {
   const currentItem = youtubeItems[youtubeIndex] || null;
   const hasEmbed = Boolean(currentItem);
-  const pendingPlayback = Boolean(hasEmbed && !youtubeHasActivePlayback());
-  loading = Boolean(loading || youtubeTrackLoading || pendingPlayback);
+  loading = Boolean(loading || youtubeTrackLoading);
   noPlaylist = noPlaylist && !loading;
   const artist = String(currentItem?.artist || "").trim();
+  const devLoading = Boolean(loading && hasEmbed && youtubeDevPlaybackDiagnosticsEnabled());
   if (youtubeSongTitle) {
-    youtubeSongTitle.textContent = loading ? "Loading..." : (hasEmbed ? (currentItem.title || "Untitled video") : "");
+    youtubeSongTitle.textContent = devLoading
+      ? `Trying: ${currentItem.title || "Untitled video"}`
+      : loading
+      ? "Loading..."
+      : (hasEmbed ? (currentItem.title || "Untitled video") : "");
     youtubeSongTitle.hidden = !loading && !hasEmbed;
-    youtubeSongTitle.classList.toggle("youtube-loading-title", loading);
+    youtubeSongTitle.classList.toggle("youtube-loading-title", loading && !devLoading);
+    youtubeSongTitle.classList.toggle("youtube-dev-loading-title", devLoading);
     youtubeSongTitle.classList.toggle("youtube-openable-title", hasEmbed && !loading);
     if (hasEmbed && !loading) {
       youtubeSongTitle.setAttribute("role", "link");
@@ -1868,14 +2869,26 @@ function updateYoutubeTrackText({ noPlaylist = false, loading = false, genreName
     }
   }
   if (youtubeArtistTitle) {
-    youtubeArtistTitle.textContent = !loading && hasEmbed ? artist : "";
-    youtubeArtistTitle.style.display = !loading && hasEmbed && artist ? "" : "none";
+    const devStatus = youtubeDevPlaybackStatus || (artist ? `Artist: ${artist}` : "Waiting for YouTube...");
+    youtubeArtistTitle.textContent = devLoading ? devStatus : (!loading && hasEmbed ? artist : "");
+    youtubeArtistTitle.style.display = (devLoading || (!loading && hasEmbed && artist)) ? "" : "none";
   }
   if (youtubeEmptyMessage) {
     const name = genreName || youtubeGenreTitle?.textContent || "this genre";
-    youtubeEmptyMessage.textContent = noPlaylist
-      ? `We haven't found any good examples of ${name}`
-      : "";
+    youtubeEmptyMessage.replaceChildren();
+    if (noPlaylist && youtubePlaybackErrorExhausted) {
+      youtubeEmptyMessage.append("We couldn't play videos for ");
+      const genreNameEl = document.createElement("span");
+      genreNameEl.className = "youtube-empty-genre-name";
+      genreNameEl.textContent = name;
+      youtubeEmptyMessage.append(genreNameEl, " right now.");
+    } else if (noPlaylist) {
+      youtubeEmptyMessage.append("We haven't found any good examples of ");
+      const genreNameEl = document.createElement("span");
+      genreNameEl.className = "youtube-empty-genre-name";
+      genreNameEl.textContent = name;
+      youtubeEmptyMessage.append(genreNameEl);
+    }
     youtubeEmptyMessage.hidden = !noPlaylist;
   }
   if (youtubeSubmitButton) {
@@ -1964,25 +2977,36 @@ function toggleYoutubePin() {
 async function transitionYoutubePlaylist(nextKey, nextItems, { noPlaylist, loading, genreName } = {}) {
   const token = ++youtubePlaylistTransitionToken;
   const isSwappingRadio = Boolean(youtubePlaylistKey && youtubePlaylistKey !== nextKey);
-  if (isSwappingRadio) clearYoutubePlaybackStore();
+  let storedPlayback = youtubePlaybackStore();
+  const isStoredRadioMismatch = Boolean(storedPlayback.playlistKey && storedPlayback.playlistKey !== nextKey);
+  if (isSwappingRadio || isStoredRadioMismatch) {
+    clearYoutubePlaybackStore();
+    storedPlayback = { version: 3, playlistKey: "", entry: null };
+  }
   if (!nextItems.length) {
     youtubePlaylistKey = nextKey;
     youtubeErroredUrls = new Set();
     youtubeReportedFailureTokens = new Set();
+    youtubePlaybackErrorExhausted = false;
     clearYoutubePlaybackSurface();
     updateYoutubeTrackText({ noPlaylist, loading, genreName });
     updateYoutubeControls({ noPlaylist, loading });
     return;
   }
   const hadActivePlayer = Boolean(youtubeFrame?.getAttribute("src") && youtubeItems.length);
-  if (hadActivePlayer) {
+  if (isSwappingRadio && hadActivePlayer) {
+    clearYoutubePlaybackSurface();
+    updateYoutubeTrackText({ loading: true, genreName });
+    updateYoutubeControls({ loading: true });
+  } else if (hadActivePlayer) {
     await fadeYoutubeVolume(lowYoutubeVolume(), 1000);
     if (token !== youtubePlaylistTransitionToken) return;
   }
   youtubePlaylistKey = nextKey;
   youtubeErroredUrls = new Set();
   youtubeReportedFailureTokens = new Set();
-  const restored = restoredYoutubePlayback(nextKey, nextItems);
+  youtubePlaybackErrorExhausted = false;
+  const restored = restoredYoutubePlayback(nextKey, nextItems, storedPlayback);
   youtubeItems = restored?.items || shuffledYoutubeItems(nextItems);
   youtubeIndex = restored?.index || 0;
   youtubeResumeSeconds = restored?.seconds || 0;
@@ -2006,14 +3030,12 @@ function updateYoutubeCardForSelection(node) {
     nodeHasExplicitNoPlaylist(node) ||
     isCoreNode
   );
-  if (!hasKnownPlaylistState && !nextItems.length && youtubeItems.length) {
-    return;
-  }
+  const nextKey = youtubeNodeIdentity(node);
   if (
     youtubePinned &&
     youtubePlaybackNode &&
-    youtubeNodeIdentity(node) &&
-    youtubeNodeIdentity(node) !== youtubeNodeIdentity(youtubePlaybackNode)
+    nextKey &&
+    nextKey !== youtubeNodeIdentity(youtubePlaybackNode)
   ) {
     youtubeDeferredSelectionNode = node;
     updateYoutubePinUi();
@@ -2024,13 +3046,24 @@ function updateYoutubeCardForSelection(node) {
     return;
   }
 
+  const previousPlaybackKey = youtubeNodeIdentity(youtubePlaybackNode);
+  if (!youtubePinned && nextKey && previousPlaybackKey && nextKey !== previousPlaybackKey) {
+    clearYoutubePlaybackSurface();
+  }
   youtubeCard.classList.remove("youtube-card-hidden");
   youtubePlaybackNode = node || null;
+  scheduleDetailCardIdleReturn();
   if (!youtubePinned) youtubeDeferredSelectionNode = null;
   youtubeGenreTitle.textContent = node?.label || "Music";
-  const nextKey = `${node?.genreId || node?.key || ""}|${nextItems.map(item => `${item.url}|${item.title}|${item.artist}`).join("|")}`;
   const noPlaylist = Boolean(hasKnownPlaylistState && !nextItems.length);
   const loading = Boolean(!hasKnownPlaylistState && !nextItems.length);
+  if (loading && nextKey !== youtubePlaylistKey) {
+    clearYoutubePlaybackSurface();
+    updateYoutubeTrackText({ loading: true, genreName: node?.label || "Music" });
+    updateYoutubeControls({ loading: true });
+    updateYoutubePinUi();
+    return;
+  }
   if (nextKey !== youtubePlaylistKey) {
     void transitionYoutubePlaylist(nextKey, nextItems, {
       noPlaylist,
@@ -2045,7 +3078,7 @@ function updateYoutubeCardForSelection(node) {
 
 function openCurrentYoutubeTrack() {
   const item = youtubeItems[youtubeIndex];
-  if (!item?.url || !youtubeHasActivePlayback()) return;
+  if (!item?.url || youtubeTrackLoading) return;
   const seconds = youtubeCurrentSeconds();
   persistYoutubePlayback();
   youtubePaused = true;
@@ -2122,6 +3155,33 @@ function restoreDetailCardAfterPlaybackHover() {
 
   const node = currentDetailFallbackNode();
   if (node) updateCard(node);
+}
+
+function playbackRadioDetailNode() {
+  const node = playbackDetailNode() || youtubePlaybackNode;
+  return nodeHasRestorableDetail(node) ? node : null;
+}
+
+function clearDetailCardIdleTimer() {
+  window.clearTimeout(detailCardIdleTimer);
+  detailCardIdleTimer = 0;
+}
+
+function scheduleDetailCardIdleReturn(renderedKey = detailCardRenderedKey) {
+  clearDetailCardIdleTimer();
+  const playbackNode = playbackRadioDetailNode();
+  if (!playbackNode) return;
+  if (!document.body.classList.contains("detail-card-visible")) return;
+  if (detailCardSuppressed || youtubeCardHovered || hoveredNodeKey) return;
+  if (renderedKey && renderedKey === detailCardIdentity(playbackNode)) return;
+  detailCardIdleTimer = window.setTimeout(() => {
+    detailCardIdleTimer = 0;
+    const nextNode = playbackRadioDetailNode();
+    if (!nextNode) return;
+    if (!document.body.classList.contains("detail-card-visible")) return;
+    if (detailCardSuppressed || youtubeCardHovered || hoveredNodeKey) return;
+    updateCard(nextNode, { idleReturn: true });
+  }, DETAIL_CARD_RADIO_IDLE_MS);
 }
 
 function activePathLabels() {
@@ -2209,6 +3269,36 @@ function closeFeedbackModal() {
   if (feedbackStatus) feedbackStatus.textContent = "";
 }
 
+function positiveMetricValue(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return null;
+}
+
+function textMetricsFromPayload(payload = {}) {
+  return {
+    textWidth: positiveMetricValue(payload.text_width, payload.textWidth),
+    textHeight: positiveMetricValue(payload.text_height, payload.textHeight),
+    boxWidth: positiveMetricValue(payload.box_width, payload.boxWidth),
+    boxHeight: positiveMetricValue(payload.box_height, payload.boxHeight),
+    boxPadX: positiveMetricValue(payload.box_pad_x, payload.boxPadX),
+    boxPadY: positiveMetricValue(payload.box_pad_y, payload.boxPadY),
+  };
+}
+
+function textMetricsFromEdge(edge = {}) {
+  return {
+    textWidth: positiveMetricValue(edge.to_text_width, edge.toTextWidth),
+    textHeight: positiveMetricValue(edge.to_text_height, edge.toTextHeight),
+    boxWidth: positiveMetricValue(edge.to_box_width, edge.toBoxWidth),
+    boxHeight: positiveMetricValue(edge.to_box_height, edge.toBoxHeight),
+    boxPadX: positiveMetricValue(edge.to_box_pad_x, edge.toBoxPadX),
+    boxPadY: positiveMetricValue(edge.to_box_pad_y, edge.toBoxPadY),
+  };
+}
+
 async function submitFeedback() {
   if (!feedbackForm || !feedbackSubmitButton) return;
   feedbackSubmitButton.disabled = true;
@@ -2239,6 +3329,7 @@ function genreFromDetail(detail, options = {}) {
     qid: detail.wikidata_qid,
     color: detail.similarity_color || detail.infobox_color,
     colorConfidence: detail.color_confidence,
+    ...textMetricsFromPayload(detail),
     summary: detail.summary,
     monthlyViews: detail.monthly_views_p30,
     wikipedia_url: detail.wikipedia_url,
@@ -2297,49 +3388,48 @@ function capitalizeDisplayTerm(value) {
   });
 }
 
+function aliasCompareKey(value) {
+  return normalizeLabel(value)
+    .toLocaleLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function displayAliasesForCard(g) {
+  const titleKeys = new Set([
+    aliasCompareKey(g?.label),
+    aliasCompareKey(g?.title),
+  ].filter(Boolean));
+  return uniqueStrings(g?.aliases || [])
+    .map(capitalizeDisplayTerm)
+    .filter(Boolean)
+    .filter(alias => !titleKeys.has(aliasCompareKey(alias)))
+    .slice(0, 8);
+}
+
 function metadataIcon(kind) {
-  if (kind === "origin") return "⌖";
-  if (kind === "instrument") return "♪";
-  return "▦";
+  if (kind === "origin") return "location_on";
+  if (kind === "instrument") return "piano";
+  return "info";
 }
 
 function cleanCategory(value) {
   return normalizeLabel(value).replace(/^Category:/i, "");
 }
 
-function isInformationalCategory(value) {
-  const lower = cleanCategory(value).toLocaleLowerCase();
-  const blocked = [
-    "all articles",
-    "articles needing",
-    "articles with",
-    "articles containing",
-    "articles covered by",
-    "cs1",
-    "short description",
-    "pages using",
-    "use dmy dates",
-    "webarchive",
-    "wikipedia",
-    "wikidata",
-    "commons category",
-    "cleanup",
-  ];
-  return lower && !blocked.some(prefix => lower.startsWith(prefix));
-}
-
 function metadataItems(g) {
   const items = [];
-  for (const value of uniqueStrings(g.origins).slice(0, 3)) {
-    items.push({ kind: "origin", value });
+  const origins = uniqueStrings(g.origins).map(capitalizeDisplayTerm);
+  if (origins.length) {
+    items.push({ kind: "origin", value: origins.join(", ") });
   }
-  for (const value of uniqueStrings(g.instruments).slice(0, 2)) {
-    items.push({ kind: "instrument", value });
+  const instruments = uniqueStrings(g.instruments).map(capitalizeDisplayTerm);
+  if (instruments.length) {
+    items.push({ kind: "instrument", value: instruments.join(", ") });
   }
-  for (const value of uniqueStrings(g.categories).filter(isInformationalCategory).slice(0, 2)) {
-    items.push({ kind: "category", value: cleanCategory(value) });
-  }
-  return items.slice(0, 6);
+  return items;
 }
 
 async function getGenreDetail(genreId) {
@@ -2364,7 +3454,8 @@ function readCachedRoots() {
   try {
     const parsed = JSON.parse(sessionStorage.getItem(STORAGE_ROOTS_KEY) || "null");
     if (!Array.isArray(parsed)) return null;
-    return parsed.filter(g => g && g.genreId && g.label);
+    const roots = parsed.filter(g => g && g.genreId && g.label && positiveMetricValue(g.textWidth, g.text_width));
+    return roots.length === parsed.length ? roots : null;
   } catch {
     return null;
   }
@@ -2385,13 +3476,21 @@ async function loadRootChildren() {
     return cached;
   }
 
-  const results = await mapWithConcurrency(ROOT_TITLES, ROOT_RESOLVE_CONCURRENCY, resolveTitle);
-  const roots = results
-    .filter(r => r.status === "fulfilled")
-    .map(r => r.value)
-    .sort((a, b) => a.label.localeCompare(b.label));
-  writeCachedRoots(roots);
-  return roots;
+  if (!rootChildrenPromise) {
+    rootChildrenPromise = mapWithConcurrency(ROOT_TITLES, ROOT_RESOLVE_CONCURRENCY, resolveTitle)
+      .then(results => {
+        const roots = results
+          .filter(r => r.status === "fulfilled")
+          .map(r => r.value)
+          .sort((a, b) => a.label.localeCompare(b.label));
+        writeCachedRoots(roots);
+        return roots;
+      })
+      .finally(() => {
+        rootChildrenPromise = null;
+      });
+  }
+  return rootChildrenPromise;
 }
 
 function isRegionalMusicTitle(title) {
@@ -2421,6 +3520,7 @@ async function loadGenreChildren(genreId, parentNode = null) {
       qid: null,
       color: edge.to_similarity_color,
       colorConfidence: edge.to_color_confidence,
+      ...textMetricsFromEdge(edge),
       summary: null,
       wikipedia_url: null,
       aliases: [],
@@ -2510,6 +3610,7 @@ async function getChildren(node) {
       qid: null,
       color: child.similarity_color || null,
       colorConfidence: child.color_confidence ?? null,
+      ...textMetricsFromPayload(child),
       summary: null,
       wikipedia_url: null,
       aliases: [],
@@ -2683,6 +3784,7 @@ function cloudViewportParams() {
   });
   if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) params.set("selected_genre_id", cloudSelectedGenreId);
   if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
+  if (cloudRegionId) params.set("region_id", cloudRegionId);
   return params;
 }
 
@@ -2693,6 +3795,7 @@ function cloudAtlasParams() {
   });
   if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) params.set("selected_genre_id", cloudSelectedGenreId);
   if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
+  if (cloudRegionId) params.set("region_id", cloudRegionId);
   return params;
 }
 
@@ -2703,7 +3806,7 @@ async function getCloudData(options = {}) {
 
 function cloudStreamUrl() {
   const params = cloudAtlasParams();
-  params.set("chunk_size", "220");
+  params.set("chunk_size", "500");
   return `/v1/render/cloud/stream?${params.toString()}`;
 }
 
@@ -2717,6 +3820,7 @@ function cloudViewportSignature() {
     Math.floor(xMin / tile),
     Math.floor(yMin / tile),
     cloudRootGenreId || "",
+    cloudRegionId || "",
     cloudSelectedGenreId || "",
   ].join("|");
 }
@@ -2779,11 +3883,9 @@ function geoTextForNode(node) {
   ].filter(Boolean).join(" "));
 }
 
-function inferCountriesForNode(node) {
-  const text = geoTextForNode(node);
-  if (!text) return new Set();
-
-  const countries = new Set();
+function addCountriesFromGeoText(countries, text) {
+  if (!text) return;
+  const initialSize = countries.size;
   const addCountry = countryName => {
     const resolved = resolveMapCountry(countryName);
     if (resolved) countries.add(resolved);
@@ -2792,11 +3894,50 @@ function inferCountriesForNode(node) {
   for (const countryName of countryElsByName.keys()) {
     if (geoTermMatches(text, countryName)) addCountry(countryName);
   }
+  if (countries.size > initialSize) return;
 
   const rules = [...GEO_TERM_RULES, ...GEO_CITY_RULES];
   for (const rule of rules) {
     if (!rule.terms.some(term => geoTermMatches(text, term))) continue;
     for (const countryName of rule.countries) addCountry(countryName);
+  }
+}
+
+function inferCountriesFromGeoValues(values) {
+  const countries = new Set();
+  addCountriesFromGeoText(countries, normalizeGeoText(values.filter(Boolean).join(" ")));
+  return countries;
+}
+
+function directDisplayableParentTitlesForNode(node) {
+  if (!node?.genreId) return [];
+  const rows = reachableParentsCache.get(node.genreId) || node.parentRelationshipRows || [];
+  const titles = [];
+  const seen = new Set();
+  for (const row of rows) {
+    if (!row?.parent_title || row.parent_genre_id === ROOT_KEY) continue;
+    if (seen.has(row.parent_title)) continue;
+    seen.add(row.parent_title);
+    titles.push(row.parent_title);
+  }
+  return titles;
+}
+
+function inferRegionCountriesForNode(node) {
+  const regionName = node?.regionName || node?.region_name || node?.label || node?.title;
+  const exactRegion = resolveMapCountry(regionName);
+  if (exactRegion) return new Set([exactRegion]);
+  return inferCountriesFromGeoValues([regionName]);
+}
+
+function inferCountriesForNode(node) {
+  if (!node) return new Set();
+  if (node.regionName || node.regionKind || node.regionId) return inferRegionCountriesForNode(node);
+
+  const countries = new Set();
+  addCountriesFromGeoText(countries, geoTextForNode(node));
+  for (const parentTitle of directDisplayableParentTitlesForNode(node)) {
+    addCountriesFromGeoText(countries, normalizeGeoText(parentTitle));
   }
 
   return countries;
@@ -2805,14 +3946,30 @@ function inferCountriesForNode(node) {
 async function loadMapFeatures(mapKey = "world") {
   const definition = MAP_DEFINITIONS[mapKey] || MAP_DEFINITIONS.world;
   if (!mapFeaturePromises.has(mapKey)) {
-    mapFeaturePromises.set(mapKey, fetch(definition.url)
+    const promise = loadMapTopology(mapKey)
+      .then(topology => feature(topology, topology.objects[definition.objectName]).features)
+      .catch(err => {
+        mapFeaturePromises.delete(mapKey);
+        throw err;
+      });
+    mapFeaturePromises.set(mapKey, promise);
+  }
+  return mapFeaturePromises.get(mapKey);
+}
+
+void loadRootChildren().catch(() => {});
+void loadMapFeatures("world").catch(() => {});
+
+async function loadMapTopology(mapKey = "world") {
+  const definition = MAP_DEFINITIONS[mapKey] || MAP_DEFINITIONS.world;
+  if (!mapTopologyPromises.has(mapKey)) {
+    mapTopologyPromises.set(mapKey, fetch(definition.url)
       .then(res => {
         if (!res.ok) throw new Error(`${mapKey} map request failed: ${res.status}`);
         return res.json();
-      })
-      .then(topology => feature(topology, topology.objects[definition.objectName]).features));
+      }));
   }
-  return mapFeaturePromises.get(mapKey);
+  return mapTopologyPromises.get(mapKey);
 }
 
 async function ensureCountryMap(mapKey = "world") {
@@ -2826,12 +3983,17 @@ async function ensureCountryMap(mapKey = "world") {
   }
   activeMapKey = mapKey;
   mapViewBox = { ...definition.viewBox };
-  const features = await loadMapFeatures(mapKey);
+  const topology = await loadMapTopology(mapKey);
+  const topologyObject = topology.objects[definition.objectName];
+  const features = feature(topology, topologyObject).features;
   const collection = { type: "FeatureCollection", features };
   const projection = definition.projection === "albersUsa"
     ? geoAlbersUsa().fitExtent([[6, 6], [314, 168]], collection)
     : geoNaturalEarth1().fitExtent([[4, 4], [316, 170]], collection);
   const path = geoPath(projection);
+  activeMapTopology = topology;
+  activeMapTopologyObject = topologyObject;
+  activeMapPath = path;
 
   mapCountryLayer.innerHTML = "";
   if (mapClipDefs) mapClipDefs.innerHTML = "";
@@ -2840,11 +4002,20 @@ async function ensureCountryMap(mapKey = "world") {
   countryElsByName.clear();
   countryHighlightElsByName.clear();
   countryHitElsByName.clear();
+  countryAreaByName.clear();
+  countryBoundsByName.clear();
+  countryBoundarySamplesByName.clear();
+  mapCountryRenderStateByName.clear();
+  mapSuperregionRenderStateByKey.clear();
 
   for (const [index, country] of features.entries()) {
     const name = country.properties?.name;
     const d = path(country);
     if (!name || !d) continue;
+    const [[x1, y1], [x2, y2]] = path.bounds(country);
+    const area = Math.max(1, (x2 - x1) * (y2 - y1));
+    countryAreaByName.set(name, Math.min(countryAreaByName.get(name) || Infinity, area));
+    countryBoundsByName.set(name, { minX: x1, minY: y1, maxX: x2, maxY: y2 });
 
     const countryPath = svgEl("path", {
       class: "map-country",
@@ -2873,16 +4044,10 @@ async function ensureCountryMap(mapKey = "world") {
       "aria-hidden": "true",
     });
     hitPath.__countryName = name;
-    hitPath.addEventListener("pointerenter", () => setMapHoveredCountry(name));
-    hitPath.addEventListener("pointerleave", () => clearMapHoveredCountry(name));
     hitPath.addEventListener("focus", () => setMapHoveredCountry(name));
     hitPath.addEventListener("blur", () => clearMapHoveredCountry(name));
-    hitPath.addEventListener("click", () => {
-      const item = mapItemsByCountryName.get(name);
-      hitPath.blur();
-      if (item) selectMapVariant(item);
-    });
     hitPath.addEventListener("keydown", event => {
+      if (!isMapExpanded()) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       const item = mapItemsByCountryName.get(name);
       if (!item) return;
@@ -2899,6 +4064,7 @@ async function ensureCountryMap(mapKey = "world") {
     countryElsByName.get(name).push(countryPath);
     countryHighlightElsByName.get(name).push(highlightPath);
     countryHitElsByName.get(name).push(hitPath);
+    updateCountryBoundarySamples(name, countryPath);
   }
   applyMapViewBox();
   if (switching) {
@@ -2906,21 +4072,117 @@ async function ensureCountryMap(mapKey = "world") {
   }
 }
 
-function setMapLabel(text = "") {
-  mapTitle.textContent = text;
-  mapTitle.classList.toggle("has-map-label", Boolean(text));
+function mapVariationCountLabel(count = 0) {
+  const value = Number(count) || 0;
+  if (value <= 0) return "";
+  return `${value} ${value === 1 ? "Variation" : "Variations"}`;
 }
 
-function setMapDefaultLabel(text = "") {
+function setMapParentLabel(text = "", targetKey = null, options = {}) {
+  const label = String(text || "").trim();
+  mapParentTargetKey = label && targetKey ? targetKey : null;
+  mapParentTargetCloud = label && options.cloud ? { ...options.cloud } : null;
+  if (mapParentLabelText) mapParentLabelText.textContent = label;
+  if (mapParentLabel) {
+    mapParentLabel.hidden = !label;
+    mapParentLabel.disabled = !(mapParentTargetKey || mapParentTargetCloud);
+    mapParentLabel.setAttribute(
+      "aria-label",
+      label ? `Return to ${label}` : "Return to parent genre"
+    );
+  }
+  mapCard?.classList.toggle("map-has-parent-label", Boolean(label));
+}
+
+function setMapLabel(text = "", variationCount = 0, metaText = "") {
+  const label = String(text || "").trim();
+  const metaLabel = String(metaText || "").trim() || mapVariationCountLabel(variationCount);
+  mapTitle.replaceChildren();
+  if (label) {
+    const title = document.createElement("span");
+    title.className = "map-title-main";
+    title.textContent = label;
+    mapTitle.append(title);
+  }
+  if (label && metaLabel) {
+    const meta = document.createElement("span");
+    meta.className = "map-title-meta";
+    meta.textContent = metaLabel;
+    mapTitle.append(meta);
+  }
+  mapTitle.classList.toggle("has-map-label", Boolean(label));
+  fitMapLabelMeta();
+}
+
+function fitMapLabelMeta() {
+  if (!mapTitle || mapTitle.hidden) return;
+  const meta = mapTitle.querySelector(".map-title-meta");
+  if (!meta) return;
+  meta.hidden = false;
+  requestAnimationFrame(() => {
+    if (!meta.isConnected || !mapTitle || mapTitle.hidden) return;
+    const overflows = mapTitle.scrollWidth > mapTitle.clientWidth + 1;
+    meta.hidden = overflows;
+  });
+}
+
+function setMapDefaultLabel(text = "", variationCount = 0) {
   mapDefaultLabel = text;
-  if (!hoveredMapCountry) setMapLabel(mapDefaultLabel);
+  mapDefaultVariationCount = Number(variationCount) || 0;
+  if (!hoveredMapCountry) setMapLabel(mapDefaultLabel, mapDefaultVariationCount);
+}
+
+function mapListTopInset() {
+  return mapCard?.classList.contains("map-has-parent-label") && !mapListSearchOpen
+    ? MAP_LIST_PARENT_TOP_INSET
+    : MAP_LIST_TOP_INSET;
+}
+
+function updateMapListBodyClasses() {
+  document.body.classList.toggle("map-list-mode-active", mapListMode);
+  document.body.classList.toggle("map-list-detail-hidden", mapListMode && mapListDetailHidden);
+}
+
+function mapListMaxCardHeight() {
+  if (!mapCard) return MAP_LIST_MIN_CARD_HEIGHT;
+  const cardRect = mapCard.getBoundingClientRect();
+  if (window.matchMedia("(max-width: 899px)").matches) {
+    const topInset = Math.max(12, cardRect.top || 12);
+    return Math.max(MAP_LIST_MIN_CARD_HEIGHT, window.innerHeight - topInset - 12);
+  }
+  const bottomInset = Math.max(12, window.innerHeight - (cardRect.bottom || window.innerHeight - 20));
+  let topLimit = 20;
+  if (mapListMode && mapListDetailHidden && detailRestoreButton) {
+    const restoreRect = detailRestoreButton.getBoundingClientRect();
+    if (restoreRect.height > 0) {
+      topLimit = Math.max(topLimit, restoreRect.bottom + MAP_LIST_DETAIL_GAP_PX);
+    }
+  }
+  return Math.max(MAP_LIST_MIN_CARD_HEIGHT, window.innerHeight - bottomInset - topLimit);
+}
+
+function updateMapListCardHeight(contentHeight = 0) {
+  if (!mapCard || !mapListMode) return;
+  const needed = mapListTopInset() + Math.max(0, contentHeight) + MAP_LIST_BOTTOM_INSET;
+  const height = Math.max(MAP_LIST_MIN_CARD_HEIGHT, Math.min(needed, mapListMaxCardHeight()));
+  mapCard.style.setProperty("--map-list-card-height", `${Math.round(height)}px`);
 }
 
 function setMapListMode(enabled) {
-  mapListMode = Boolean(enabled);
+  const nextMode = Boolean(enabled);
+  if (nextMode && !mapListMode) {
+    mapListDetailHidden = document.body.classList.contains("detail-card-visible");
+  } else if (!nextMode) {
+    mapListDetailHidden = false;
+    mapListSearchQuery = "";
+    mapListSearchOpen = false;
+    if (mapListSearchInput) mapListSearchInput.value = "";
+  }
+  mapListMode = nextMode;
   mapCard?.classList.toggle("map-list-mode", mapListMode);
   mapListButton?.setAttribute("aria-pressed", String(mapListMode));
   mapListButton?.setAttribute("aria-label", mapListMode ? "Show map" : "Show variations list");
+  if (mapListButton) mapListButton.dataset.tooltip = mapListMode ? "Show map" : "Show variations list";
   if (!mapListMode) {
     mapListViewState = null;
     if (mapListScrollFrame) {
@@ -2932,8 +4194,28 @@ function setMapListMode(enabled) {
     mapList.hidden = !mapListMode;
     if (!mapListMode) mapList.innerHTML = "";
   }
+  updateMapListSearchVisibility(false);
   if (regionMap) regionMap.hidden = mapListMode;
+  if (!mapListMode) mapCard?.style.removeProperty("--map-list-card-height");
+  updateMapListBodyClasses();
   updateMapResetButton();
+  syncMapCountryInteractivity();
+  updateDetailCardVisibility();
+  if (mapListMode) updateMapListCardHeight(mapListViewState?.totalHeight || 0);
+}
+
+function selectableMapItems(items) {
+  return (items || []).filter(item => item?.selectable !== false);
+}
+
+function mapContextHasSelectableVariants(items) {
+  return selectableMapItems(items).length > 0;
+}
+
+function setMapListButtonVisible(visible) {
+  if (!mapListButton) return;
+  mapListButton.hidden = !visible;
+  if (!visible && mapListMode) setMapListMode(false);
 }
 
 function setMapWorldButtonVisible(visible) {
@@ -2941,16 +4223,256 @@ function setMapWorldButtonVisible(visible) {
   mapWorldButton.hidden = !visible;
 }
 
-function mapHoverLabel(name) {
+function normalizedRegionTitleText(value) {
+  return normalizedCountryLookup(value)
+    .replace(/\b(music|region|regions|state|states|province|provinces|city|cities|the)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const regionTitleAdjectiveAliases = new Map(Object.entries({
+  "africa": ["african"],
+  "argentina": ["argentine", "argentinian"],
+  "armenia": ["armenian"],
+  "australia": ["australian"],
+  "azerbaijan": ["azerbaijani"],
+  "belgium": ["belgian"],
+  "brazil": ["brazilian"],
+  "bulgaria": ["bulgarian"],
+  "canada": ["canadian"],
+  "denmark": ["danish"],
+  "ethiopia": ["ethiopian", "ethio"],
+  "finland": ["finnish"],
+  "france": ["french"],
+  "germany": ["german"],
+  "india": ["indian"],
+  "iran": ["iranian"],
+  "italy": ["italian"],
+  "japan": ["japanese"],
+  "mexico": ["mexican"],
+  "netherlands": ["dutch"],
+  "poland": ["polish"],
+  "russia": ["russian"],
+  "south africa": ["south african"],
+  "spain": ["spanish"],
+  "sweden": ["swedish"],
+  "united kingdom": ["british", "uk"],
+  "united states": ["american", "us", "u s"],
+  "united states of america": ["american", "us", "u s"],
+  "zimbabwe": ["zimbabwean"],
+}));
+
+function titleMostlyIncludesRegion(title, regionName) {
+  const titleText = normalizedRegionTitleText(title);
+  const regionText = normalizedRegionTitleText(regionName);
+  if (!titleText || !regionText) return false;
+  if (titleText.includes(regionText)) return true;
+  for (const alias of regionTitleAdjectiveAliases.get(regionText) || []) {
+    if (titleText.includes(normalizedRegionTitleText(alias))) return true;
+  }
+  const regionTokens = regionText.split(" ").filter(token => token.length > 2);
+  if (!regionTokens.length) return false;
+  const titleTokens = new Set(titleText.split(" ").filter(Boolean));
+  const matched = regionTokens.filter(token => titleTokens.has(token)).length;
+  return matched / regionTokens.length >= 0.5;
+}
+
+function mapHoverVariantTitle(item, fallbackName) {
+  return item?.selectable_for || item?.display_title || item?.wikipedia_title || item?.region_name || fallbackName;
+}
+
+function mapHoverRegionSuffix(item, fallbackName) {
+  if (!item) return "";
+  const grouped = mapHoverCountryGroup(fallbackName).size > 1;
+  return (
+    grouped
+      ? item.matched_region_name || item.mount_parent_region_name || item.region_name
+      : item.region_name || item.matched_region_name || item.mount_parent_region_name
+  ) || "";
+}
+
+function mapHoverLabelParts(name) {
   const item = mapItemsByCountryName.get(name);
-  return item?.selectable_for || item?.display_title || item?.region_name || name;
+  if (!item) return { label: name, meta: "" };
+  const label = mapHoverVariantTitle(item, name);
+  const region = mapHoverRegionSuffix(item, name);
+  return {
+    label,
+    meta: region && !titleMostlyIncludesRegion(label, region) ? region : "",
+  };
+}
+
+function mapHoverLabel(name) {
+  const { label, meta } = mapHoverLabelParts(name);
+  return [label, meta].filter(Boolean).join(" ");
+}
+
+function setMapHoverLabel(name) {
+  const { label, meta } = mapHoverLabelParts(name);
+  if (label) {
+    setMapLabel(label, 0, meta);
+    return;
+  }
+  setMapLabel(name);
+}
+
+function updateMapListSearchVisibility(rootMode = false, searchable = false) {
+  if (!mapListSearchInput) return;
+  const available = Boolean(mapListMode && searchable);
+  const visible = Boolean(available && mapListSearchOpen);
+  mapListSearchInput.hidden = !visible;
+  if (mapListSearchButton) {
+    mapListSearchButton.hidden = !available;
+    mapListSearchButton.setAttribute("aria-pressed", String(visible));
+  }
+  mapCard?.classList.toggle("map-list-search-mode", visible);
+  mapCard?.classList.toggle("map-list-search-available", available);
+  mapTitle?.toggleAttribute("hidden", visible);
+  mapParentLabel?.toggleAttribute("hidden", visible || !mapParentLabelText?.textContent?.trim());
+  if (mapListMode) updateMapListCardHeight(mapListViewState?.totalHeight || 0);
 }
 
 function mapVariationLabel(node, items, context = null) {
+  if (!node || node.key === ROOT_KEY || node.label === "Music") return context?.map_label || "";
+  if (node.label) return node.label;
+  if (context?.wikipedia_title) return labelFromTitle(context.wikipedia_title);
   if (context?.map_label) return context.map_label;
-  if (!items.length || !node || node.key === ROOT_KEY || node.label === "Music") return "";
+  if (!items.length) return "";
   if (node.genreId && items.some(item => item.genre_id === node.genreId)) return "";
-  return `${node.label} variations`;
+  return node.label || "";
+}
+
+function mapVariationSelectionKey(item) {
+  if (!item) return "";
+  if (item.genre_id) return `genre:${item.genre_id}`;
+  if (item.candidate_id) return `candidate:${item.candidate_id}`;
+  if (item.base_genre_id && item.display_title) return `base:${item.base_genre_id}:${item.display_title}`;
+  return `feature:${item.map_key || ""}:${item.feature_key || item.region_key || item.region_id || mapListTitle(item)}`;
+}
+
+function mapVariationCount(items) {
+  const keys = new Set();
+  for (const item of selectableMapItems(items)) {
+    const key = mapVariationSelectionKey(item);
+    if (key) keys.add(key);
+  }
+  return keys.size;
+}
+
+function mapParentInfoForNode(node) {
+  if (!node?.isMapChild || !node.parentKey) return { label: "", targetKey: null };
+  const parent = nodes.get(node.parentKey);
+  if (!parent) return { label: "", targetKey: null };
+  if (parent.key === ROOT_KEY) return { label: "Global", targetKey: parent.key };
+  return {
+    label: parent.label || labelFromTitle(parent.title) || "",
+    targetKey: parent.key,
+  };
+}
+
+function mapParentLabelForNode(node) {
+  return mapParentInfoForNode(node).label;
+}
+
+function cloudMapParentInfoForContext(context, selectedNode) {
+  if (!cloudMode || !cloudRegionId) return null;
+  return {
+    label: "Global",
+    cloud: { root: true },
+  };
+}
+
+function clearScheduledCloudHoverCard(nodeKey = null) {
+  if (nodeKey && pendingCloudHoverCardKey && pendingCloudHoverCardKey !== nodeKey) return;
+  const canceledKey = pendingCloudHoverCardKey || nodeKey;
+  window.clearTimeout(cloudHoverCardDelayTimer);
+  cloudHoverCardDelayTimer = 0;
+  pendingCloudHoverCardKey = null;
+  if (
+    detailIndicatorPreviewKey &&
+    (!nodeKey || detailIndicatorPreviewKey === nodeKey || detailIndicatorPreviewKey === canceledKey)
+  ) {
+    setDetailIndicatorPreviewKey(null);
+  }
+}
+
+function scheduleCloudHoverCard(nodeId) {
+  const key = detailKeyForCloudNodeId(nodeId);
+  clearScheduledCloudHoverCard();
+  if (!key || detailCardSuppressed) return;
+  setDetailIndicatorPreviewKey(key);
+  pendingCloudHoverCardKey = key;
+  cloudHoverCardDelayTimer = window.setTimeout(() => {
+    cloudHoverCardDelayTimer = 0;
+    const wantedKey = pendingCloudHoverCardKey;
+    pendingCloudHoverCardKey = null;
+    if (wantedKey !== key) return;
+    if (detailCardSuppressed || !cloudMode) return;
+    void showCloudHoverCard(nodeId);
+  }, prefersReducedMotion() ? 0 : CLOUD_HOVER_DETAIL_SWAP_DELAY_MS);
+}
+
+async function showCloudHoverCard(nodeId) {
+  if (detailCardSuppressed || !cloudMode || !nodeId) return;
+  const token = ++hoverCardToken;
+  const node = cloudNodeById.get(nodeId) || cloudScene?.nodesById?.get(nodeId);
+  if (!node) return;
+  const key = detailKeyForCloudNodeId(nodeId);
+  setDetailCardNodeKey(key);
+  setDetailIndicatorPreviewKey(key);
+  try {
+    const detail = await getGenreDetail(nodeId);
+    if (token !== hoverCardToken || detailCardNodeKey !== key || !cloudMode) return;
+    setDetailCardNodeKey(key);
+    setDetailIndicatorPreviewKey(key);
+    updateCard(detail, { hoverSwap: true });
+  } catch (err) {
+    console.error("[wiki-genres] cloud hover detail failed", err);
+    if (token === hoverCardToken && detailCardNodeKey === key && cloudMode) {
+      updateCard(cloudNodeFromPayload(node), { hoverSwap: true });
+    }
+  }
+}
+
+async function returnToMapParent() {
+  if (mapParentTargetCloud) {
+    const target = mapParentTargetCloud;
+    allowDetailCardForManualSelection();
+    if (target.root) {
+      cloudRootGenreId = null;
+      cloudRegionId = null;
+      cloudSelectedGenreId = null;
+      setDetailCardNodeKey(null);
+      updateDetailCardVisibility();
+      updateUrlState({ push: true });
+      void loadCloudMode({ initial: true }).then(() => {
+        if (cloudMode) void updateMapCard(nodes.get(ROOT_KEY));
+      }).catch(err => {
+        console.error("[wiki-genres] cloud map parent failed", err);
+        setStatus("Cloud unavailable.");
+      });
+    }
+    return;
+  }
+  const targetKey = mapParentTargetKey;
+  const target = targetKey ? nodes.get(targetKey) : null;
+  if (!target) return;
+  allowDetailCardForManualSelection();
+  if (target.key === ROOT_KEY) {
+    activeLeafKey = null;
+    for (const item of nodes.values()) item.isActiveLeaf = false;
+    void renderRootState();
+    updateUrlState({ push: true });
+    return;
+  }
+  await focusOn(target.key);
+}
+
+function isRootMusicMapContext(context, selectedNode) {
+  return Boolean(
+    selectedNode?.key === ROOT_KEY
+    || context?.wikipedia_title === "Music" && context?.genre_id == null
+  );
 }
 
 function worldContextFromSubmap(context, selectedNode) {
@@ -2990,93 +4512,761 @@ function worldContextFromSubmap(context, selectedNode) {
   };
 }
 
+function mapCountryArea(name) {
+  return countryAreaByName.get(name) || Number.POSITIVE_INFINITY;
+}
+
+function compareMapCountryPriority(a, b) {
+  return mapCountryArea(a) - mapCountryArea(b) || a.localeCompare(b);
+}
+
+function updateCountryBoundarySamples(countryName, pathEl) {
+  if (!countryName || !pathEl || typeof pathEl.getTotalLength !== "function") return;
+  let length = 0;
+  try {
+    length = pathEl.getTotalLength();
+  } catch {
+    return;
+  }
+  if (!Number.isFinite(length) || length <= 0) return;
+  const sampleCount = clamp(Math.ceil(length / 2.5), 18, 140);
+  const samples = countryBoundarySamplesByName.get(countryName) || [];
+  for (let index = 0; index < sampleCount; index += 1) {
+    try {
+      const point = pathEl.getPointAtLength((length * index) / sampleCount);
+      samples.push({ x: point.x, y: point.y });
+    } catch {}
+  }
+  if (samples.length) countryBoundarySamplesByName.set(countryName, samples);
+}
+
+function mapPixelMetrics() {
+  const rect = regionMap?.getBoundingClientRect?.();
+  if (!rect) return { sx: 1, sy: 1 };
+  return {
+    sx: Math.max(0.001, rect.width / Math.max(1, mapViewBox.w)),
+    sy: Math.max(0.001, rect.height / Math.max(1, mapViewBox.h)),
+  };
+}
+
+function countryBufferRadiusPx(countryName, metrics = mapPixelMetrics()) {
+  const area = Math.max(1, mapCountryArea(countryName) * metrics.sx * metrics.sy);
+  const effectiveRadius = Math.sqrt(area / Math.PI);
+  return clamp(
+    MAP_BUFFER_BASE_PX +
+      Math.max(0, MAP_BUFFER_SMALL_RADIUS_PX - effectiveRadius) *
+        MAP_BUFFER_SMALL_RADIUS_GAIN,
+    MAP_BUFFER_BASE_PX,
+    MAP_BUFFER_MAX_PX
+  );
+}
+
+function countryBoundsDistancePx(countryName, point, metrics) {
+  const bounds = countryBoundsByName.get(countryName);
+  if (!bounds) return Number.POSITIVE_INFINITY;
+  const dx = point.x < bounds.minX
+    ? bounds.minX - point.x
+    : point.x > bounds.maxX
+    ? point.x - bounds.maxX
+    : 0;
+  const dy = point.y < bounds.minY
+    ? bounds.minY - point.y
+    : point.y > bounds.maxY
+    ? point.y - bounds.maxY
+    : 0;
+  return Math.hypot(dx * metrics.sx, dy * metrics.sy);
+}
+
+function countryBoundaryDistancePx(countryName, point, metrics) {
+  const samples = countryBoundarySamplesByName.get(countryName) || [];
+  if (!samples.length) return Number.POSITIVE_INFINITY;
+  let best = Number.POSITIVE_INFINITY;
+  for (const sample of samples) {
+    const distance = Math.hypot(
+      (sample.x - point.x) * metrics.sx,
+      (sample.y - point.y) * metrics.sy
+    );
+    if (distance < best) best = distance;
+  }
+  return best;
+}
+
+function mapOceanBufferCandidate(countryName, point, metrics) {
+  const radius = countryBufferRadiusPx(countryName, metrics);
+  if (countryBoundsDistancePx(countryName, point, metrics) > radius) return null;
+  const distance = countryBoundaryDistancePx(countryName, point, metrics);
+  if (!Number.isFinite(distance) || distance > radius) return null;
+  const area = Math.max(1, mapCountryArea(countryName) * metrics.sx * metrics.sy);
+  const largeAreaPenalty = Math.log10(area + 10) * MAP_BUFFER_LARGE_AREA_PENALTY;
+  const selectableBonus = mapItemsByCountryName.has(countryName) ? MAP_BUFFER_SELECTABLE_BONUS : 0;
+  return {
+    countryName,
+    distance,
+    radius,
+    score: distance / radius + largeAreaPenalty - selectableBonus,
+  };
+}
+
+function mapHoverSelectionKey(countryName) {
+  const item = mapItemsByCountryName.get(countryName);
+  if (!item) return "";
+  return mapSelectableHoverGroupKey(item) || `country:${countryName}`;
+}
+
+function betterMapBufferCandidate(candidate, best) {
+  if (!candidate) return best;
+  if (!best) return candidate;
+  if (candidate.score < best.score) return candidate;
+  if (
+    candidate.score === best.score &&
+    compareMapCountryPriority(candidate.countryName, best.countryName) < 0
+  ) {
+    return candidate;
+  }
+  return best;
+}
+
+function bestMapBufferCandidate(point, metrics, countryNames) {
+  let best = null;
+  for (const name of countryNames) {
+    if (!mapItemsByCountryName.has(name)) continue;
+    best = betterMapBufferCandidate(
+      mapOceanBufferCandidate(name, point, metrics),
+      best
+    );
+  }
+  return best;
+}
+
+function featureKeyForMapItem(item) {
+  const feature = mapFeatureForItem(item);
+  return feature ? resolveMapCountry(feature) || feature : null;
+}
+
+function mapSelectableHoverGroupKey(item) {
+  if (!item) return "";
+  const selectsMatchedSuperregion = Boolean(
+    item.match_type === "pure_region_descendant_country" &&
+    item.genre_id &&
+    item.matched_genre_id &&
+    item.genre_id === item.matched_genre_id &&
+    item.matched_region_id &&
+    item.matched_region_kind &&
+    item.matched_region_kind !== "country" &&
+    item.matched_region_kind !== "territory"
+  );
+  if (selectsMatchedSuperregion) {
+    return [
+      "superregion",
+      item.matched_region_id,
+      item.matched_genre_id,
+    ].filter(Boolean).join(":");
+  }
+  return [
+    "feature",
+    item.map_key,
+    item.feature_key || item.region_key || item.region_id || mapListTitle(item),
+  ].filter(Boolean).join(":");
+}
+
+function rebuildMapHoverGroups(items) {
+  mapHoverCountriesByCountryName.clear();
+  mapSuperregionCountriesByGroupKey.clear();
+  mapSuperregionGroupKeyByCountryName.clear();
+  const groupedFeatures = new Map();
+  for (const item of selectableMapItems(items)) {
+    const feature = featureKeyForMapItem(item);
+    if (!feature || !countryElsByName.has(feature)) continue;
+    const groupKey = mapSelectableHoverGroupKey(item) || feature;
+    if (!groupedFeatures.has(groupKey)) groupedFeatures.set(groupKey, new Set());
+    groupedFeatures.get(groupKey).add(feature);
+  }
+  for (const features of groupedFeatures.values()) {
+    const group = new Set(features);
+    for (const feature of features) mapHoverCountriesByCountryName.set(feature, group);
+  }
+  for (const [groupKey, features] of groupedFeatures.entries()) {
+    if (!groupKey.startsWith("superregion:") || features.size <= 1) continue;
+    const group = new Set(features);
+    mapSuperregionCountriesByGroupKey.set(groupKey, group);
+    for (const feature of group) mapSuperregionGroupKeyByCountryName.set(feature, groupKey);
+  }
+}
+
+function mapHoverCountryGroup(name) {
+  return mapHoverCountriesByCountryName.get(name) || new Set([name]);
+}
+
+function topoFeatureName(featureItem) {
+  return featureItem?.properties?.name || "";
+}
+
+function superregionGroupKeyForItem(item) {
+  const featureName = featureKeyForMapItem(item);
+  if (!featureName) return "";
+  const groupKey = mapSelectableHoverGroupKey(item);
+  const countries = groupKey ? mapSuperregionCountriesByGroupKey.get(groupKey) : null;
+  return countries?.has(featureName) && countries.size > 1 ? groupKey : "";
+}
+
+function superregionBoundaryPath(countries) {
+  if (!activeMapTopology || !activeMapTopologyObject || !activeMapPath || !countries?.size) {
+    return "";
+  }
+  const boundary = topoMesh(activeMapTopology, activeMapTopologyObject, (a, b) => {
+    const aIn = countries.has(topoFeatureName(a));
+    const bIn = countries.has(topoFeatureName(b));
+    return (aIn && a === b) || aIn !== bIn;
+  });
+  return activeMapPath(boundary) || "";
+}
+
+function updateSuperregionBorder(groupKey, color, { dim = true, hover = false, selected = true } = {}) {
+  const countries = mapSuperregionCountriesByGroupKey.get(groupKey);
+  if (!groupKey || !countries || countries.size <= 1 || !mapHighlightLayer) return;
+  let borderPath = mapSuperregionBorderElsByGroupKey.get(groupKey);
+  if (!borderPath) {
+    borderPath = svgEl("path", {
+      class: "map-superregion-border",
+      "aria-hidden": "true",
+    });
+    mapSuperregionBorderElsByGroupKey.set(groupKey, borderPath);
+    mapHighlightLayer.appendChild(borderPath);
+  }
+  const d = superregionBoundaryPath(countries);
+  if (!d) {
+    borderPath.remove();
+    mapSuperregionBorderElsByGroupKey.delete(groupKey);
+    return;
+  }
+  const pair = mapColorPair(color, { dim, hover });
+  borderPath.setAttribute("d", d);
+  borderPath.style.stroke = pair.stroke;
+  borderPath.style.strokeWidth = hover ? "1.35" : (selected ? "1.2" : "1");
+}
+
+function mapItemFeatureKeys(items) {
+  const keys = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const feature = featureKeyForMapItem(item);
+    if (!feature || !countryElsByName.has(feature) || seen.has(feature)) continue;
+    seen.add(feature);
+    keys.push(feature);
+  }
+  return keys;
+}
+
+function mapPointerSvgPoint(event) {
+  if (!regionMap || typeof regionMap.createSVGPoint !== "function") return null;
+  const matrix = regionMap.getScreenCTM?.();
+  if (!matrix) return null;
+  const point = regionMap.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  return point.matrixTransform(matrix.inverse());
+}
+
+function mapPathContainsPoint(path, point, method) {
+  if (!path || !point || typeof path[method] !== "function") return false;
+  try {
+    return path[method](point);
+  } catch {
+    return false;
+  }
+}
+
+function mapCountryContainsPoint(name, point) {
+  return (countryElsByName.get(name) || []).some(path =>
+    mapPathContainsPoint(path, point, "isPointInFill")
+  );
+}
+
+function mapCountryBufferContainsPoint(name, point) {
+  return Boolean(mapOceanBufferCandidate(name, point, mapPixelMetrics()));
+}
+
+function resolvedMapCountryAtPointer(event) {
+  const point = mapPointerSvgPoint(event);
+  if (!point) return null;
+
+  const landMatches = [];
+  for (const name of countryElsByName.keys()) {
+    if (mapCountryContainsPoint(name, point)) landMatches.push(name);
+  }
+  if (landMatches.length) {
+    const landTarget = landMatches
+      .filter(name => mapItemsByCountryName.has(name))
+      .sort(compareMapCountryPriority)[0] || null;
+    if (landTarget) {
+      if (
+        hoveredMapCountry &&
+        mapHoverSelectionKey(landTarget) === mapHoverSelectionKey(hoveredMapCountry)
+      ) {
+        return hoveredMapCountry;
+      }
+      return landTarget;
+    }
+  }
+
+  const metrics = mapPixelMetrics();
+  const best = bestMapBufferCandidate(point, metrics, mapItemsByCountryName.keys());
+  if (!best) return null;
+
+  if (hoveredMapCountry && mapItemsByCountryName.has(hoveredMapCountry)) {
+    const hoveredKey = mapHoverSelectionKey(hoveredMapCountry);
+    const bestKey = mapHoverSelectionKey(best.countryName);
+    if (hoveredKey && hoveredKey === bestKey) return hoveredMapCountry;
+
+    const hoveredGroup = mapHoverCountryGroup(hoveredMapCountry);
+    const current = bestMapBufferCandidate(point, metrics, hoveredGroup);
+    if (
+      current &&
+      best.score > current.score - MAP_HOVER_SWITCH_SCORE_MARGIN
+    ) {
+      return hoveredMapCountry;
+    }
+  }
+
+  return best.countryName;
+}
+
+function updateResolvedMapHover(event) {
+  if (mapListMode || !isMapExpanded()) {
+    clearMapHoveredCountry();
+    return;
+  }
+  const countryName = resolvedMapCountryAtPointer(event);
+  if (countryName) {
+    setMapHoveredCountry(countryName);
+  } else {
+    clearMapHoveredCountry();
+  }
+}
+
+function selectResolvedMapCountry(event) {
+  if (!isMapExpanded()) return;
+  const countryName = resolvedMapCountryAtPointer(event);
+  const item = countryName ? mapItemsByCountryName.get(countryName) : null;
+  if (!item) return;
+  event.preventDefault();
+  event.stopPropagation();
+  void selectMapVariant(item);
+}
+
 function setMapHoveredCountry(name) {
   if (hoveredMapCountry && hoveredMapCountry !== name) clearMapHoveredCountry(hoveredMapCountry);
   hoveredMapCountry = name;
-  for (const countryPath of countryElsByName.get(name) || []) {
-    countryPath.classList.add("map-country-hovered");
+  mapCard?.classList.add("map-hover-active");
+  hoveredMapCountries = new Set(mapHoverCountryGroup(name));
+  for (const countryName of hoveredMapCountries) {
+    for (const countryPath of countryElsByName.get(countryName) || []) {
+      countryPath.classList.add("map-country-hovered");
+    }
+    applyHoveredSelectableCountryStyle(countryName);
   }
-  setMapLabel(mapHoverLabel(name));
+  setMapHoverLabel(name);
 }
 
 function clearMapHoveredCountry(name = hoveredMapCountry) {
   if (!name || hoveredMapCountry !== name) return;
-  for (const countryPath of countryElsByName.get(name) || []) {
-    countryPath.classList.remove("map-country-hovered");
+  for (const countryName of hoveredMapCountries) {
+    for (const countryPath of countryElsByName.get(countryName) || []) {
+      countryPath.classList.remove("map-country-hovered");
+    }
+    restoreSelectableCountryStyle(countryName);
   }
+  hoveredMapCountries = new Set();
   hoveredMapCountry = null;
-  setMapLabel(mapDefaultLabel);
+  mapCard?.classList.remove("map-hover-active");
+  setMapLabel(mapDefaultLabel, mapDefaultVariationCount);
+}
+
+function setSvgClass(el, className, active) {
+  if (!el) return;
+  const hasClass = el.classList.contains(className);
+  if (active && !hasClass) el.classList.add(className);
+  if (!active && hasClass) el.classList.remove(className);
+}
+
+function setSvgStyle(el, prop, value) {
+  if (!el) return;
+  const cssName = prop.replace(/[A-Z]/g, match => `-${match.toLowerCase()}`);
+  if (value == null || value === "") {
+    if (el.style[prop]) el.style.removeProperty(cssName);
+    return;
+  }
+  if (el.style[prop] !== String(value)) el.style[prop] = String(value);
+}
+
+function setSvgAttr(el, name, value) {
+  if (!el) return;
+  if (value == null || value === "") {
+    if (el.hasAttribute(name)) el.removeAttribute(name);
+    return;
+  }
+  const next = String(value);
+  if (el.getAttribute(name) !== next) el.setAttribute(name, next);
+}
+
+function setMapPathTitle(pathEl, text) {
+  const title = pathEl?.querySelector?.("title");
+  if (!title) return;
+  const next = String(text || pathEl.__countryName || title.textContent || "");
+  if (title.textContent !== next) title.textContent = next;
+}
+
+function inactiveMapCountryRenderState(countryName) {
+  return {
+    active: false,
+    context: false,
+    selected: false,
+    hovered: false,
+    countryTitle: countryName,
+    countryFill: "",
+    countryStroke: "",
+    countryStrokeWidth: "",
+    highlightContext: false,
+    highlightSelected: false,
+    highlightStroke: "",
+    highlightStrokeWidth: "",
+    hitActive: false,
+    hitTitle: countryName,
+    hitTabindex: "-1",
+    hitRole: "",
+    hitAriaHidden: "true",
+    hitAriaLabel: "",
+  };
+}
+
+function mapCountryRenderSignature(state) {
+  return [
+    state.active ? 1 : 0,
+    state.context ? 1 : 0,
+    state.selected ? 1 : 0,
+    state.hovered ? 1 : 0,
+    state.countryTitle || "",
+    state.countryFill || "",
+    state.countryStroke || "",
+    state.countryStrokeWidth || "",
+    state.highlightContext ? 1 : 0,
+    state.highlightSelected ? 1 : 0,
+    state.highlightStroke || "",
+    state.highlightStrokeWidth || "",
+    state.hitActive ? 1 : 0,
+    state.hitTitle || "",
+    state.hitTabindex || "",
+    state.hitRole || "",
+    state.hitAriaHidden || "",
+    state.hitAriaLabel || "",
+  ].join("|");
+}
+
+function mapCountryState(nextStates, countryName) {
+  if (!nextStates.has(countryName)) {
+    const state = inactiveMapCountryRenderState(countryName);
+    nextStates.set(countryName, state);
+  }
+  return nextStates.get(countryName);
+}
+
+function applyMapCountryRenderState(countryName, nextState = inactiveMapCountryRenderState(countryName)) {
+  const nextSignature = mapCountryRenderSignature(nextState);
+  const prevSignature = mapCountryRenderStateByName.get(countryName)?.signature || "";
+  if (nextSignature === prevSignature) return;
+
+  for (const countryPath of countryElsByName.get(countryName) || []) {
+    countryPath.__countryName = countryName;
+    setSvgClass(countryPath, "map-country-active", nextState.active);
+    setSvgClass(countryPath, "map-country-context", nextState.context);
+    setSvgClass(countryPath, "map-country-selected", nextState.selected);
+    setSvgClass(countryPath, "map-country-hovered", nextState.hovered);
+    setSvgStyle(countryPath, "fill", nextState.countryFill);
+    setSvgStyle(countryPath, "stroke", nextState.countryStroke);
+    setSvgStyle(countryPath, "strokeWidth", nextState.countryStrokeWidth);
+    setMapPathTitle(countryPath, nextState.countryTitle || countryName);
+  }
+
+  for (const countryPath of countryHighlightElsByName.get(countryName) || []) {
+    setSvgClass(countryPath, "map-country-highlight-border-context", nextState.highlightContext);
+    setSvgClass(countryPath, "map-country-highlight-border-selected", nextState.highlightSelected);
+    setSvgStyle(countryPath, "stroke", nextState.highlightStroke);
+    setSvgStyle(countryPath, "strokeWidth", nextState.highlightStrokeWidth);
+  }
+
+  for (const countryPath of countryHitElsByName.get(countryName) || []) {
+    countryPath.__countryName = countryName;
+    setSvgClass(countryPath, "map-country-hit-active", nextState.hitActive);
+    setSvgAttr(countryPath, "tabindex", nextState.hitTabindex || "-1");
+    setSvgAttr(countryPath, "aria-hidden", nextState.hitAriaHidden || "true");
+    setSvgAttr(countryPath, "role", nextState.hitRole);
+    setSvgAttr(countryPath, "aria-label", nextState.hitAriaLabel);
+    setMapPathTitle(countryPath, nextState.hitTitle || countryName);
+  }
+
+  if (nextSignature === mapCountryRenderSignature(inactiveMapCountryRenderState(countryName))) {
+    mapCountryRenderStateByName.delete(countryName);
+  } else {
+    mapCountryRenderStateByName.set(countryName, { signature: nextSignature });
+  }
+}
+
+function mapSuperregionRenderSignature(state) {
+  if (!state) return "";
+  return [
+    state.countriesKey || "",
+    state.color || "",
+    state.dim ? 1 : 0,
+    state.hover ? 1 : 0,
+    state.selected ? 1 : 0,
+  ].join("|");
+}
+
+function applyMapSuperregionRenderState(groupKey, state = null) {
+  const nextSignature = mapSuperregionRenderSignature(state);
+  const prevSignature = mapSuperregionRenderStateByKey.get(groupKey)?.signature || "";
+  if (!state) {
+    const borderPath = mapSuperregionBorderElsByGroupKey.get(groupKey);
+    if (borderPath) borderPath.remove();
+    mapSuperregionBorderElsByGroupKey.delete(groupKey);
+    mapSuperregionRenderStateByKey.delete(groupKey);
+    return;
+  }
+  if (nextSignature === prevSignature) return;
+  updateSuperregionBorder(groupKey, state.color, {
+    dim: state.dim,
+    hover: state.hover,
+    selected: state.selected,
+  });
+  mapSuperregionRenderStateByKey.set(groupKey, { signature: nextSignature });
+}
+
+function applyMapRenderState(nextCountryStates = new Map(), nextItemsByCountry = new Map(), nextSuperregionStates = new Map()) {
+  clearMapHoveredCountry();
+
+  mapItemsByCountryName.clear();
+  for (const [countryName, item] of nextItemsByCountry.entries()) {
+    mapItemsByCountryName.set(countryName, item);
+  }
+
+  const countryNames = new Set([
+    ...mapCountryRenderStateByName.keys(),
+    ...nextCountryStates.keys(),
+  ]);
+  for (const countryName of countryNames) {
+    applyMapCountryRenderState(countryName, nextCountryStates.get(countryName) || inactiveMapCountryRenderState(countryName));
+  }
+
+  const superregionKeys = new Set([
+    ...mapSuperregionRenderStateByKey.keys(),
+    ...nextSuperregionStates.keys(),
+  ]);
+  for (const groupKey of superregionKeys) {
+    applyMapSuperregionRenderState(groupKey, nextSuperregionStates.get(groupKey) || null);
+  }
 }
 
 function clearCountryHighlights() {
-  mapItemsByCountryName.clear();
-  clearMapHoveredCountry();
-  for (const countryPaths of countryElsByName.values()) {
-    for (const countryPath of countryPaths) {
-      countryPath.classList.remove("map-country-active", "map-country-context", "map-country-selected", "map-country-hovered");
-      countryPath.style.removeProperty("fill");
-      countryPath.style.removeProperty("stroke");
-      countryPath.style.removeProperty("stroke-width");
-      const title = countryPath.querySelector("title");
-      if (title) title.textContent = countryPath.__countryName || title.textContent;
-    }
+  applyMapRenderState();
+  mapHoverCountriesByCountryName.clear();
+  mapSuperregionCountriesByGroupKey.clear();
+  mapSuperregionGroupKeyByCountryName.clear();
+  for (const borderPath of mapSuperregionBorderElsByGroupKey.values()) {
+    borderPath.remove();
   }
-  for (const countryPaths of countryHighlightElsByName.values()) {
-    for (const countryPath of countryPaths) {
-      countryPath.classList.remove("map-country-highlight-border-context", "map-country-highlight-border-selected");
-      countryPath.style.removeProperty("stroke");
-      countryPath.style.removeProperty("stroke-width");
-    }
-  }
-  for (const countryPaths of countryHitElsByName.values()) {
-    for (const countryPath of countryPaths) {
-      countryPath.classList.remove("map-country-hit-active");
-      countryPath.setAttribute("tabindex", "-1");
-      countryPath.setAttribute("aria-hidden", "true");
-      countryPath.removeAttribute("role");
-      countryPath.removeAttribute("aria-label");
-      const title = countryPath.querySelector("title");
-      if (title) title.textContent = countryPath.__countryName || title.textContent;
-    }
-  }
+  mapSuperregionBorderElsByGroupKey.clear();
+  mapSuperregionRenderStateByKey.clear();
 }
 
 function isMapExpanded() {
   return Boolean(mapCard?.classList.contains("map-expanded"));
 }
 
+function syncMapCountryInteractivity() {
+  const interactive = isMapExpanded() && !mapListMode;
+  for (const [countryName, countryPaths] of countryHitElsByName.entries()) {
+    const active = countryPaths.some(path => path.classList.contains("map-country-hit-active"));
+    for (const countryPath of countryPaths) {
+      if (active && interactive) {
+        const item = mapItemsByCountryName.get(countryName);
+        setSvgAttr(countryPath, "tabindex", "0");
+        setSvgAttr(countryPath, "role", "button");
+        setSvgAttr(countryPath, "aria-hidden", "false");
+        setSvgAttr(countryPath, "aria-label", item?.selectable_for || `${countryName}: ${item?.display_title || item?.wikipedia_title || countryName}`);
+      } else {
+        setSvgAttr(countryPath, "tabindex", "-1");
+        setSvgAttr(countryPath, "aria-hidden", "true");
+        if (!active) {
+          setSvgAttr(countryPath, "role", "");
+          setSvgAttr(countryPath, "aria-label", "");
+        }
+      }
+    }
+  }
+}
+
 function mapZoomFromViewBox() {
-  return MAP_VIEWBOX_DEFAULT.w / mapViewBox.w;
+  return Math.min(
+    MAP_VIEWBOX_DEFAULT.w / Math.max(1, mapViewBox.w),
+    MAP_VIEWBOX_DEFAULT.h / Math.max(1, mapViewBox.h)
+  );
 }
 
 function isMapViewZoomed() {
   return (
-    mapZoomFromViewBox() > 1.01 ||
-    Math.abs(mapViewBox.x - MAP_VIEWBOX_DEFAULT.x) > 0.5 ||
-    Math.abs(mapViewBox.y - MAP_VIEWBOX_DEFAULT.y) > 0.5
+    Math.abs(mapViewBox.w - mapAutoViewBox.w) > 0.5 ||
+    Math.abs(mapViewBox.h - mapAutoViewBox.h) > 0.5 ||
+    Math.abs(mapViewBox.x - mapAutoViewBox.x) > 0.5 ||
+    Math.abs(mapViewBox.y - mapAutoViewBox.y) > 0.5
   );
 }
 
 function updateMapResetButton() {
   if (!mapResetButton) return;
-  mapResetButton.hidden = mapListMode || !isMapExpanded() || !isMapViewZoomed();
+  mapResetButton.hidden = mapListMode || !isMapExpanded() || !mapViewManuallyAdjusted;
 }
 
-function clampMapViewBox(box) {
-  const zoom = clamp(MAP_VIEWBOX_DEFAULT.w / box.w, MAP_MIN_ZOOM, MAP_MAX_ZOOM);
-  const w = MAP_VIEWBOX_DEFAULT.w / zoom;
-  const h = MAP_VIEWBOX_DEFAULT.h / zoom;
+function setMapViewManuallyAdjusted(adjusted) {
+  mapViewManuallyAdjusted = Boolean(adjusted);
+  updateMapResetButton();
+}
+
+function clampAxisToRange(value, min, max) {
+  if (min > max) return (min + max) / 2;
+  return clamp(value, min, max);
+}
+
+function softClampAxisToRange(value, min, max, overscroll = MAP_FOCUS_OVERSCROLL) {
+  if (min > max) return (min + max) / 2;
+  if (value < min) return min - Math.min(overscroll, (min - value) * 0.28);
+  if (value > max) return max + Math.min(overscroll, (value - max) * 0.28);
+  return value;
+}
+
+function mapWorldPanLimits(w, h) {
   return {
-    x: clamp(box.x, MAP_VIEWBOX_DEFAULT.x, MAP_VIEWBOX_DEFAULT.x + MAP_VIEWBOX_DEFAULT.w - w),
-    y: clamp(box.y, MAP_VIEWBOX_DEFAULT.y, MAP_VIEWBOX_DEFAULT.y + MAP_VIEWBOX_DEFAULT.h - h),
+    minX: MAP_VIEWBOX_DEFAULT.x,
+    maxX: MAP_VIEWBOX_DEFAULT.x + MAP_VIEWBOX_DEFAULT.w - w,
+    minY: MAP_VIEWBOX_DEFAULT.y,
+    maxY: MAP_VIEWBOX_DEFAULT.y + MAP_VIEWBOX_DEFAULT.h - h,
+  };
+}
+
+function mapViewportAspect() {
+  const rect = regionMap?.getBoundingClientRect?.();
+  const width = Number(rect?.width);
+  const height = Number(rect?.height);
+  if (Number.isFinite(width) && Number.isFinite(height) && width > 4 && height > 4) {
+    return clamp(width / height, 0.45, 3.2);
+  }
+  return MAP_VIEWBOX_DEFAULT.w / MAP_VIEWBOX_DEFAULT.h;
+}
+
+function mapSizeForAspectAndZoom(aspect = mapViewportAspect(), zoom = 1) {
+  const worldAspect = MAP_VIEWBOX_DEFAULT.w / MAP_VIEWBOX_DEFAULT.h;
+  const clampedZoom = clamp(Number(zoom) || 1, MAP_MIN_ZOOM, MAP_MAX_ZOOM);
+  if (aspect >= worldAspect) {
+    const w = MAP_VIEWBOX_DEFAULT.w / clampedZoom;
+    return { w, h: w / aspect };
+  }
+  const h = MAP_VIEWBOX_DEFAULT.h / clampedZoom;
+  return { w: h * aspect, h };
+}
+
+function mapBoxWithViewportAspect(box, aspect = mapViewportAspect()) {
+  const inputW = Math.max(1, Number(box?.w) || MAP_VIEWBOX_DEFAULT.w);
+  const inputH = Math.max(1, Number(box?.h) || MAP_VIEWBOX_DEFAULT.h);
+  const centerX = Number.isFinite(box?.x) ? box.x + inputW / 2 : MAP_VIEWBOX_DEFAULT.x + MAP_VIEWBOX_DEFAULT.w / 2;
+  const centerY = Number.isFinite(box?.y) ? box.y + inputH / 2 : MAP_VIEWBOX_DEFAULT.y + MAP_VIEWBOX_DEFAULT.h / 2;
+  let w = inputW;
+  let h = inputH;
+  if (w / h < aspect) w = h * aspect;
+  else h = w / aspect;
+  const zoom = clamp(
+    Math.min(MAP_VIEWBOX_DEFAULT.w / Math.max(1, w), MAP_VIEWBOX_DEFAULT.h / Math.max(1, h)),
+    MAP_MIN_ZOOM,
+    MAP_MAX_ZOOM
+  );
+  ({ w, h } = mapSizeForAspectAndZoom(aspect, zoom));
+  return {
+    x: centerX - w / 2,
+    y: centerY - h / 2,
     w,
     h,
   };
 }
 
-function applyMapViewBox() {
+function focusedPanAxisLimits(focusStart, focusSize, viewportSize, worldMin, worldMax) {
+  let min;
+  let max;
+  if (focusSize <= viewportSize) {
+    min = focusStart + focusSize - viewportSize;
+    max = focusStart;
+  } else {
+    const overlap = Math.min(MAP_FOCUS_MIN_OVERLAP, viewportSize * 0.42, focusSize * 0.42);
+    min = focusStart - viewportSize + overlap;
+    max = focusStart + focusSize - overlap;
+  }
+  return {
+    min: Math.max(worldMin, min),
+    max: Math.min(worldMax, max),
+  };
+}
+
+function focusedMapPanLimits(w, h) {
+  const world = mapWorldPanLimits(w, h);
+  if (!mapPanFocusActive) return world;
+  const xLimits = focusedPanAxisLimits(
+    mapAutoViewBox.x,
+    mapAutoViewBox.w,
+    w,
+    world.minX,
+    world.maxX
+  );
+  const yLimits = focusedPanAxisLimits(
+    mapAutoViewBox.y,
+    mapAutoViewBox.h,
+    h,
+    world.minY,
+    world.maxY
+  );
+  return {
+    minX: xLimits.min,
+    maxX: xLimits.max,
+    minY: yLimits.min,
+    maxY: yLimits.max,
+  };
+}
+
+function clampMapViewBox(box, { softFocus = false } = {}) {
+  const aspect = mapViewportAspect();
+  const fitted = mapBoxWithViewportAspect(box, aspect);
+  const w = fitted.w;
+  const h = fitted.h;
+  const world = mapWorldPanLimits(w, h);
+  const focus = focusedMapPanLimits(w, h);
+  const clampFocus = softFocus ? softClampAxisToRange : clampAxisToRange;
+  const x = clamp(
+    clampFocus(fitted.x, focus.minX, focus.maxX),
+    world.minX,
+    world.maxX
+  );
+  const y = clamp(
+    clampFocus(fitted.y, focus.minY, focus.maxY),
+    world.minY,
+    world.maxY
+  );
+  return {
+    x,
+    y,
+    w,
+    h,
+  };
+}
+
+function applyMapViewBox(options = {}) {
   if (!regionMap) return;
-  mapViewBox = clampMapViewBox(mapViewBox);
+  mapViewBox = clampMapViewBox(mapViewBox, options);
   regionMap.setAttribute(
     "viewBox",
     `${mapViewBox.x} ${mapViewBox.y} ${mapViewBox.w} ${mapViewBox.h}`
@@ -3084,9 +5274,170 @@ function applyMapViewBox() {
   updateMapResetButton();
 }
 
+function cancelMapViewBoxAnimation() {
+  if (!mapViewBoxAnimFrame) return;
+  cancelAnimationFrame(mapViewBoxAnimFrame);
+  mapViewBoxAnimFrame = 0;
+}
+
+function cancelMapPanSettle() {
+  if (!mapPanSettleTimer) return;
+  clearTimeout(mapPanSettleTimer);
+  mapPanSettleTimer = 0;
+}
+
+function mapViewBoxCloseEnough(a, b) {
+  return (
+    Math.abs(a.x - b.x) < 0.25 &&
+    Math.abs(a.y - b.y) < 0.25 &&
+    Math.abs(a.w - b.w) < 0.25 &&
+    Math.abs(a.h - b.h) < 0.25
+  );
+}
+
+function easeMapViewBox(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function animateMapViewBoxTo(target, { immediate = false } = {}) {
+  const next = clampMapViewBox(target);
+  cancelMapViewBoxAnimation();
+  cancelMapPanSettle();
+  if (immediate || mapViewBoxCloseEnough(mapViewBox, next)) {
+    mapViewBox = { ...next };
+    applyMapViewBox();
+    return;
+  }
+  const start = { ...mapViewBox };
+  const startAt = performance.now();
+  const step = now => {
+    const t = clamp((now - startAt) / MAP_VIEWBOX_ANIM_MS, 0, 1);
+    const eased = easeMapViewBox(t);
+    mapViewBox = {
+      x: start.x + (next.x - start.x) * eased,
+      y: start.y + (next.y - start.y) * eased,
+      w: start.w + (next.w - start.w) * eased,
+      h: start.h + (next.h - start.h) * eased,
+    };
+    applyMapViewBox();
+    if (t < 1) {
+      mapViewBoxAnimFrame = requestAnimationFrame(step);
+      return;
+    }
+    mapViewBoxAnimFrame = 0;
+    mapViewBox = { ...next };
+    applyMapViewBox();
+  };
+  mapViewBoxAnimFrame = requestAnimationFrame(step);
+}
+
 function resetMapViewBox() {
-  mapViewBox = { ...MAP_VIEWBOX_DEFAULT };
-  applyMapViewBox();
+  refitMapAutoView({ animate: true });
+}
+
+function settleMapViewBox() {
+  cancelMapPanSettle();
+  const next = clampMapViewBox(mapViewBox);
+  if (mapViewBoxCloseEnough(mapViewBox, next)) {
+    mapViewBox = { ...next };
+    applyMapViewBox();
+    if (mapViewBoxCloseEnough(mapViewBox, mapAutoViewBox)) {
+      setMapViewManuallyAdjusted(false);
+    }
+    return;
+  }
+  if (mapViewBoxCloseEnough(next, mapAutoViewBox)) {
+    setMapViewManuallyAdjusted(false);
+  }
+  animateMapViewBoxTo(next);
+}
+
+function scheduleMapPanSettle() {
+  cancelMapPanSettle();
+  mapPanSettleTimer = window.setTimeout(settleMapViewBox, MAP_PAN_SETTLE_DELAY_MS);
+}
+
+function countrySvgBounds(countryName) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const path of countryElsByName.get(countryName) || []) {
+    try {
+      const box = path.getBBox();
+      if (!box || box.width <= 0 || box.height <= 0) continue;
+      minX = Math.min(minX, box.x);
+      minY = Math.min(minY, box.y);
+      maxX = Math.max(maxX, box.x + box.width);
+      maxY = Math.max(maxY, box.y + box.height);
+    } catch {}
+  }
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+function mapViewBoxForCountryFeatures(featureKeys) {
+  const bounds = [];
+  for (const key of featureKeys || []) {
+    const resolved = resolveMapCountry(key) || key;
+    const box = countrySvgBounds(resolved);
+    if (box) bounds.push(box);
+  }
+  if (!bounds.length) return clampMapViewBox({ ...MAP_VIEWBOX_DEFAULT });
+
+  let minX = Math.min(...bounds.map(box => box.minX));
+  let minY = Math.min(...bounds.map(box => box.minY));
+  let maxX = Math.max(...bounds.map(box => box.maxX));
+  let maxY = Math.max(...bounds.map(box => box.maxY));
+  minX -= MAP_FIT_PADDING;
+  minY -= MAP_FIT_PADDING;
+  maxX += MAP_FIT_PADDING;
+  maxY += MAP_FIT_PADDING;
+
+  const width = Math.max(18, maxX - minX);
+  const height = Math.max(18, maxY - minY);
+  const fitted = mapBoxWithViewportAspect({
+    x: minX,
+    y: minY,
+    w: width,
+    h: height,
+  });
+  return clampMapViewBox(fitted);
+}
+
+function normalizeMapAutoViewFeatureKeys(featureKeys) {
+  const keys = [];
+  const seen = new Set();
+  for (const key of featureKeys || []) {
+    const resolved = resolveMapCountry(key) || key;
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    keys.push(resolved);
+  }
+  return keys;
+}
+
+function setMapAutoViewFeatures(featureKeys, { animate = true, immediate = false } = {}) {
+  setMapViewManuallyAdjusted(false);
+  mapAutoViewFeatureKeys = normalizeMapAutoViewFeatureKeys(featureKeys);
+  mapPanFocusActive = Boolean(mapAutoViewFeatureKeys.length);
+  mapAutoViewBox = mapViewBoxForCountryFeatures(mapAutoViewFeatureKeys);
+  if (animate) animateMapViewBoxTo(mapAutoViewBox, { immediate });
+  else {
+    cancelMapViewBoxAnimation();
+    cancelMapPanSettle();
+    mapViewBox = { ...mapAutoViewBox };
+    applyMapViewBox();
+  }
+}
+
+function refitMapAutoView({ animate = true, immediate = false } = {}) {
+  if (!mapAutoViewFeatureKeys.length && !activeMapKey) return;
+  setMapAutoViewFeatures(mapAutoViewFeatureKeys, { animate, immediate });
+}
+
+function updateMapAutoView(featureKeys) {
+  setMapAutoViewFeatures(featureKeys, { animate: true });
 }
 
 function mapClientToViewBoxPoint(clientX, clientY, box = mapViewBox) {
@@ -3097,6 +5448,9 @@ function mapClientToViewBoxPoint(clientX, clientY, box = mapViewBox) {
 }
 
 function zoomMapAt(clientX, clientY, factor) {
+  setMapViewManuallyAdjusted(true);
+  cancelMapViewBoxAnimation();
+  cancelMapPanSettle();
   const before = mapClientToViewBoxPoint(clientX, clientY);
   const nextZoom = clamp(mapZoomFromViewBox() * factor, MAP_MIN_ZOOM, MAP_MAX_ZOOM);
   const nextW = MAP_VIEWBOX_DEFAULT.w / nextZoom;
@@ -3114,27 +5468,34 @@ function zoomMapAt(clientX, clientY, factor) {
 }
 
 function panMapByClientDelta(dx, dy) {
+  setMapViewManuallyAdjusted(true);
+  cancelMapViewBoxAnimation();
+  cancelMapPanSettle();
   const rect = regionMap.getBoundingClientRect();
   mapViewBox = clampMapViewBox({
     ...mapViewBox,
     x: mapViewBox.x - (dx / Math.max(1, rect.width)) * mapViewBox.w,
     y: mapViewBox.y - (dy / Math.max(1, rect.height)) * mapViewBox.h,
-  });
-  applyMapViewBox();
+  }, { softFocus: true });
+  applyMapViewBox({ softFocus: true });
 }
 
 function highlightContextCountries(node) {
-  if (activeMapKey !== "world") return;
+  const features = [];
+  if (activeMapKey !== "world") return features;
   const color = nodeMapColor(node);
   for (const countryName of inferCountriesForNode(node)) {
+    if (!countryElsByName.has(countryName)) continue;
+    features.push(countryName);
     for (const countryPath of countryElsByName.get(countryName) || []) {
       countryPath.classList.add("map-country-context");
     }
     for (const countryPath of countryHighlightElsByName.get(countryName) || []) {
       countryPath.classList.add("map-country-highlight-border-context");
     }
-    applyMapCountryColor(countryName, color, { dim: true });
+    applyMapCountryColor(countryName, color);
   }
+  return features;
 }
 
 function mapFeatureForItem(item) {
@@ -3170,69 +5531,52 @@ function normalizedCountryLookup(value) {
     .toLowerCase();
 }
 
-const regionCodeDisplayNames = typeof Intl?.DisplayNames === "function"
-  ? new Intl.DisplayNames(["en"], { type: "region" })
-  : null;
-const regionCodeByCountryName = (() => {
-  const lookup = new Map();
-  if (regionCodeDisplayNames) {
-    for (let a = 65; a <= 90; a++) {
-      for (let b = 65; b <= 90; b++) {
-        const code = String.fromCharCode(a, b);
-        const label = regionCodeDisplayNames.of(code);
-        if (!label || label === code) continue;
-        lookup.set(normalizedCountryLookup(label), code);
-      }
-    }
-  }
-  const aliases = {
-    "bolivia": "BO",
-    "bosnia and herzegovina": "BA",
-    "cape verde": "CV",
-    "congo": "CG",
-    "cote d ivoire": "CI",
-    "czech republic": "CZ",
-    "dem rep congo": "CD",
-    "democratic republic of the congo": "CD",
-    "dominican republic": "DO",
-    "eswatini": "SZ",
-    "gambia": "GM",
-    "georgia": "GE",
-    "ivory coast": "CI",
-    "laos": "LA",
-    "macedonia": "MK",
-    "micronesia": "FM",
-    "moldova": "MD",
-    "north korea": "KP",
-    "north macedonia": "MK",
-    "palestine": "PS",
-    "philippines": "PH",
-    "republic of the congo": "CG",
-    "russia": "RU",
-    "south korea": "KR",
-    "south sudan": "SS",
-    "syria": "SY",
-    "taiwan": "TW",
-    "tanzania": "TZ",
-    "timor leste": "TL",
-    "turkey": "TR",
-    "united kingdom": "GB",
-    "united states": "US",
-    "united states of america": "US",
-    "venezuela": "VE",
-    "vietnam": "VN",
-  };
-  for (const [name, code] of Object.entries(aliases)) {
-    lookup.set(name, code);
-  }
-  return lookup;
-})();
+const wikimediaFlagFileAliases = new Map(Object.entries({
+  "bahamas": "Flag of the Bahamas.svg",
+  "czech republic": "Flag of the Czech Republic.svg",
+  "democratic republic of the congo": "Flag of the Democratic Republic of the Congo.svg",
+  "dominican republic": "Flag of the Dominican Republic.svg",
+  "gambia": "Flag of the Gambia.svg",
+  "ivory coast": "Flag of Cote d'Ivoire.svg",
+  "netherlands": "Flag of the Netherlands.svg",
+  "philippines": "Flag of the Philippines.svg",
+  "republic of the congo": "Flag of the Republic of the Congo.svg",
+  "united arab emirates": "Flag of the United Arab Emirates.svg",
+  "united kingdom": "Flag of the United Kingdom.svg",
+  "united states": "Flag of the United States.svg",
+  "united states of america": "Flag of the United States.svg",
+}));
 
-function flagEmojiForRegionName(name, mapKey = activeMapKey || "world") {
-  if (mapKey === "us") return "🇺🇸";
-  const code = regionCodeByCountryName.get(normalizedCountryLookup(name));
-  if (!code || code.length !== 2) return "◌";
-  return [...code.toUpperCase()].map(char => String.fromCodePoint(127397 + char.charCodeAt(0))).join("");
+function wikimediaFlagUrlForCountry(name) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return "";
+  const fileTitle = wikimediaFlagFileAliases.get(normalizedCountryLookup(cleanName)) || `Flag of ${cleanName}.svg`;
+  return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fileTitle)}?width=96`;
+}
+
+function createRootMapListFlagIcon(item) {
+  const countryName = item?.region_name || mapFeatureForItem(item) || mapListTitle(item);
+  const url = wikimediaFlagUrlForCountry(countryName);
+  if (!url) {
+    const fallback = document.createElement("span");
+    fallback.className = "map-list-flag-fallback";
+    fallback.setAttribute("aria-hidden", "true");
+    return fallback;
+  }
+  const img = document.createElement("img");
+  img.className = "map-list-flag";
+  img.alt = "";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.referrerPolicy = "no-referrer";
+  img.src = url;
+  img.addEventListener("error", () => {
+    const fallback = document.createElement("span");
+    fallback.className = "map-list-flag-fallback";
+    fallback.setAttribute("aria-hidden", "true");
+    img.replaceWith(fallback);
+  }, { once: true });
+  return img;
 }
 
 let worldMiniMapDataPromise = null;
@@ -3241,7 +5585,7 @@ async function getWorldMiniMapData() {
   if (!worldMiniMapDataPromise) {
     worldMiniMapDataPromise = loadMapFeatures("world").then(features => {
       const collection = { type: "FeatureCollection", features };
-      const projection = geoNaturalEarth1().fitExtent([[0, 0], [110, 64]], collection);
+      const projection = geoNaturalEarth1().fitExtent([[0, 0], [MAP_LIST_ICON_WIDTH * 4, MAP_LIST_ICON_HEIGHT * 4]], collection);
       const path = geoPath(projection);
       const data = new Map();
       for (const featureItem of features) {
@@ -3383,6 +5727,15 @@ function flattenMapListNode(node, depth, rows) {
   for (const child of node.children) flattenMapListNode(child, depth + 1, rows);
 }
 
+function canParentMapListChild(parentItem, childItem) {
+  if (!parentItem || !childItem) return false;
+  if (parentItem.region_kind === "country") return true;
+  if (parentItem.role === "regional_variant" || parentItem.role === "regional_style_candidate") {
+    return false;
+  }
+  return parentItem.region_id === childItem.mount_parent_region_id;
+}
+
 function buildMapListRows(items) {
   const dedupedItems = aggregateMapListItems(items);
   if (!dedupedItems.length) return [];
@@ -3404,7 +5757,7 @@ function buildMapListRows(items) {
     const parentRegionId = node.item.mount_parent_region_id;
     if (!parentRegionId || parentRegionId === node.item.region_id) continue;
     const parent = nodeByRegionId.get(parentRegionId);
-    if (!parent) continue;
+    if (!parent || !canParentMapListChild(parent.item, node.item)) continue;
     node.parentKey = parent.key;
     parent.children.push(node);
   }
@@ -3445,14 +5798,101 @@ function buildMapListRows(items) {
   return rows;
 }
 
+function rootMapListCountrySortLabel(item) {
+  return item?.region_name || mapFeatureForItem(item) || mapListTitle(item);
+}
+
+function buildRootMapListRows(items) {
+  const groups = new Map();
+  for (const item of dedupeMapListItems(items)) {
+    const key = mapListGroupKey(item);
+    const label = mapListGroupLabel(item);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label,
+        items: [],
+      });
+    }
+    groups.get(key).items.push(item);
+  }
+
+  const rows = [];
+  const sortedGroups = [...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
+  for (const group of sortedGroups) {
+    rows.push({
+      type: "header",
+      key: `header-${group.key}`,
+      label: group.label,
+    });
+    group.items.sort((a, b) =>
+      rootMapListCountrySortLabel(a).localeCompare(rootMapListCountrySortLabel(b))
+      || mapListTitle(a).localeCompare(mapListTitle(b))
+    );
+    for (const item of group.items) {
+      rows.push({
+        type: "item",
+        key: `item-root-${mapListItemKey(item)}`,
+        item,
+        depth: 0,
+        hasParent: false,
+      });
+    }
+  }
+  return rows;
+}
+
+function mapListIndividualSearchTextForItem(item) {
+  return normalizeGeoText([
+    mapListTitle(item),
+    rootMapListCountrySortLabel(item),
+    item?.region_name,
+    item?.feature_name,
+    item?.feature_key,
+    item?.wikipedia_title,
+    ...(item?.represented_titles || []),
+  ].filter(Boolean).join(" "));
+}
+
+function mapListAggregateSearchTextForItem(item) {
+  return normalizeGeoText([
+    mapListIndividualSearchTextForItem(item),
+    mapListGroupLabel(item),
+    item?.matched_region_name,
+    item?.mount_parent_region_name,
+  ].filter(Boolean).join(" "));
+}
+
+function mapListRowsForItems(items, rootMode) {
+  return rootMode ? buildRootMapListRows(items) : buildMapListRows(items);
+}
+
+function mapListSearchAvailableForMetrics(metrics) {
+  const viewportHeight = mapListMaxCardHeight() - mapListTopInset() - MAP_LIST_BOTTOM_INSET;
+  return metrics.totalHeight > Math.max(MAP_LIST_MIN_CARD_HEIGHT, viewportHeight) + 4;
+}
+
+function filterMapListItemsForSearch(items, rootMode) {
+  const query = normalizeGeoText(mapListSearchQuery);
+  if (!query) return items;
+  const individualMatches = (items || []).filter(item => mapListIndividualSearchTextForItem(item).includes(query));
+  if (individualMatches.length) return individualMatches;
+  return (rootMode ? dedupeMapListItems(items) : aggregateMapListItems(items))
+    .filter(item => mapListAggregateSearchTextForItem(item).includes(query));
+}
+
 function mapListRowMetrics(rows) {
-  let offset = 0;
-  return rows.map(row => {
+  let offset = MAP_LIST_CONTENT_TOP_PAD;
+  const measuredRows = rows.map(row => {
     const height = row.type === "header" ? MAP_LIST_HEADER_HEIGHT : MAP_LIST_ITEM_HEIGHT;
     const measured = { ...row, top: offset, height, bottom: offset + height };
     offset += height;
     return measured;
   });
+  return {
+    rows: measuredRows,
+    totalHeight: offset + MAP_LIST_CONTENT_BOTTOM_PAD,
+  };
 }
 
 function mapListVisibleRowRange(rows, scrollTop, viewportHeight) {
@@ -3476,7 +5916,7 @@ function mapListIconFeatureKeys(item) {
 function createMapListIcon(item, worldMiniMapData, currentNode) {
   const svg = svgEl("svg", {
     class: "map-list-icon",
-    viewBox: "0 0 26 18",
+    viewBox: `0 0 ${MAP_LIST_ICON_WIDTH} ${MAP_LIST_ICON_HEIGHT}`,
     "aria-hidden": "true",
   });
   const keys = [...new Set(mapListIconFeatureKeys(item))];
@@ -3498,9 +5938,12 @@ function createMapListIcon(item, worldMiniMapData, currentNode) {
   const width = Math.max(1, maxX - minX);
   const height = Math.max(1, maxY - minY);
   const padding = 1.2;
-  const scale = Math.min((26 - padding * 2) / width, (18 - padding * 2) / height);
-  const translateX = padding + (26 - padding * 2 - width * scale) / 2 - minX * scale;
-  const translateY = padding + (18 - padding * 2 - height * scale) / 2 - minY * scale;
+  const scale = Math.min(
+    (MAP_LIST_ICON_WIDTH - padding * 2) / width,
+    (MAP_LIST_ICON_HEIGHT - padding * 2) / height
+  );
+  const translateX = padding + (MAP_LIST_ICON_WIDTH - padding * 2 - width * scale) / 2 - minX * scale;
+  const translateY = padding + (MAP_LIST_ICON_HEIGHT - padding * 2 - height * scale) / 2 - minY * scale;
   const isSelected = isMapItemSelected(item, currentNode);
   const fill = mapColorPair(item.similarity_color || nodeMapColor(currentNode), { dim: isSelected }).fill;
 
@@ -3522,19 +5965,25 @@ function createMapListIcon(item, worldMiniMapData, currentNode) {
 function renderVisibleMapListRows() {
   if (!mapList) return;
   const state = mapListViewState;
-  const scrollTop = mapList.scrollTop;
-  mapList.innerHTML = "";
   if (!state?.rows?.length) {
     const empty = document.createElement("div");
     empty.className = "map-list-empty";
-    empty.textContent = "No regional variations";
-    mapList.appendChild(empty);
+    empty.textContent = state?.emptyMessage || "No regional variations";
+    mapList.replaceChildren(empty);
     return;
   }
 
   const currentNode = nodes.get(currentKey);
   const viewportHeight = mapList.clientHeight || 0;
+  if (viewportHeight < 24) return;
   const [start, end] = mapListVisibleRowRange(state.rows, mapList.scrollTop, viewportHeight);
+  if (
+    state.renderedStart === start
+    && state.renderedEnd === end
+    && state.renderedSelectionKey === currentKey
+  ) {
+    return;
+  }
   const space = document.createElement("div");
   space.className = "map-list-virtual-space";
   space.style.height = `${state.totalHeight}px`;
@@ -3564,7 +6013,9 @@ function renderVisibleMapListRows() {
 
     const iconWrap = document.createElement("span");
     iconWrap.className = "map-list-icon-wrap";
-    iconWrap.appendChild(createMapListIcon(row.item, state.worldMiniMapData, currentNode));
+    iconWrap.appendChild(state.rootMode
+      ? createRootMapListFlagIcon(row.item)
+      : createMapListIcon(row.item, state.worldMiniMapData, currentNode));
 
     const title = document.createElement("span");
     title.className = "map-list-title";
@@ -3574,24 +6025,42 @@ function renderVisibleMapListRows() {
     space.appendChild(button);
   }
 
-  mapList.appendChild(space);
-  if (Math.abs(mapList.scrollTop - scrollTop) > 1) {
-    mapList.scrollTop = scrollTop;
-  }
+  mapList.replaceChildren(space);
+  state.renderedStart = start;
+  state.renderedEnd = end;
+  state.renderedSelectionKey = currentKey;
 }
 
-async function renderMapList(items) {
+async function renderMapList(items, options = {}) {
   if (!mapList) return;
   const token = ++mapListRenderToken;
   const scrollTop = mapList.scrollTop;
-  const worldMiniMapData = await getWorldMiniMapData();
+  const rootMode = Boolean(options.rootMode);
+  const worldMiniMapData = rootMode ? null : await getWorldMiniMapData();
   if (token !== mapListRenderToken || !mapListMode) return;
-  const rows = mapListRowMetrics(buildMapListRows(items));
+  const fullMetrics = mapListRowMetrics(mapListRowsForItems(items, rootMode));
+  const searchAvailable = mapListSearchAvailableForMetrics(fullMetrics);
+  if (!searchAvailable) {
+    mapListSearchOpen = false;
+    mapListSearchQuery = "";
+    if (mapListSearchInput) mapListSearchInput.value = "";
+  }
+  updateMapListSearchVisibility(rootMode, searchAvailable);
+  const visibleItems = filterMapListItemsForSearch(items, rootMode);
+  const metrics = mapListRowMetrics(mapListRowsForItems(visibleItems, rootMode));
   mapListViewState = {
-    rows,
-    totalHeight: rows.length ? rows[rows.length - 1].bottom : 0,
+    rows: metrics.rows,
+    totalHeight: metrics.totalHeight,
     worldMiniMapData,
+    rootMode,
+    items,
+    searchAvailable,
+    emptyMessage: rootMode && mapListSearchQuery ? "No matching regions" : "No regional variations",
+    renderedStart: -1,
+    renderedEnd: -1,
+    renderedSelectionKey: "",
   };
+  updateMapListCardHeight(metrics.totalHeight);
   mapList.scrollTop = scrollTop;
   renderVisibleMapListRows();
 }
@@ -3672,6 +6141,68 @@ function rgbToHex({ r, g, b }) {
   }).join("")}`;
 }
 
+function parseColorToRgb(color) {
+  return parseCssColor(color);
+}
+
+function srgbToLinear(value) {
+  const c = clamp(value / 255, 0, 1);
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(value) {
+  const c = clamp(value, 0, 1);
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function rgbToOklab(rgb) {
+  const r = srgbToLinear(rgb.r);
+  const g = srgbToLinear(rgb.g);
+  const b = srgbToLinear(rgb.b);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return {
+    L: 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    a: 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    b: 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+  };
+}
+
+function oklabToRgb(oklab) {
+  const l = oklab.L + 0.3963377774 * oklab.a + 0.2158037573 * oklab.b;
+  const m = oklab.L - 0.1055613458 * oklab.a - 0.0638541728 * oklab.b;
+  const s = oklab.L - 0.0894841775 * oklab.a - 1.2914855480 * oklab.b;
+  const l3 = l * l * l;
+  const m3 = m * m * m;
+  const s3 = s * s * s;
+  return {
+    r: Math.round(linearToSrgb(4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3) * 255),
+    g: Math.round(linearToSrgb(-1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3) * 255),
+    b: Math.round(linearToSrgb(-0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3) * 255),
+  };
+}
+
+function oklabToOklch(oklab) {
+  return {
+    L: oklab.L,
+    C: Math.hypot(oklab.a, oklab.b),
+    h: Math.atan2(oklab.b, oklab.a),
+  };
+}
+
+function oklchToOklab(oklch) {
+  return {
+    L: oklch.L,
+    a: oklch.C * Math.cos(oklch.h),
+    b: oklch.C * Math.sin(oklch.h),
+  };
+}
+
+function rgbToCss(rgb) {
+  return `rgb(${clamp(Math.round(rgb.r), 0, 255)}, ${clamp(Math.round(rgb.g), 0, 255)}, ${clamp(Math.round(rgb.b), 0, 255)})`;
+}
+
 function fallbackMapAccentColor() {
   const color = getComputedStyle(document.documentElement).getPropertyValue("--accent");
   return parseCssColor(color) ? color : "#2563eb";
@@ -3681,11 +6212,11 @@ function nodeMapColor(node) {
   return node?.color || node?.similarity_color || fallbackMapAccentColor();
 }
 
-function mapColorPair(color, { dim = false } = {}) {
+function mapColorPair(color, { dim = false, hover = false } = {}) {
   const rgb = parseCssColor(color) || parseCssColor(fallbackMapAccentColor());
   const hsl = rgbToHsl(rgb);
   const normalizedLightness = 0.56;
-  const fillLightness = (dim ? 0.5 : 1) * normalizedLightness;
+  const fillLightness = (dim ? (hover ? 0.68 : 0.5) : 1) * normalizedLightness;
   const fill = {
     ...hsl,
     s: Math.max(0, Math.min(1, hsl.s * 0.84)),
@@ -3702,16 +6233,64 @@ function mapColorPair(color, { dim = false } = {}) {
   };
 }
 
-function applyMapCountryColor(countryName, color, { dim = false, selected = false } = {}) {
-  const pair = mapColorPair(color, { dim });
+function applyMapCountryColor(countryName, color, { dim = false, selected = false, hover = false, suppressStroke = false } = {}) {
+  const pair = mapColorPair(color, { dim, hover });
   for (const countryPath of countryElsByName.get(countryName) || []) {
     countryPath.style.fill = pair.fill;
-    countryPath.style.stroke = pair.stroke;
-    countryPath.style.strokeWidth = selected ? "0.95" : "0.85";
+    countryPath.style.stroke = suppressStroke ? "transparent" : pair.stroke;
+    countryPath.style.strokeWidth = suppressStroke ? "0" : (hover ? "1.05" : (selected ? "0.95" : "0.85"));
   }
   for (const countryPath of countryHighlightElsByName.get(countryName) || []) {
-    countryPath.style.stroke = pair.stroke;
-    countryPath.style.strokeWidth = selected ? "1.15" : "0.95";
+    countryPath.style.stroke = suppressStroke ? "transparent" : pair.stroke;
+    countryPath.style.strokeWidth = suppressStroke ? "0" : (hover ? "1.25" : (selected ? "1.15" : "0.95"));
+  }
+}
+
+function selectableMapItemColor(item) {
+  return item?.similarity_color || nodeMapColor(currentMapNodeForMode());
+}
+
+function restoreSelectableCountryStyle(countryName) {
+  const item = mapItemsByCountryName.get(countryName);
+  if (!item) return;
+  const currentNode = currentMapNodeForMode();
+  const isSelected = isMapItemSelected(item, currentNode);
+  const useSelectedHighlightStyle = !isSelected;
+  const groupKey = superregionGroupKeyForItem(item);
+  const groupedSuperregion = Boolean(groupKey);
+  applyMapCountryColor(countryName, selectableMapItemColor(item), {
+    dim: useSelectedHighlightStyle,
+    selected: useSelectedHighlightStyle,
+    suppressStroke: groupedSuperregion,
+  });
+  if (groupedSuperregion) {
+    updateSuperregionBorder(groupKey, selectableMapItemColor(item), {
+      dim: useSelectedHighlightStyle,
+      selected: useSelectedHighlightStyle,
+    });
+  }
+}
+
+function applyHoveredSelectableCountryStyle(countryName) {
+  const item = mapItemsByCountryName.get(countryName);
+  if (!item) return;
+  const currentNode = currentMapNodeForMode();
+  const isSelected = isMapItemSelected(item, currentNode);
+  const useSelectedHighlightStyle = !isSelected;
+  const groupKey = superregionGroupKeyForItem(item);
+  const groupedSuperregion = Boolean(groupKey);
+  applyMapCountryColor(countryName, selectableMapItemColor(item), {
+    dim: useSelectedHighlightStyle,
+    selected: useSelectedHighlightStyle,
+    hover: true,
+    suppressStroke: groupedSuperregion,
+  });
+  if (groupedSuperregion) {
+    updateSuperregionBorder(groupKey, selectableMapItemColor(item), {
+      dim: useSelectedHighlightStyle,
+      selected: useSelectedHighlightStyle,
+      hover: true,
+    });
   }
 }
 
@@ -3725,7 +6304,7 @@ function isMapItemSelected(item, currentNode) {
 }
 
 function highlightMapContextItem(item, color = null) {
-  const countryName = mapFeatureForItem(item);
+  const countryName = featureKeyForMapItem(item);
   const countryPaths = countryElsByName.get(countryName);
   if (!countryPaths?.length) return;
   for (const countryPath of countryPaths) {
@@ -3736,19 +6315,21 @@ function highlightMapContextItem(item, color = null) {
   for (const countryPath of countryHighlightElsByName.get(countryName) || []) {
     countryPath.classList.add("map-country-highlight-border-context");
   }
-  applyMapCountryColor(countryName, color || item.similarity_color || fallbackMapAccentColor(), { dim: true });
+  applyMapCountryColor(countryName, color || item.similarity_color || fallbackMapAccentColor());
 }
 
 function highlightVariantCountry(item) {
-  const countryName = mapFeatureForItem(item);
+  const countryName = featureKeyForMapItem(item);
   const countryPaths = countryElsByName.get(countryName);
   if (!countryPaths?.length) return;
   const itemLabel = item.selectable_for || `${item.display_title || item.wikipedia_title} (${item.region_name})`;
 
   mapItemsByCountryName.set(countryName, item);
-  const currentNode = nodes.get(currentKey);
+  const currentNode = currentMapNodeForMode();
   const isSelected = isMapItemSelected(item, currentNode);
-  const itemColor = item.similarity_color || nodeMapColor(currentNode);
+  const itemColor = selectableMapItemColor(item);
+  const groupKey = superregionGroupKeyForItem(item);
+  const groupedSuperregion = Boolean(groupKey);
   for (const countryPath of countryPaths) {
     countryPath.__countryName = countryName;
     countryPath.classList.add("map-country-active");
@@ -3756,21 +6337,103 @@ function highlightVariantCountry(item) {
     const title = countryPath.querySelector("title");
     if (title) title.textContent = itemLabel;
   }
-  if (isSelected) {
+  const useSelectedHighlightStyle = !isSelected;
+  if (useSelectedHighlightStyle && !groupedSuperregion) {
     for (const countryPath of countryHighlightElsByName.get(countryName) || []) {
       countryPath.classList.add("map-country-highlight-border-selected");
     }
   }
-  applyMapCountryColor(countryName, itemColor, { dim: isSelected, selected: isSelected });
+  applyMapCountryColor(countryName, itemColor, {
+    dim: useSelectedHighlightStyle,
+    selected: useSelectedHighlightStyle,
+    suppressStroke: groupedSuperregion,
+  });
+  if (groupedSuperregion) {
+    updateSuperregionBorder(groupKey, itemColor, {
+      dim: useSelectedHighlightStyle,
+      selected: useSelectedHighlightStyle,
+    });
+  }
   for (const countryPath of countryHitElsByName.get(countryName) || []) {
     countryPath.__countryName = countryName;
     countryPath.classList.add("map-country-hit-active");
-    countryPath.setAttribute("tabindex", "0");
-    countryPath.setAttribute("role", "button");
-    countryPath.setAttribute("aria-hidden", "false");
-    countryPath.setAttribute("aria-label", item.selectable_for || `${countryName}: ${item.display_title || item.wikipedia_title}`);
+    if (isMapExpanded() && !mapListMode) {
+      countryPath.setAttribute("tabindex", "0");
+      countryPath.setAttribute("role", "button");
+      countryPath.setAttribute("aria-hidden", "false");
+      countryPath.setAttribute("aria-label", item.selectable_for || `${countryName}: ${item.display_title || item.wikipedia_title}`);
+    } else {
+      countryPath.setAttribute("tabindex", "-1");
+      countryPath.setAttribute("aria-hidden", "true");
+    }
     const title = countryPath.querySelector("title");
     if (title) title.textContent = itemLabel;
+  }
+}
+
+function inferredContextCountryFeatures(node) {
+  const features = [];
+  if (activeMapKey !== "world") return features;
+  for (const countryName of inferCountriesForNode(node)) {
+    if (countryElsByName.has(countryName)) features.push(countryName);
+  }
+  return features;
+}
+
+function assignContextMapCountryState(nextStates, countryName, item, color) {
+  if (!countryName || !countryElsByName.has(countryName)) return;
+  const state = mapCountryState(nextStates, countryName);
+  const pair = mapColorPair(color || item?.similarity_color || fallbackMapAccentColor());
+  state.context = true;
+  state.highlightContext = true;
+  state.countryTitle = item?.selectable_for || item?.display_title || item?.region_name || countryName;
+  state.countryFill = pair.fill;
+  state.countryStroke = pair.stroke;
+  state.countryStrokeWidth = "0.85";
+  state.highlightStroke = pair.stroke;
+  state.highlightStrokeWidth = "0.95";
+}
+
+function assignVariantMapCountryState(nextStates, nextItemsByCountry, nextSuperregionStates, item) {
+  const countryName = featureKeyForMapItem(item);
+  if (!countryName || !countryElsByName.has(countryName)) return;
+  const state = mapCountryState(nextStates, countryName);
+  const currentNode = currentMapNodeForMode();
+  const isSelected = isMapItemSelected(item, currentNode);
+  const useSelectedHighlightStyle = !isSelected;
+  const itemColor = selectableMapItemColor(item);
+  const groupKey = superregionGroupKeyForItem(item);
+  const groupedSuperregion = Boolean(groupKey);
+  const pair = mapColorPair(itemColor, { dim: useSelectedHighlightStyle });
+  const itemLabel = item.selectable_for || `${item.display_title || item.wikipedia_title} (${item.region_name})`;
+  const hitInteractive = isMapExpanded() && !mapListMode;
+
+  nextItemsByCountry.set(countryName, item);
+  state.active = true;
+  state.selected = isSelected;
+  state.countryTitle = itemLabel;
+  state.countryFill = pair.fill;
+  state.countryStroke = groupedSuperregion ? "transparent" : pair.stroke;
+  state.countryStrokeWidth = groupedSuperregion ? "0" : (useSelectedHighlightStyle ? "0.95" : "0.85");
+  state.highlightStroke = groupedSuperregion ? "transparent" : pair.stroke;
+  state.highlightStrokeWidth = groupedSuperregion ? "0" : (useSelectedHighlightStyle ? "1.15" : "0.95");
+  state.highlightSelected = useSelectedHighlightStyle && !groupedSuperregion;
+  state.hitActive = true;
+  state.hitTitle = itemLabel;
+  state.hitTabindex = hitInteractive ? "0" : "-1";
+  state.hitRole = hitInteractive ? "button" : "";
+  state.hitAriaHidden = hitInteractive ? "false" : "true";
+  state.hitAriaLabel = hitInteractive ? (item.selectable_for || `${countryName}: ${item.display_title || item.wikipedia_title}`) : "";
+
+  if (groupedSuperregion) {
+    const countries = mapSuperregionCountriesByGroupKey.get(groupKey);
+    nextSuperregionStates.set(groupKey, {
+      countriesKey: countries ? [...countries].sort().join(",") : "",
+      color: itemColor,
+      dim: useSelectedHighlightStyle,
+      hover: false,
+      selected: useSelectedHighlightStyle,
+    });
   }
 }
 
@@ -3779,7 +6442,14 @@ function mapNodeKey(parent, item) {
 }
 
 function mapSourceNodeFor(node) {
-  const parentScopedRoles = new Set(["regional_variant", "regional_style_candidate", "country_region_group", "inferred_country_region_group"]);
+  const parentScopedRoles = new Set([
+    "regional_variant",
+    "regional_style_candidate",
+    "country_region_group",
+    "inferred_country_region_group",
+    "subregion",
+    "territory",
+  ]);
   if (
     node?.isMapChild &&
     node.parentKey &&
@@ -3821,6 +6491,8 @@ function mapMountParentForItem(item, focused) {
     const visibleParent = findVisibleRegionNode(requestedParentRegionId);
     if (visibleParent) return visibleParent;
   }
+
+  if (focused?.isMapChild && focused.key === mapContextOwnerKey) return focused;
 
   const role = item.role || item.match_type || "";
   const peerRegionRoles = new Set(["subregion", "territory"]);
@@ -3945,43 +6617,83 @@ async function selectMapVariant(item) {
   await focusOn(node.key);
 }
 
-function renderMapContext(node, context, selectedNode = node) {
-  const items = context.selectable_regions || context.items || [];
+function renderMapContext(node, context, selectedNode = node, options = {}) {
+  mapContextOwnerKey = node?.key || null;
+  const allItems = context.selectable_regions || context.items || [];
+  const items = selectableMapItems(allItems);
   const highlights = context.context_highlights || [];
-  const parents = context.parent_regions || [];
-  setMapDefaultLabel(mapVariationLabel(selectedNode, items, context));
+  const selectedRegion = context.selected_region || null;
+  setMapListButtonVisible(items.length > 0);
+  const parentInfo = cloudMapParentInfoForContext(context, selectedNode) || mapParentInfoForNode(selectedNode);
+  setMapParentLabel(parentInfo.label, parentInfo.targetKey, { cloud: parentInfo.cloud });
+  setMapDefaultLabel(mapVariationLabel(selectedNode, items, context), mapVariationCount(items));
   setMapWorldButtonVisible((context.active_map || "world") !== "world" && !context.is_world_override);
   mapPoints.innerHTML = "";
-  clearCountryHighlights();
   if (mapList) mapList.innerHTML = "";
+  rebuildMapHoverGroups(items);
+  const fitHighlights = inferredContextCountryFeatures(selectedNode);
+  const inferredHighlights = selectedRegion ? [selectedRegion] : highlights;
+  const selectableFeatures = mapItemFeatureKeys(items);
+  const highlightFeatures = [
+    ...fitHighlights,
+    ...mapItemFeatureKeys(inferredHighlights),
+  ];
+  const autoViewFeatures = selectableFeatures.length ? selectableFeatures : highlightFeatures;
 
-  if (mapListMode) {
-    void renderMapList(items);
-    return;
+  const nextCountryStates = new Map();
+  const nextItemsByCountry = new Map();
+  const nextSuperregionStates = new Map();
+  const contextColor = nodeMapColor(selectedNode);
+  for (const countryName of fitHighlights) {
+    assignContextMapCountryState(nextCountryStates, countryName, null, contextColor);
   }
-
-  highlightContextCountries(selectedNode);
-  for (const item of highlights) {
-    highlightMapContextItem(item, nodeMapColor(selectedNode));
-  }
-  for (const item of parents) {
-    highlightMapContextItem(item, nodeMapColor(selectedNode));
+  for (const item of inferredHighlights) {
+    assignContextMapCountryState(nextCountryStates, featureKeyForMapItem(item), item, contextColor);
   }
   for (const item of items) {
-    highlightVariantCountry(item);
+    assignVariantMapCountryState(nextCountryStates, nextItemsByCountry, nextSuperregionStates, item);
+  }
+  applyMapRenderState(nextCountryStates, nextItemsByCountry, nextSuperregionStates);
+  syncMapCountryInteractivity();
+  if (mapListMode) {
+    setMapAutoViewFeatures(autoViewFeatures, { animate: false });
+    void renderMapList(items, { rootMode: isRootMusicMapContext(context, selectedNode) });
+    return;
+  }
+  if (options.autoView === "silent") {
+    setMapAutoViewFeatures(autoViewFeatures, { animate: false });
+  } else if (options.autoView !== "none") {
+    updateMapAutoView(autoViewFeatures);
   }
 }
 
-async function updateMapCard(node) {
+async function updateMapCard(node, options = {}) {
   if (!mapCard || !node) return;
+  scheduledMapCardUpdateToken++;
   const token = ++mapToken;
-  const mapNode = mapSourceNodeFor(node);
+  const showLoading = options.loading !== false;
+  const clearBeforeLoad = options.clearBeforeLoad !== false;
+  if (showLoading) mapCard.classList.add("map-card-loading");
+  const selectedMapChild = Boolean(node?.genreId && node.isMapChild);
+  let mapNode = selectedMapChild ? node : mapSourceNodeFor(node);
+  setMapParentLabel("");
   setMapDefaultLabel("");
-  mapPoints.innerHTML = "";
-  clearCountryHighlights();
+  if (clearBeforeLoad) {
+    mapPoints.innerHTML = "";
+    clearCountryHighlights();
+  }
 
   try {
     let result = null;
+    if (selectedMapChild) {
+      result = await getMapContext(node);
+      if (token !== mapToken) return;
+      if (!mapContextHasSelectableVariants(result.selectable_regions || result.items)) {
+        result = null;
+        mapNode = mapSourceNodeFor(node);
+      }
+    }
+
     if (node?.genreId && !node.isMapChild && node.parentKey && nodes.has(node.parentKey)) {
       const parent = nodes.get(node.parentKey);
       const parentResult = await getMapContext(parent);
@@ -3995,19 +6707,62 @@ async function updateMapCard(node) {
 
     if (!result) result = await getMapContext(mapNode);
     if (token !== mapToken) return;
-    if (mapDisplayedWorldOverride && (result.active_map || "world") !== "world") {
+    if ((cloudMode || mapDisplayedWorldOverride) && (result.active_map || "world") !== "world") {
       result = worldContextFromSubmap(result, node);
     } else {
       mapDisplayedWorldOverride = false;
     }
+    if (mapNode?.genreId && !mapNode.isMapChild) {
+      const parentRows = await getReachableParents(mapNode.genreId).catch(() => []);
+      if (token !== mapToken) return;
+      mapNode.parentRelationshipRows = parentRows;
+      if (node?.genreId === mapNode.genreId) node.parentRelationshipRows = parentRows;
+    }
     await ensureCountryMap(result.active_map || "world");
     if (token !== mapToken) return;
-    renderMapContext(mapNode, result, node);
+    renderMapContext(mapNode, result, node, { autoView: options.autoView });
+    if (showLoading) mapCard.classList.remove("map-card-loading");
   } catch (err) {
     if (token !== mapToken) return;
     console.error("[wiki-genres] regional map failed", err);
+    if (showLoading) mapCard.classList.remove("map-card-loading");
+    setMapListButtonVisible(false);
     clearCountryHighlights();
+    updateMapAutoView([]);
   }
+}
+
+function cancelScheduledMapCardUpdate() {
+  if (scheduledMapCardUpdateFrame) {
+    cancelAnimationFrame(scheduledMapCardUpdateFrame);
+    scheduledMapCardUpdateFrame = 0;
+  }
+  if (scheduledMapCardUpdateTimer) {
+    clearTimeout(scheduledMapCardUpdateTimer);
+    scheduledMapCardUpdateTimer = 0;
+  }
+  scheduledMapCardUpdateToken++;
+}
+
+function scheduleMapCardUpdate(node, { delay = MAP_DEFERRED_UPDATE_DELAY_MS } = {}) {
+  if (!node) return;
+  cancelScheduledMapCardUpdate();
+  const token = scheduledMapCardUpdateToken;
+  scheduledMapCardUpdateFrame = requestAnimationFrame(() => {
+    scheduledMapCardUpdateFrame = requestAnimationFrame(() => {
+      scheduledMapCardUpdateFrame = 0;
+      if (token !== scheduledMapCardUpdateToken) return;
+      scheduledMapCardUpdateTimer = window.setTimeout(() => {
+        scheduledMapCardUpdateTimer = 0;
+        if (token !== scheduledMapCardUpdateToken) return;
+        void updateMapCard(node, {
+          autoView: "silent",
+          clearBeforeLoad: false,
+          loading: false,
+        });
+      }, Math.max(0, Number(delay) || 0));
+    });
+  });
 }
 
 function placeRoot() {
@@ -5377,16 +8132,24 @@ function defaultSelectedEdgeLength(parent, child, baseLen) {
 }
 
 function selectedTraceMusicDistanceFromMetrics(metrics, baseLen) {
-  if (!metrics?.traceLinkCount) return null;
+  const visualTraceCount = Math.max(metrics?.traceLinkCount || 0, metrics?.visualTraceCount || 0);
+  if (!visualTraceCount) return null;
   const traceNodeCount = [...nodes.values()].filter(node =>
     metrics.traceNodeKeys?.has(node.genreId)
   ).length;
   const precomputedTraceNodeCount = Math.max(metrics.traceNodeCount || 0, traceNodeCount);
   const maxTraceSteps = Math.max(1, metrics.maxTraceSteps || 1);
-  const countBoost = Math.min(baseLen * 1.45, Math.sqrt(metrics.traceLinkCount) * baseLen * 0.24);
+  const maxMusicSteps = Math.max(maxTraceSteps, metrics.maxMusicSteps || 1);
+  const countBoost = Math.min(baseLen * 1.45, Math.sqrt(visualTraceCount) * baseLen * 0.24);
   const depthBoost = Math.min(baseLen * 1.75, Math.max(0, maxTraceSteps - 1) * baseLen * 0.20);
+  const musicDepthFloor = maxMusicSteps > 1
+    ? baseLen * Math.min(7.20, 0.58 + maxMusicSteps * 0.46)
+    : 0;
   const nodeBoost = Math.min(baseLen * 4.20, precomputedTraceNodeCount * baseLen * 0.11);
-  return Math.min(baseLen * 7.20, baseLen * 1.05 + countBoost + depthBoost + nodeBoost);
+  return Math.min(
+    baseLen * 7.20,
+    Math.max(musicDepthFloor, baseLen * 1.05 + countBoost + depthBoost + nodeBoost)
+  );
 }
 
 function relaxFocusedChildClusterHomes(spine) {
@@ -5485,19 +8248,32 @@ function relaxFocusedChildClusterHomes(spine) {
 function precomputeSelectedTraceDistance(selectedNode, rows) {
   if (!selectedNode || selectedNode.key === ROOT_KEY) return;
 
-  const parentTraceRows = rows.filter(row => !shouldSwapParentToChild(row, selectedNode));
+  const visualTraceRows = rows || [];
+  const parentTraceRows = visualTraceRows.filter(row => !shouldSwapParentToChild(row, selectedNode));
   const traceNodeKeys = new Set();
-  for (const row of parentTraceRows) {
+  for (const row of visualTraceRows) {
     for (const genreId of row.path_genre_ids?.slice(0, -1) || []) {
       if (genreId && genreId !== ROOT_KEY) traceNodeKeys.add(genreId);
+    }
+    if (row.parent_genre_id && row.parent_genre_id !== ROOT_KEY) {
+      traceNodeKeys.add(row.parent_genre_id);
     }
   }
 
   const metrics = {
     traceLinkCount: parentTraceRows.length,
+    visualTraceCount: visualTraceRows.length,
     traceNodeCount: traceNodeKeys.size,
     traceNodeKeys,
     maxTraceSteps: Math.max(0, ...parentTraceRows.map(row => row.trace_steps || traceSteps(row))),
+    maxMusicSteps: Math.max(
+      0,
+      ...visualTraceRows.map(row => Math.max(
+        row.trace_steps || traceSteps(row),
+        row.depth_from_music || 0,
+        Number.isFinite(row.parent_depth_from_music) ? row.parent_depth_from_music + 1 : 0
+      ))
+    ),
   };
   selectedNode.rootTraceMetrics = metrics;
   selectedNode.precomputedTraceMusicDistance =
@@ -5651,6 +8427,13 @@ function shouldUseClearingCluster(node, childCount) {
 
 function easeOutCubic(t) {
   return 1 - Math.pow(1 - t, 3);
+}
+
+function easeInOutCubic(t) {
+  const value = clamp(t, 0, 1);
+  return value < 0.5
+    ? 4 * value * value * value
+    : 1 - Math.pow(-2 * value + 2, 3) / 2;
 }
 
 function animatedChildEdgeLength(parent, child, baseLen, target, shouldAnimate) {
@@ -6508,8 +9291,8 @@ function recomputeLayout() {
       const isSpineEdge = spine.has(parent.key) && spine.has(child.key);
       const childHasChildren = child.childCount === null ? true : child.childCount > 0;
       const baseLen = edgeBaseLength();
-      const isTraceChild = Boolean(child.isTraceOnly);
-      const isTracePath = Boolean(e.isTracePath && !isTraceChild);
+      const isTracePath = Boolean(e.isTracePath || child.isTracePathNode);
+      const isTraceChild = Boolean(e.isTraceChild || (child.isTraceOnly && !isTracePath));
       const parentIsActiveAncestor = spine.has(parent.key) && parent.key !== ROOT_KEY;
       const slot = parentIsActiveAncestor && !isSpineEdge && !isTracePath
         ? focusedChildSlot(parent, child, baseLen)
@@ -6578,13 +9361,35 @@ function recomputeLayout() {
   shapeAdditionalParentPaths(edgeBaseLength());
 }
 
+function graphNodeFontWeight(node) {
+  if (node?.key === currentKey) return 700;
+  if (node?.key === ROOT_KEY) return 600;
+  return 500;
+}
+
+function scaledDbTextWidth(node, label, fontSize) {
+  const measuredWidth = positiveMetricValue(node?.textWidth, node?.text_width, node?.width);
+  if (measuredWidth) return measuredWidth * (fontSize / CLOUD_FONT_SIZE);
+  return cloudFallbackTextWidth(label) * (fontSize / CLOUD_FONT_SIZE);
+}
+
+function svgPretextWidth(node, label, fontSize, fontWeight) {
+  return Math.ceil(scaledDbTextWidth(node, label, fontSize));
+}
+
+function pillWidthFromPretext(node, label, fontSize, fontWeight, padX, minWidth, maxWidth) {
+  const textWidth = svgPretextWidth(node, label, fontSize, fontWeight);
+  return Math.min(maxWidth, Math.max(minWidth, textWidth + padX * 2));
+}
+
 function nodeBox(d, extraX = 12, extraY = 8, includeVisualScale = true) {
-  const label = displayLabel(d.label);
+  const label = normalizeLabel(d.label);
   const fontSize = d.key === ROOT_KEY ? 17 : 15;
+  const fontWeight = graphNodeFontWeight(d);
   const scale = includeVisualScale && d.key === currentKey ? CURRENT_NODE_SCALE : 1;
-  const padX = isCompact() ? 10 : 12;
+  const padX = isCompact() ? 12 : 14;
   const padY = isCompact() ? 5 : 6;
-  const w = Math.min(isCompact() ? 210 : 280, Math.max(34, label.length * fontSize * 0.55) + padX * 2);
+  const w = pillWidthFromPretext(d, label, fontSize, fontWeight, padX, 1, Number.POSITIVE_INFINITY);
   const h = fontSize + padY * 2;
   return {
     w: w * scale + extraX,
@@ -7641,13 +10446,60 @@ function graphEdgeKey(edge) {
 }
 
 function renderQuantum() {
-  return 0;
+  const dpr = Number(window.devicePixelRatio) || 1;
+  return 1 / Math.max(1, dpr);
 }
 
 function quantizeRenderCoord(value) {
   const quantum = renderQuantum();
   if (quantum <= 0) return value;
   return Math.round(value / quantum) * quantum;
+}
+
+function graphCoord(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "0";
+  const rounded = Math.round(number * GRAPH_RENDER_COORD_PRECISION) / GRAPH_RENDER_COORD_PRECISION;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
+}
+
+function graphTranslate(x, y) {
+  return `translate(${graphCoord(x)} ${graphCoord(y)})`;
+}
+
+function setGraphAttr(el, name, value) {
+  if (!el) return false;
+  const next = String(value);
+  if (el.getAttribute(name) === next) return false;
+  el.setAttribute(name, next);
+  return true;
+}
+
+function setGraphCoordAttr(el, name, value) {
+  return setGraphAttr(el, name, graphCoord(value));
+}
+
+function edgeNeedsPositionUpdate(edge, line, movedNodeKeys, gradient = null) {
+  if (!line?.hasAttribute?.("x1")) return true;
+  if (gradient && !gradient.hasAttribute("x1")) return true;
+  return movedNodeKeys.has(edge.from) || movedNodeKeys.has(edge.to);
+}
+
+function raiseGraphFocusNodes(currentEl, activeLeafEl) {
+  if (!nodesG) return;
+  if (currentEl && activeLeafEl && currentEl !== activeLeafEl) {
+    if (
+      nodesG.lastElementChild === activeLeafEl &&
+      activeLeafEl.previousElementSibling === currentEl
+    ) {
+      return;
+    }
+    nodesG.appendChild(currentEl);
+    nodesG.appendChild(activeLeafEl);
+    return;
+  }
+  const focusEl = activeLeafEl || currentEl;
+  if (focusEl && nodesG.lastElementChild !== focusEl) nodesG.appendChild(focusEl);
 }
 
 function nodeRenderX(node) {
@@ -8018,9 +10870,18 @@ function isDirectSelectedParent(node, spine, activeTraceParents) {
   );
 }
 
+function isImmediateSelectedParent(node) {
+  if (!node || activeTraceTargetKeys().has(node.key)) return false;
+  return [...activeTraceTargetKeys()]
+    .map(key => nodes.get(key))
+    .filter(Boolean)
+    .some(target => target.parentKey === node.key);
+}
+
 function shouldShowPersistentNodeColor(node, spine, activeTraceParents) {
   if (!node?.color) return false;
   if (node.key === activeLeafKey) return false;
+  if (isDirectSelectedParent(node, spine, activeTraceParents)) return false;
   return (
     node.key === currentKey ||
     (node.parentKey === currentKey && !node.isTrimming && !node.isFaded)
@@ -8065,6 +10926,25 @@ function syncEdgeGradients(spine, activeTraceParents) {
     edgeGradientEls.set(graphEdgeKey(edge), gradient);
     line.style.stroke = `url(#${gradientId})`;
   }
+}
+
+function graphNodeAllowsHoverDetail(node, el = null) {
+  if (!node) return false;
+  const spine = getSpine();
+  const activeTraceParents = activeTraceParentKeys(spine);
+  if (spine.has(node.key) || isBacktraceParentNode(node, spine, activeTraceParents) || isDirectSelectedParent(node, spine, activeTraceParents)) {
+    return !node.isTrimming && node.isRevealed !== false && !el?.classList?.contains("trimming") && !el?.classList?.contains("pending");
+  }
+  if (node.isFaded || node.isTrimming || node.isRevealed === false || Boolean(node.isUnresolved)) return false;
+  if (
+    el?.classList?.contains("faded") ||
+    el?.classList?.contains("pending") ||
+    el?.classList?.contains("trimming") ||
+    el?.classList?.contains("unresolved")
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function selectedGradientEnd(start, end) {
@@ -8126,7 +11006,8 @@ function fullRender() {
     return 0;
   });
   for (const d of renderOrder) {
-    nodesG.appendChild(buildNodeEl(d, spine, activeTraceParents));
+    const nodeEl = buildNodeEl(d, spine, activeTraceParents);
+    nodesG.appendChild(nodeEl);
   }
   renderTick();
 }
@@ -8137,7 +11018,7 @@ function buildNodeEl(d, spine = getSpine(), activeTraceParents = activeTracePare
   const isSpineNode = spine.has(d.key);
   const isBacktraceParent = isBacktraceParentNode(d, spine, activeTraceParents);
   const isRoot = d.key === ROOT_KEY;
-  const label = displayLabel(d.label);
+  const label = normalizeLabel(d.label);
   const fontSize = isRoot ? 17 : 15;
   const { w, h } = nodeBox(d, 0, 0, false);
 
@@ -8151,6 +11032,7 @@ function buildNodeEl(d, spine = getSpine(), activeTraceParents = activeTracePare
   if (isActiveLeaf) classes.push("node-active-leaf");
   if (isSpineNode || isBacktraceParent) classes.push("node-spine");
   if (isDirectSelectedParent(d, spine, activeTraceParents)) classes.push("direct-parent");
+  if (isImmediateSelectedParent(d)) classes.push("immediate-parent");
   if (isRoot) classes.push("node-root");
   if (isCurrent) d.isTrimming = false;
   if (d.isFaded && !isCurrent && !isSpineNode && !isBacktraceParent && !isActiveLeaf) classes.push("faded");
@@ -8158,6 +11040,7 @@ function buildNodeEl(d, spine = getSpine(), activeTraceParents = activeTracePare
   if (!isCurrent && !isSpineNode && !isBacktraceParent && d.isRevealed === false) classes.push("pending");
   if (d.isTrimming) classes.push("trimming");
   if (d.color) classes.push("has-color");
+  if (d.key === activeDetailIndicatorKey()) classes.push("node-detail-preview");
 
   const g = svgEl("g", {
     class: classes.join(" "),
@@ -8182,7 +11065,7 @@ function buildNodeEl(d, spine = getSpine(), activeTraceParents = activeTracePare
   const text = svgEl("text", {
     class: "node-label",
     x: 0,
-    y: 0,
+    y: GRAPH_LABEL_Y,
     "dominant-baseline": "central",
     "text-anchor": "middle",
   });
@@ -8195,8 +11078,17 @@ function buildNodeEl(d, spine = getSpine(), activeTraceParents = activeTracePare
   }
   text.textContent = label;
   inner.appendChild(text);
+  inner.appendChild(svgEl("rect", {
+    class: "node-hit-area",
+    width: w,
+    height: h,
+    rx: h / 2,
+    ry: h / 2,
+    x: -w / 2,
+    y: -h / 2,
+  }));
 
-  g.setAttribute("transform", `translate(${d.x} ${d.y})`);
+  g.setAttribute("transform", graphTranslate(d.x, d.y));
   attachNodeInteraction(g, d);
   nodeEls.set(d.key, g);
   return g;
@@ -8232,32 +11124,35 @@ function renderTick() {
   suppressBacktraceJitter(activeNodes);
   updateRenderPositions(renderNodes);
 
+  const movedNodeKeys = new Set();
   for (const d of renderNodes) {
     const el = nodeEls.get(d.key);
-    if (el) el.setAttribute("transform", `translate(${nodeRenderX(d)} ${nodeRenderY(d)})`);
+    if (el && setGraphAttr(el, "transform", graphTranslate(nodeRenderX(d), nodeRenderY(d)))) {
+      movedNodeKeys.add(d.key);
+    }
   }
   updateTargetButtonVisibility();
   const currentEl = nodeEls.get(currentKey);
-  if (currentEl) nodesG.appendChild(currentEl);
   const activeLeafEl = activeLeafKey ? nodeEls.get(activeLeafKey) : null;
-  if (activeLeafEl) nodesG.appendChild(activeLeafEl);
+  raiseGraphFocusNodes(currentEl, activeLeafEl);
   for (const e of edges) {
     const line = edgeEls.get(graphEdgeKey(e));
     const f = nodes.get(e.from);
     const t = nodes.get(e.to);
     if (!line || !f || !t) continue;
-    const endpoints = edgeEndpoints(f, t);
-    line.setAttribute("x1", endpoints.start.x);
-    line.setAttribute("y1", endpoints.start.y);
-    line.setAttribute("x2", endpoints.end.x);
-    line.setAttribute("y2", endpoints.end.y);
     const gradient = edgeGradientEls.get(graphEdgeKey(e));
+    if (!edgeNeedsPositionUpdate(e, line, movedNodeKeys, gradient)) continue;
+    const endpoints = edgeEndpoints(f, t);
+    setGraphCoordAttr(line, "x1", endpoints.start.x);
+    setGraphCoordAttr(line, "y1", endpoints.start.y);
+    setGraphCoordAttr(line, "x2", endpoints.end.x);
+    setGraphCoordAttr(line, "y2", endpoints.end.y);
     if (gradient) {
       const gradientEnd = selectedGradientEnd(endpoints.start, endpoints.end);
-      gradient.setAttribute("x1", endpoints.start.x);
-      gradient.setAttribute("y1", endpoints.start.y);
-      gradient.setAttribute("x2", gradientEnd.x);
-      gradient.setAttribute("y2", gradientEnd.y);
+      setGraphCoordAttr(gradient, "x1", endpoints.start.x);
+      setGraphCoordAttr(gradient, "y1", endpoints.start.y);
+      setGraphCoordAttr(gradient, "x2", gradientEnd.x);
+      setGraphCoordAttr(gradient, "y2", gradientEnd.y);
     }
   }
 }
@@ -8301,12 +11196,14 @@ function updateClasses() {
     el.classList.toggle("node-active-leaf", isActiveLeaf);
     el.classList.toggle("node-spine", isSpineNode || isBacktraceParent);
     el.classList.toggle("direct-parent", isDirectSelectedParent(d, spine, activeTraceParents));
+    el.classList.toggle("immediate-parent", isImmediateSelectedParent(d));
     el.classList.toggle("node-root", d.key === ROOT_KEY);
     el.classList.toggle("faded", d.isFaded && !isCurrent && !isSpineNode && !isBacktraceParent && !isActiveLeaf);
     el.classList.toggle("unresolved", Boolean(d.isUnresolved));
     el.classList.toggle("pending", !isCurrent && !isSpineNode && !isBacktraceParent && d.isRevealed === false);
     el.classList.toggle("trimming", !isCurrent && d.isTrimming);
     el.classList.toggle("has-color", Boolean(d.color));
+    el.classList.toggle("node-detail-preview", d.key === activeDetailIndicatorKey());
   }
   for (const e of edges) {
     const line = edgeEls.get(graphEdgeKey(e));
@@ -8339,11 +11236,13 @@ function attachNodeInteraction(g, d) {
   let startY = 0;
 
   g.addEventListener("pointerenter", () => {
+    if (!graphNodeAllowsHoverDetail(d, g)) return;
     setHoveredNode(d.key);
     setHoveredMapItemForNode(d);
-    void showHoverCard(d.key);
+    scheduleHoverCard(d.key);
   });
   g.addEventListener("pointerleave", () => {
+    if (!graphNodeAllowsHoverDetail(d, g)) return;
     clearHoveredMapItemForNode(d);
     restoreSelectedCardAfterHover(d.key);
   });
@@ -8356,6 +11255,8 @@ function attachNodeInteraction(g, d) {
     moved = false;
     startX = e.clientX;
     startY = e.clientY;
+    beginManualMovementGesture(e.clientX, e.clientY);
+    cancelScheduledHoverCard(d.key);
     g.setPointerCapture?.(e.pointerId);
 
     const onMove = me => {
@@ -8364,6 +11265,7 @@ function attachNodeInteraction(g, d) {
       const dy = me.clientY - startY;
       if (!moved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) moved = true;
       if (!moved) return;
+      markManualUiMovingAfterGestureThreshold(me.clientX, me.clientY);
       d.fx = (d.x || d.homeX) + dx / viewScale;
       d.fy = (d.y || d.homeY) + dy / viewScale;
       startX = me.clientX;
@@ -8377,6 +11279,7 @@ function attachNodeInteraction(g, d) {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
       dragging = false;
+      clearManualMovementGesture();
       if (moved) {
         if (d.key !== ROOT_KEY) {
           commitManualLengthTarget(d);
@@ -8405,10 +11308,12 @@ function attachNodeInteraction(g, d) {
 }
 
 function writeWorldTransform() {
+  viewScale = clampViewScale(viewScale);
+  clampViewTranslation();
   world.setAttribute("transform", `translate(${viewTx} ${viewTy}) scale(${viewScale})`);
   updateFooterZoom();
   if (cloudMode && cloudData) {
-    updateCloudLodVisibility();
+    updateCloudLodVisibility({ immediate: true });
   } else if (timelineMode && timelineData) {
     if (!timelineViewportFrame) {
       timelineViewportFrame = requestAnimationFrame(() => {
@@ -8417,9 +11322,6 @@ function writeWorldTransform() {
         updateTimelineZoomDetail();
       });
     }
-  } else {
-    updateTimelineYearMarkers();
-    updateTimelineZoomDetail();
   }
   updateTargetButtonVisibility();
 }
@@ -8462,7 +11364,7 @@ function panToCurrent(options = {}) {
 
 function panToGraphNode(node, options = {}) {
   if (!node) return;
-  const targetScale = options.normalizeZoom ? defaultScale() : viewScale;
+  const targetScale = options.normalizeZoom ? graphAutoViewScale(viewScale) : viewScale;
   if (options.holdDetailCard) {
     holdDetailCardDuringLocate = true;
     updateDetailCardVisibility();
@@ -8538,7 +11440,7 @@ function updateTargetButtonVisibility() {
 function panToSelectedCenterTarget(options = {}) {
   const target = selectedCenterTargetPoint();
   if (!target) return;
-  const targetScale = options.normalizeZoom && !cloudMode && !timelineMode ? defaultScale() : viewScale;
+  const targetScale = options.normalizeZoom && !cloudMode && !timelineMode ? graphAutoViewScale(viewScale) : viewScale;
   if (options.holdDetailCard) {
     holdDetailCardDuringLocate = true;
     updateDetailCardVisibility();
@@ -8565,6 +11467,13 @@ function selectedGenreIdFromUrlPath() {
   return pathIds.at(-1) || null;
 }
 
+function selectedGenreIdFromUrlState() {
+  const url = new URL(window.location.href);
+  return (url.searchParams.get("cloud_selected") || "").trim() ||
+    (url.searchParams.get("timeline_selected") || "").trim() ||
+    selectedGenreIdFromUrlPath();
+}
+
 function activeSelectedGenreId() {
   if (cloudMode && cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) return cloudSelectedGenreId;
   if (timelineMode && timelineSelectedGenreId) return timelineSelectedGenreId;
@@ -8572,6 +11481,11 @@ function activeSelectedGenreId() {
   if (!node || node.key === ROOT_KEY || node.genreId === ROOT_KEY) return selectedGenreIdFromUrlPath();
   if (node.genreId) return node.genreId;
   return selectedGenreIdFromUrlPath();
+}
+
+function selectedGenreIdForModeTransfer() {
+  const selected = activeSelectedGenreId() || selectedGenreIdFromUrlState();
+  return selected && selected !== ROOT_KEY ? selected : null;
 }
 
 function startFollow() {
@@ -8592,11 +11506,11 @@ function startFollow() {
     updateLastPointerPosition(e.clientX, e.clientY);
     window.getSelection?.()?.removeAllRanges?.();
     markGraphMoving();
-    markManualUiMoving();
+    beginManualMovementGesture(e.clientX, e.clientY);
+    if (cloudMode) clearCloudHover();
     stopPanInertia();
     followMode = false;
     if (panAnimTimer) clearInterval(panAnimTimer);
-    panTarget.setPointerCapture?.(e.pointerId);
     panState = {
       sx: e.clientX,
       sy: e.clientY,
@@ -8607,7 +11521,13 @@ function startFollow() {
       lastT: Date.now(),
       vx: 0,
       vy: 0,
+      moved: false,
     };
+    try {
+      panTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      // Synthetic and cancelled pointer streams can fail capture; panning still works.
+    }
     svg.classList.add("panning");
     document.body.classList.add("is-panning-canvas");
   });
@@ -8620,6 +11540,10 @@ function startFollow() {
     viewTx = panState.ttx + (e.clientX - panState.sx);
     viewTy = panState.tty + (e.clientY - panState.sy);
     const now = Date.now();
+    if (Math.hypot(e.clientX - panState.sx, e.clientY - panState.sy) > 4) {
+      panState.moved = true;
+      if (cloudMode) clearCloudHover();
+    }
     const dt = Math.max(1, now - panState.lastT);
     const ivx = (e.clientX - panState.lastX) / dt;
     const ivy = (e.clientY - panState.lastY) / dt;
@@ -8630,20 +11554,40 @@ function startFollow() {
     panState.lastT = now;
     writeWorldTransform();
     markGraphMoving();
-    markManualUiMoving();
-    if (cloudMode) scheduleCloudFetch();
+    markManualUiMovingAfterGestureThreshold(e.clientX, e.clientY);
     if (timelineMode) markTimelineInteracting();
   });
 
   const endPan = e => {
     if (!panState) return;
-    panTarget.releasePointerCapture?.(e.pointerId);
-    const { vx, vy, lastT } = panState;
+    try {
+      panTarget.releasePointerCapture?.(e.pointerId);
+    } catch {
+      // Ignore stale pointer capture during cancelled or synthetic pointer streams.
+    }
+    const { vx, vy, lastT, moved } = panState;
     const idle = Date.now() - lastT;
     panState = null;
+    clearManualMovementGesture();
     svg.classList.remove("panning");
     document.body.classList.remove("is-panning-canvas");
     window.getSelection?.()?.removeAllRanges?.();
+    if (cloudMode && moved) {
+      scheduleCloudClickEnable();
+    }
+    if (cloudMode && !moved && cloudCanClickNodes()) {
+      if (cloudSelectedMarkerHit(e.clientX, e.clientY)) {
+        focusCloudSelectedMarker();
+        scheduleGraphStill();
+        return;
+      }
+      const hitNode = cloudCanvasHitTest(e.clientX, e.clientY);
+      if (hitNode?.id) {
+        void openCloudGenre(hitNode.id);
+        scheduleGraphStill();
+        return;
+      }
+    }
     if (prefersReducedMotion() || idle > 80 || (Math.abs(vx) < 0.05 && Math.abs(vy) < 0.05)) {
       scheduleGraphStill();
       return;
@@ -8657,8 +11601,6 @@ function startFollow() {
       cvy *= 0.92;
       writeWorldTransform();
       markDetailCardMoving(520);
-      markManualUiMoving(520);
-      if (cloudMode) scheduleCloudFetch();
       if (timelineMode) markTimelineInteracting();
       if (Math.abs(cvx) < 0.1 && Math.abs(cvy) < 0.1) {
         stopPanInertia();
@@ -8672,8 +11614,24 @@ function startFollow() {
   window.addEventListener("blur", () => {
     if (!panState) return;
     panState = null;
+    clearManualMovementGesture();
     svg.classList.remove("panning");
     document.body.classList.remove("is-panning-canvas");
+    if (cloudMode) {
+      scheduleCloudClickEnable();
+      syncCloudClickAffordance();
+    }
+  });
+
+  panTarget.addEventListener("pointermove", e => {
+    if (panState || !cloudMode) return;
+    updateLastPointerPosition(e.clientX, e.clientY);
+    updateCloudHoverFromPoint(e.clientX, e.clientY);
+  });
+
+  panTarget.addEventListener("pointerleave", () => {
+    if (!cloudMode || panState) return;
+    clearCloudHover();
   });
 }
 
@@ -8681,7 +11639,6 @@ svg.addEventListener("wheel", e => {
   e.preventDefault();
   updateLastPointerPosition(e.clientX, e.clientY);
   markGraphMoving();
-  markManualUiMoving();
   stopPanInertia();
   followMode = false;
   if (panAnimTimer) clearInterval(panAnimTimer);
@@ -8692,11 +11649,11 @@ svg.addEventListener("wheel", e => {
     !e.ctrlKey &&
     (Math.abs(e.deltaX) > 0 || Math.abs(e.deltaY) < 60);
 
+  markManualUiMovingAfterWheelThreshold(e);
   if (looksLikeTrackpadPan) {
     viewTx -= e.deltaX * TRACKPAD_PAN_SPEED;
     viewTy -= e.deltaY * TRACKPAD_PAN_SPEED;
     writeWorldTransform();
-    if (cloudMode) scheduleCloudFetch();
     if (timelineMode) markTimelineInteracting();
     scheduleGraphStill();
     return;
@@ -8710,11 +11667,10 @@ svg.addEventListener("wheel", e => {
   const factor = e.ctrlKey
     ? Math.max(0.82, Math.min(1.22, Math.exp(-e.deltaY * TRACKPAD_ZOOM_SPEED)))
     : (e.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP);
-  viewScale = Math.max(MIN_VIEW_SCALE, Math.min(MAX_VIEW_SCALE, viewScale * factor));
+  viewScale = clampViewScale(viewScale * factor);
   viewTx = mx - wx * viewScale;
   viewTy = my - wy * viewScale;
   writeWorldTransform();
-  if (cloudMode) scheduleCloudFetch();
   if (timelineMode) markTimelineInteracting();
   scheduleGraphStill();
 }, { passive: false });
@@ -8790,11 +11746,14 @@ function updateUrlState(options = {}) {
     if (timelineSelectedGenreId) url.searchParams.set("timeline_selected", timelineSelectedGenreId);
     else url.searchParams.delete("timeline_selected");
     url.searchParams.delete("cloud_root");
+    url.searchParams.delete("cloud_region");
     url.searchParams.delete("cloud_selected");
   } else if (cloudMode) {
     url.searchParams.set("mode", "cloud");
     if (cloudRootGenreId) url.searchParams.set("cloud_root", cloudRootGenreId);
     else url.searchParams.delete("cloud_root");
+    if (cloudRegionId) url.searchParams.set("cloud_region", cloudRegionId);
+    else url.searchParams.delete("cloud_region");
     if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) url.searchParams.set("cloud_selected", cloudSelectedGenreId);
     else url.searchParams.delete("cloud_selected");
     url.searchParams.delete("timeline_selected");
@@ -8802,10 +11761,12 @@ function updateUrlState(options = {}) {
     url.searchParams.delete("mode");
     url.searchParams.delete("timeline_selected");
     url.searchParams.delete("cloud_root");
+    url.searchParams.delete("cloud_region");
     url.searchParams.delete("cloud_selected");
   }
   if (options.push) history.pushState(null, "", url);
   else history.replaceState(null, "", url);
+  writeExplorerSelectionState(url);
   recordAppHistory(url.href, { push: Boolean(options.push) });
 }
 
@@ -8848,6 +11809,26 @@ function selectedCloudNode() {
   return cloudNode ? cloudNodeFromPayload(cloudNode) : null;
 }
 
+function currentMapNodeForMode() {
+  if (cloudMode) {
+    if (!cloudSelectedGenreId || cloudSelectedGenreId === ROOT_KEY) {
+      return nodes.get(ROOT_KEY) || null;
+    }
+    return selectedCloudNode() || {
+      key: `cloud-${cloudSelectedGenreId}`,
+      id: cloudSelectedGenreId,
+      genreId: cloudSelectedGenreId,
+      label: "",
+      title: "",
+      isUnresolved: false,
+    };
+  }
+  if (timelineMode) {
+    return selectedTimelineNode() || nodes.get(currentKey) || nodes.get(ROOT_KEY) || null;
+  }
+  return nodes.get(currentKey) || nodes.get(ROOT_KEY) || null;
+}
+
 function cloudNodeFromPayload(node) {
   return {
     key: `cloud-${node.id}`,
@@ -8868,6 +11849,7 @@ function cloudNodeFromPayload(node) {
     categories: [],
     youtubeItems: [],
     youtubeUrls: [],
+    selected_distance: Number.isFinite(Number(node.selected_distance)) ? Number(node.selected_distance) : null,
     isDetailLoaded: node.id === ROOT_KEY,
     isUnresolved: false,
   };
@@ -8883,13 +11865,113 @@ function cloudStableUnit(value) {
   return ((hash >>> 0) % 100000) / 100000;
 }
 
+function cloudFallbackTextWidth(label) {
+  const text = String(label || "");
+  let width = 0;
+  for (const char of text) {
+    if (char === " ") width += 0.32;
+    else if ("ijlI!|.,'`:/;[](){}".includes(char)) width += 0.34;
+    else if ("rtf-".includes(char)) width += 0.42;
+    else if ("MW@#%&".includes(char)) width += 0.86;
+    else if (/[\u3000-\u9FFF\uAC00-\uD7AF\u3040-\u30FF]/u.test(char)) width += 0.98;
+    else if (/[A-Z]/.test(char)) width += 0.68;
+    else if (/[0-9]/.test(char)) width += 0.56;
+    else width += 0.56;
+  }
+  return Math.ceil(Math.max(22, width * CLOUD_FONT_SIZE) + 0.75);
+}
+
+function cloudFallbackTextHeight() {
+  return Math.ceil(CLOUD_FONT_SIZE * 1.25 + 0.25);
+}
+
+function cloudRenderMetrics(node) {
+  if (!node) {
+    const textWidth = cloudFallbackTextWidth("");
+    const textHeight = cloudFallbackTextHeight();
+    return {
+      textWidth,
+      textHeight,
+      boxPadX: CLOUD_LABEL_PAD_PX,
+      boxPadY: CLOUD_LABEL_PAD_Y_PX,
+      boxWidth: textWidth + CLOUD_LABEL_PAD_PX * 2,
+      selectedPillWidth: textWidth + (CLOUD_LABEL_PAD_PX + CLOUD_SELECTED_LABEL_EXTRA_PAD_PX) * 2,
+      boxHeight: textHeight + CLOUD_LABEL_PAD_Y_PX * 2,
+    };
+  }
+  if (node.__cloudRenderMetrics) return node.__cloudRenderMetrics;
+  const label = node.label || node.wikipedia_title;
+  const textWidth = positiveMetricValue(node.text_width, node.textWidth, node.width) ||
+    cloudFallbackTextWidth(label);
+  const textHeight = positiveMetricValue(node.text_height, node.textHeight, node.height) ||
+    cloudFallbackTextHeight();
+  const boxPadX = positiveMetricValue(node.box_pad_x, node.boxPadX) || CLOUD_LABEL_PAD_PX;
+  const boxPadY = positiveMetricValue(node.box_pad_y, node.boxPadY) || CLOUD_LABEL_PAD_Y_PX;
+  const metrics = {
+    textWidth,
+    textHeight,
+    boxPadX,
+    boxPadY,
+    boxWidth: positiveMetricValue(node.box_width, node.boxWidth) || Math.ceil(textWidth + boxPadX * 2),
+    selectedPillWidth: Math.ceil(textWidth + (boxPadX + CLOUD_SELECTED_LABEL_EXTRA_PAD_PX) * 2),
+    boxHeight: positiveMetricValue(node.box_height, node.boxHeight) || Math.ceil(textHeight + boxPadY * 2),
+  };
+  try {
+    Object.defineProperty(node, "__cloudRenderMetrics", {
+      value: metrics,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    node.__cloudRenderMetrics = metrics;
+  }
+  return metrics;
+}
+
+function cloudTextWidth(node) {
+  return cloudRenderMetrics(node).textWidth;
+}
+
+function cloudTextHeight(node) {
+  return cloudRenderMetrics(node).textHeight;
+}
+
+function cloudBoxPadX(node) {
+  return cloudRenderMetrics(node).boxPadX;
+}
+
+function cloudBoxPadY(node) {
+  return cloudRenderMetrics(node).boxPadY;
+}
+
+function cloudPretextBoxWidth(node, extraPadX = 0) {
+  const metrics = cloudRenderMetrics(node);
+  return Math.ceil(metrics.textWidth + (metrics.boxPadX + extraPadX) * 2);
+}
+
+function cloudBoxWidth(node) {
+  return cloudRenderMetrics(node).boxWidth;
+}
+
+function cloudSelectedPillWidth(node) {
+  return cloudRenderMetrics(node).selectedPillWidth;
+}
+
+function cloudRenderedBoxWidth(node) {
+  return node?.id === cloudSelectedGenreId ? cloudSelectedPillWidth(node) : cloudBoxWidth(node);
+}
+
+function cloudBoxHeight(node) {
+  return cloudRenderMetrics(node).boxHeight;
+}
+
 function cloudBoundsForNodes(nodes = []) {
   if (!nodes.length) return null;
   return {
-    min_x: Math.min(...nodes.map(node => node.x - node.width / 2)),
-    max_x: Math.max(...nodes.map(node => node.x + node.width / 2)),
-    min_y: Math.min(...nodes.map(node => node.y - node.height / 2)),
-    max_y: Math.max(...nodes.map(node => node.y + node.height / 2)),
+    min_x: Math.min(...nodes.map(node => node.x - cloudBoxWidth(node) / 2)),
+    max_x: Math.max(...nodes.map(node => node.x + cloudBoxWidth(node) / 2)),
+    min_y: Math.min(...nodes.map(node => node.y - cloudBoxHeight(node) / 2)),
+    max_y: Math.max(...nodes.map(node => node.y + cloudBoxHeight(node) / 2)),
   };
 }
 
@@ -8897,19 +11979,35 @@ function normalizedCloudData(data) {
   const rawNodes = Array.isArray(data?.nodes) ? data.nodes : [];
   const hasCoordinates = rawNodes.every(node => Number.isFinite(Number(node.x)) && Number.isFinite(Number(node.y)));
   if (hasCoordinates) {
-    const nodesWithSize = rawNodes.map(node => ({
-      ...node,
-      x: Number(node.x),
-      y: Number(node.y),
-      width: Number(node.width) || Math.max(22, String(node.label || node.wikipedia_title || "").length * CLOUD_FONT_SIZE * 0.58),
-      height: Number(node.height) || CLOUD_FONT_SIZE * 1.25,
-      lod_score: Number(node.lod_score) || 0,
-      lod_rank: Number.isFinite(Number(node.lod_rank)) ? Number(node.lod_rank) : 0,
-      lod_tier: Number.isFinite(Number(node.lod_tier)) ? Number(node.lod_tier) : 5,
-      min_visible_scale: Number.isFinite(Number(node.min_visible_scale)) ? Number(node.min_visible_scale) : 2,
-      show_scale: Number.isFinite(Number(node.show_scale)) ? Number(node.show_scale) : Number(node.min_visible_scale) || 2,
-      hide_scale: Number.isFinite(Number(node.hide_scale)) ? Number(node.hide_scale) : (Number(node.show_scale) || Number(node.min_visible_scale) || 2) * 0.92,
-    }));
+    const nodesWithSize = rawNodes.map(node => {
+      const label = node.label || labelFromTitle(node.wikipedia_title);
+      const textWidth = Number(node.text_width) || Number(node.width) || cloudFallbackTextWidth(label);
+      const textHeight = Number(node.text_height) || Number(node.height) || cloudFallbackTextHeight();
+      const boxPadX = Number(node.box_pad_x) || CLOUD_LABEL_PAD_PX;
+      const boxPadY = Number(node.box_pad_y) || CLOUD_LABEL_PAD_Y_PX;
+      return {
+        ...node,
+        label,
+        x: Number(node.x),
+        y: Number(node.y),
+        width: textWidth,
+        height: textHeight,
+        text_width: textWidth,
+        text_height: textHeight,
+        box_width: Number(node.box_width) || textWidth + boxPadX * 2,
+        box_height: Number(node.box_height) || textHeight + boxPadY * 2,
+        box_pad_x: boxPadX,
+        box_pad_y: boxPadY,
+        lod_score: Number(node.lod_score) || 0,
+        lod_rank: Number.isFinite(Number(node.lod_rank)) ? Number(node.lod_rank) : 0,
+        lod_tier: Number.isFinite(Number(node.lod_tier)) ? Number(node.lod_tier) : 5,
+        min_visible_scale: Number.isFinite(Number(node.min_visible_scale)) ? Number(node.min_visible_scale) : 2,
+        show_scale: Number.isFinite(Number(node.show_scale)) ? Number(node.show_scale) : Number(node.min_visible_scale) || 2,
+        hide_scale: Number.isFinite(Number(node.hide_scale)) ? Number(node.hide_scale) : (Number(node.show_scale) || Number(node.min_visible_scale) || 2) * 0.92,
+        selected_distance: Number.isFinite(Number(node.selected_distance)) ? Number(node.selected_distance) : null,
+        selected_focus_score: Number.isFinite(Number(node.selected_focus_score)) ? Number(node.selected_focus_score) : null,
+      };
+    });
     return {
       ...data,
       nodes: nodesWithSize,
@@ -8944,8 +12042,16 @@ function normalizedCloudData(data) {
       priority,
       x: Math.cos(angle) * radius * 1.18,
       y: Math.sin(angle) * radius * 0.86,
-      width: Math.max(22, String(label).length * CLOUD_FONT_SIZE * 0.58),
-      height: CLOUD_FONT_SIZE * 1.25,
+      width: cloudFallbackTextWidth(label),
+      height: cloudFallbackTextHeight(),
+      text_width: cloudFallbackTextWidth(label),
+      text_height: cloudFallbackTextHeight(),
+      box_width: cloudFallbackTextWidth(label) + CLOUD_LABEL_PAD_PX * 2,
+      box_height: cloudFallbackTextHeight() + CLOUD_LABEL_PAD_Y_PX * 2,
+      box_pad_x: CLOUD_LABEL_PAD_PX,
+      box_pad_y: CLOUD_LABEL_PAD_Y_PX,
+      selected_distance: Number.isFinite(Number(node.selected_distance)) ? Number(node.selected_distance) : null,
+      selected_focus_score: Number.isFinite(Number(node.selected_focus_score)) ? Number(node.selected_focus_score) : null,
     };
   });
   return {
@@ -8973,16 +12079,122 @@ function createCloudScene(stats = {}) {
   return {
     nodesById: new Map(),
     layersByTier: new Map(),
+    layerIdsByScale: new Map(),
+    layerSpatialByScale: new Map(),
+    layerTilesByScale: new Map(),
+    layerScales: [],
     loadedLayers: new Set(),
+    atlasSignature: "",
+    pendingAtlasSignature: "",
+    awaitingScaleLayer: false,
     stats: { ...stats },
     complete: false,
   };
 }
 
+function cloudAtlasSignature() {
+  return [
+    cloudRootGenreId || "",
+    cloudRegionId || "",
+    cloudSelectedGenreId || "",
+    "atlas",
+  ].join("|");
+}
+
+function prepareCloudSceneForReload(options = {}) {
+  const atlasSignature = options.atlasSignature || cloudAtlasSignature();
+  if (!options.preserveView || !cloudScene?.nodesById?.size) {
+    resetCloudScene();
+    if (cloudScene) cloudScene.atlasSignature = atlasSignature;
+    return;
+  }
+  if (cloudScene.atlasSignature && cloudScene.atlasSignature !== atlasSignature) {
+    resetCloudScaleLayersForSignature(atlasSignature);
+  } else if (!cloudScene.atlasSignature) {
+    cloudScene.atlasSignature = atlasSignature;
+  }
+  cloudScene.complete = false;
+  cloudScene.stats = {
+    ...(cloudScene.stats || {}),
+    selected_genre_id: cloudSelectedGenreId || null,
+  };
+}
+
+function resetCloudScaleLayersForSignature(atlasSignature = cloudAtlasSignature()) {
+  if (!cloudScene) return;
+  if (cloudScene.atlasSignature === atlasSignature && !cloudScene.pendingAtlasSignature) return;
+  cloudScene.pendingAtlasSignature = atlasSignature;
+  cloudScene.complete = false;
+}
+
+function activateCloudScaleLayersForSignature(atlasSignature = cloudAtlasSignature()) {
+  if (!cloudScene) return;
+  if (cloudScene.atlasSignature === atlasSignature && !cloudScene.pendingAtlasSignature) return;
+  cloudScene.layersByTier = new Map();
+  cloudScene.layerIdsByScale = new Map();
+  cloudScene.layerSpatialByScale = new Map();
+  cloudScene.layerTilesByScale = new Map();
+  cloudScene.layerScales = [];
+  cloudScene.loadedLayers = new Set();
+  cloudScene.atlasSignature = atlasSignature;
+  cloudScene.pendingAtlasSignature = "";
+  cloudScene.awaitingScaleLayer = false;
+  cloudRenderedLayerScale = null;
+  cloudRenderedWindowSignature = "";
+}
+
 function resetCloudScene(stats = {}) {
   cloudScene = createCloudScene(stats);
   cloudVisibleNodeIds = new Set();
+  cloudTextEls = new Map();
+  cloudSceneDomPrepared = false;
+  cloudRenderedLayerScale = null;
+  cloudRenderedTextScale = 0;
+  cloudRenderedWindowSignature = "";
   cloudNodeById = cloudScene.nodesById;
+		    cloudCanvasNodes = [];
+			    cloudCanvasHitNodes = [];
+				    cloudCanvasVisibleIds = new Set();
+				    cloudCanvasAlphaById = new Map();
+				    cloudRenderSnapshot = null;
+				    cloudRenderTransition = null;
+				    cloudPresentationById = new Map();
+				    cloudPresentationLastAt = 0;
+				    cloudPresentationTargetSignature = "";
+				    cloudSelectedLabelAlphaById = new Map();
+			    cloudHoverUnderlineAlphaById = new Map();
+			    cloudRelationshipAlphaById = new Map();
+  cancelCloudFadeFrame();
+  cloudBackgroundCache = null;
+  cloudBackgroundBuildSignature = "";
+  window.clearTimeout(cloudBackgroundBuildTimer);
+  cloudBackgroundBuildTimer = 0;
+  cloudLabelSpriteCache = new Map();
+  cloudHoveredNodeId = null;
+  cloudSelectedMarker = null;
+  clearCloudSelectedMarkerAnimation();
+  cloudClickEnabled = true;
+  cloudClickEnableAt = 0;
+  window.clearTimeout(cloudClickEnableTimer);
+  cloudClickEnableTimer = 0;
+  syncCloudClickAffordance();
+	    if (cloudCanvasFadeFrame) {
+	      cancelAnimationFrame(cloudCanvasFadeFrame);
+	      cloudCanvasFadeFrame = 0;
+	    }
+		    if (cloudSelectedLabelFadeFrame) {
+		      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
+		      cloudSelectedLabelFadeFrame = 0;
+		    }
+		    if (cloudHoverUnderlineFadeFrame) {
+		      cancelAnimationFrame(cloudHoverUnderlineFadeFrame);
+		      cloudHoverUnderlineFadeFrame = 0;
+		    }
+		    if (cloudRelationshipFadeFrame) {
+		      cancelAnimationFrame(cloudRelationshipFadeFrame);
+		      cloudRelationshipFadeFrame = 0;
+		    }
+  scheduleCloudCanvasRender();
   cloudData = { nodes: [], stats: cloudScene.stats };
 }
 
@@ -8998,9 +12210,9 @@ function cloudViewportWorldBounds(marginPx = 160) {
 }
 
 function cloudNodeIntersectsViewport(node, bounds = cloudViewportWorldBounds()) {
-  if (node.id === cloudSelectedGenreId || node.id === ROOT_KEY) return true;
-  const width = Number(node.box_width) || Number(node.width) || 0;
-  const height = Number(node.box_height) || Number(node.height) || CLOUD_FONT_SIZE * 1.25;
+  if (node.id === ROOT_KEY) return true;
+  const width = cloudBoxWidth(node);
+  const height = cloudBoxHeight(node);
   return (
     node.x + width / 2 >= bounds.left &&
     node.x - width / 2 <= bounds.right &&
@@ -9009,31 +12221,79 @@ function cloudNodeIntersectsViewport(node, bounds = cloudViewportWorldBounds()) 
   );
 }
 
+function cloudNodeScreenIntersectsViewport(node, marginPx = 160) {
+  if (node.id === ROOT_KEY) return true;
+  const rect = cloudNodeScreenRect(node);
+  return (
+    rect.right >= -marginPx &&
+    rect.left <= vw() + marginPx &&
+    rect.bottom >= -marginPx &&
+    rect.top <= vh() + marginPx
+  );
+}
+
+function cloudLodBaselineScale(bounds = cloudStatsBounds(cloudData) || cloudBounds) {
+  if (!bounds) return 1;
+  const width = Math.max(1, Number(bounds.maxX) - Number(bounds.minX));
+  const height = Math.max(1, Number(bounds.maxY) - Number(bounds.minY));
+  const padding = isCompact() ? 28 : 48;
+  const fitWidth = Math.max(220, vw() - padding * 2);
+  const fitHeight = Math.max(220, vh() - padding * 2);
+  return clamp(
+    Math.min(fitWidth / width, fitHeight / height, 1),
+    MIN_VIEW_SCALE,
+    MAX_VIEW_SCALE
+  );
+}
+
+function cloudEffectiveLodScale() {
+  const baseline = Math.max(0.001, cloudLodBaselineScale());
+  return Math.max(0.001, viewScale / baseline);
+}
+
 function cloudNodePassesLod(node, wasVisible = false) {
-  if (node.id === cloudSelectedGenreId || node.id === ROOT_KEY) return true;
+  if (node.id === ROOT_KEY) return true;
   const showScale = Number.isFinite(Number(node.show_scale))
     ? Number(node.show_scale)
     : Number.isFinite(Number(node.min_visible_scale))
       ? Number(node.min_visible_scale)
       : 2;
   const hideScale = Number.isFinite(Number(node.hide_scale)) ? Number(node.hide_scale) : showScale * 0.92;
-  return viewScale >= (wasVisible ? hideScale : showScale);
+  const effectiveScale = cloudEffectiveLodScale();
+  return effectiveScale >= (wasVisible ? hideScale : showScale);
 }
 
-function cloudNodeScreenRect(node) {
+function cloudNodeScreenRect(node, options = {}) {
+  const insetPx = Math.max(0, Number(options.insetPx) || 0);
   const scale = Math.max(0.001, viewScale);
   const x = Number(node.x) * scale + viewTx;
   const y = Number(node.y) * scale + viewTy;
-  const width = Number(node.box_width) ||
-    ((Number(node.width) || Math.max(22, String(node.label || node.wikipedia_title || "").length * CLOUD_FONT_SIZE * 0.58)) +
-      CLOUD_LABEL_PAD_PX * 2);
-  const height = Number(node.box_height) ||
-    ((Number(node.height) || CLOUD_FONT_SIZE * 1.25) + CLOUD_LABEL_PAD_PX * 2);
+  const width = cloudBoxWidth(node);
+  const height = cloudBoxHeight(node);
+  const halfWidth = Math.max(0, width / 2 - insetPx);
+  const halfHeight = Math.max(0, height / 2 - insetPx);
   return {
-    left: x - width / 2,
-    right: x + width / 2,
-    top: y - height / 2,
-    bottom: y + height / 2,
+    left: x - halfWidth,
+    right: x + halfWidth,
+    top: y - halfHeight,
+    bottom: y + halfHeight,
+  };
+}
+
+function cloudNodeLodScreenRect(node, options = {}) {
+  const insetPx = Math.max(0, Number(options.insetPx) || 0);
+  const scale = Math.max(0.001, viewScale);
+  const x = Number(node.x) * scale + viewTx;
+  const y = Number(node.y) * scale + viewTy;
+  const width = cloudRenderedBoxWidth(node);
+  const height = cloudBoxHeight(node);
+  const halfWidth = Math.max(0, width / 2 - insetPx);
+  const halfHeight = Math.max(0, height / 2 - insetPx);
+  return {
+    left: x - halfWidth,
+    right: x + halfWidth,
+    top: y - halfHeight,
+    bottom: y + halfHeight,
   };
 }
 
@@ -9063,22 +12323,1988 @@ function cloudRectOverlapsOccupied(rect, occupiedBuckets) {
     for (const existing of occupiedBuckets.get(key) || []) {
       if (tested.has(existing)) continue;
       tested.add(existing);
-      if (cloudScreenRectsOverlap(rect, existing)) return true;
+      if (cloudScreenRectsOverlap(rect, existing.rect)) return existing;
     }
   }
+  return null;
+}
+
+function cloudOccupyRect(rect, occupiedBuckets, node) {
+  const entry = { rect, node };
+  for (const key of cloudRectCollisionBuckets(rect)) {
+    if (!occupiedBuckets.has(key)) occupiedBuckets.set(key, []);
+    occupiedBuckets.get(key).push(entry);
+  }
+}
+
+function cloudSortedLayerScales(scene = cloudScene) {
+  if (!scene) return [];
+  if (scene.layerScales?.length) return scene.layerScales;
+  const scales = Array.from(scene.layerIdsByScale?.keys?.() || [])
+    .map(scale => Number(scale))
+    .filter(scale => Number.isFinite(scale))
+    .sort((a, b) => a - b);
+  scene.layerScales = scales;
+  return scales;
+}
+
+function cloudActiveLayerScale(scene = cloudScene) {
+  const scales = cloudSortedLayerScales(scene);
+  if (!scales.length) return null;
+  const current = clampViewScale(viewScale);
+  let active = scales[0];
+  for (const scale of scales) {
+    if (scale <= current + 0.0001) active = scale;
+    else break;
+  }
+  return active;
+}
+
+function cloudActiveLayerCaughtUp(scene = cloudScene) {
+  if (!scene?.layerIdsByScale?.size) return false;
+  const activeScale = cloudActiveLayerScale(scene);
+  if (activeScale == null) return false;
+  return activeScale >= clampViewScale(viewScale) - CLOUD_LAYER_READY_EPSILON;
+}
+
+function cloudActiveLayerIds(scene = cloudScene, activeScale = null) {
+  if (scene?.awaitingScaleLayer && !scene?.layerIdsByScale?.size) return new Set();
+  if (!scene?.layerIdsByScale?.size) {
+    const ids = Array.from(scene?.nodesById?.keys?.() || []);
+    return new Set(scene?.complete ? ids : ids.slice(0, CLOUD_CATALOG_PREVIEW_NODE_LIMIT));
+  }
+  let scale = Number.isFinite(Number(activeScale)) ? Number(activeScale) : cloudActiveLayerScale(scene);
+  if (scale == null) return new Set();
+  let ids = scene.layerIdsByScale.get(scale);
+  if (!ids?.size) {
+    const scales = cloudSortedLayerScales(scene).filter(scale => scene.layerIdsByScale.get(scale)?.size);
+    scale = scales.length ? scales[scales.length - 1] : null;
+    ids = scale == null ? null : scene.layerIdsByScale.get(scale);
+  }
+  return ids || new Set();
+}
+
+function cloudSpatialKey(x, y, cellSize = CLOUD_SPATIAL_CELL_PX) {
+  return `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
+}
+
+function cloudLayerSpatialIndex(scene = cloudScene, scale = cloudActiveLayerScale(scene)) {
+  if (!scene || scale == null) return null;
+  const cacheKey = Number(scale);
+  const cached = scene.layerSpatialByScale?.get(cacheKey);
+  if (cached) return cached;
+  const layerIds = cloudActiveLayerIds(scene, cacheKey);
+  const cells = new Map();
+  for (const nodeId of layerIds) {
+    const node = scene.nodesById.get(nodeId);
+    if (!node) continue;
+    const x = Number(node.x);
+    const y = Number(node.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const key = cloudSpatialKey(x, y);
+    if (!cells.has(key)) cells.set(key, []);
+    cells.get(key).push(String(nodeId));
+  }
+  const index = { scale: cacheKey, cells, size: layerIds.size };
+  scene.layerSpatialByScale?.set(cacheKey, index);
+  return index;
+}
+
+function cloudViewportCandidateIds(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const layerIds = cloudActiveLayerIds(scene, activeScale);
+  const index = cloudLayerSpatialIndex(scene, activeScale);
+  if (!index?.cells?.size) return new Set(layerIds);
+  const bounds = cloudViewportWorldBounds(CLOUD_DOM_WINDOW_MARGIN_PX + 220);
+  const cellSize = CLOUD_SPATIAL_CELL_PX;
+  const ids = new Set();
+  const left = Math.floor(bounds.left / cellSize);
+  const right = Math.floor(bounds.right / cellSize);
+  const top = Math.floor(bounds.top / cellSize);
+  const bottom = Math.floor(bounds.bottom / cellSize);
+  for (let x = left; x <= right; x += 1) {
+    for (let y = top; y <= bottom; y += 1) {
+      for (const nodeId of index.cells.get(`${x}:${y}`) || []) ids.add(nodeId);
+    }
+  }
+  return ids;
+}
+
+function cloudLayerTileIndex(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  if (!scene || activeScale == null) return null;
+  return scene.layerTilesByScale?.get(Number(activeScale)) || null;
+}
+
+function cloudTilePacketCandidateIds(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const packet = cloudLayerTileIndex(scene, activeScale);
+  if (!packet?.cells?.size) return null;
+  const scale = Math.max(0.001, viewScale);
+  const margin = CLOUD_DOM_WINDOW_MARGIN_PX + 220;
+  const tileSize = Math.max(1, Number(packet.tileSize) || CLOUD_DOM_WINDOW_TILE_PX);
+  const left = (0 - viewTx - margin) / scale;
+  const right = (vw() - viewTx + margin) / scale;
+  const top = (0 - viewTy - margin) / scale;
+  const bottom = (vh() - viewTy + margin) / scale;
+  const minX = Math.floor((left * Number(activeScale || scale)) / tileSize);
+  const maxX = Math.floor((right * Number(activeScale || scale)) / tileSize);
+  const minY = Math.floor((top * Number(activeScale || scale)) / tileSize);
+  const maxY = Math.floor((bottom * Number(activeScale || scale)) / tileSize);
+  const ids = new Set();
+  for (let tileX = minX; tileX <= maxX; tileX += 1) {
+    for (let tileY = minY; tileY <= maxY; tileY += 1) {
+      for (const nodeId of packet.cells.get(`${tileX}:${tileY}`) || []) ids.add(nodeId);
+    }
+  }
+  return ids;
+}
+
+function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const packetCandidateIds = cloudTilePacketCandidateIds(scene, activeScale);
+  if (!packetCandidateIds) return null;
+  const layerIds = cloudActiveLayerIds(scene, activeScale);
+  const nextNodeIds = new Set();
+  let hiddenForViewport = 0;
+  let missingCandidates = 0;
+  for (const nodeId of packetCandidateIds) {
+    const node = scene?.nodesById?.get(nodeId);
+    if (!node) {
+      missingCandidates += 1;
+      continue;
+    }
+    if (!cloudNodeScreenIntersectsViewport(node, CLOUD_DOM_WINDOW_MARGIN_PX)) {
+      hiddenForViewport += 1;
+      continue;
+    }
+    nextNodeIds.add(node.id);
+  }
+  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
+    nextNodeIds.add(cloudSelectedGenreId);
+  } else {
+    nextNodeIds.add(ROOT_KEY);
+  }
+  return {
+    nextNodeIds,
+    candidateIds: packetCandidateIds,
+    layerIds,
+    hiddenForViewport,
+    hiddenForOverlap: 0,
+    missingCandidates,
+    source: "packet_tiles",
+  };
+}
+
+function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const packetTarget = cloudPacketLodTarget(scene, activeScale);
+  if (packetTarget) return packetTarget;
+  const layerIds = cloudActiveLayerIds(scene, activeScale);
+  const candidateIds = cloudViewportCandidateIds(scene, activeScale);
+  candidateIds.add(ROOT_KEY);
+  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
+    candidateIds.add(cloudSelectedGenreId);
+  }
+
+  const orderedIds = [];
+  const queuedIds = new Set();
+  const addOrderedId = nodeId => {
+    if (!nodeId || queuedIds.has(nodeId)) return;
+    queuedIds.add(nodeId);
+    orderedIds.push(nodeId);
+  };
+  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
+    addOrderedId(cloudSelectedGenreId);
+  }
+  addOrderedId(ROOT_KEY);
+  for (const nodeId of layerIds) {
+    if (candidateIds.has(nodeId)) addOrderedId(nodeId);
+  }
+  for (const nodeId of candidateIds) addOrderedId(nodeId);
+
+  const nextNodeIds = new Set();
+  const occupiedBuckets = new Map();
+  let hiddenForViewport = 0;
+  let hiddenForOverlap = 0;
+  let missingCandidates = 0;
+  for (const nodeId of orderedIds) {
+    const node = scene?.nodesById?.get(nodeId);
+    if (!node) {
+      missingCandidates += 1;
+      continue;
+    }
+    if (!cloudNodeScreenIntersectsViewport(node, CLOUD_DOM_WINDOW_MARGIN_PX)) {
+      hiddenForViewport += 1;
+      continue;
+    }
+    const forceVisible = node.id === cloudSelectedGenreId || (node.id === ROOT_KEY && !cloudSelectedGenreId);
+    const rect = cloudNodeLodScreenRect(node);
+    if (!forceVisible && cloudRectOverlapsOccupied(rect, occupiedBuckets)) {
+      hiddenForOverlap += 1;
+      continue;
+    }
+    nextNodeIds.add(node.id);
+    cloudOccupyRect(rect, occupiedBuckets, node);
+  }
+
+  return {
+    nextNodeIds,
+    candidateIds,
+    layerIds,
+    hiddenForViewport,
+    hiddenForOverlap,
+    missingCandidates,
+    source: "client_overlap",
+  };
+}
+
+function cloudBackgroundNodeColor(node) {
+  return node?.similarity_color || node?.color || null;
+}
+
+function cloudBackgroundTheme() {
+  const styles = getComputedStyle(document.documentElement);
+  const colorScheme = styles.getPropertyValue("color-scheme").trim().toLowerCase();
+  const bg = parseCssColor(styles.getPropertyValue("--bg")) || { r: 13, g: 13, b: 13 };
+  const perceivedLightness = (0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b) / 255;
+  return colorScheme.includes("light") || perceivedLightness > 0.55 ? "light" : "dark";
+}
+
+function cloudBackgroundNodes(nodes = []) {
+  return nodes
+    .filter(node => {
+      if (!node || node.id === ROOT_KEY) return false;
+      if (!Number.isFinite(Number(node.x)) || !Number.isFinite(Number(node.y))) return false;
+      return Boolean(parseColorToRgb(cloudBackgroundNodeColor(node)));
+    })
+    .map(node => ({
+      ...node,
+      x: Number(node.x),
+      y: Number(node.y),
+    }));
+}
+
+function cloudBackgroundBounds(nodes = []) {
+  const bounds = cloudStatsBounds(cloudData) || cloudBoundsForNodes(nodes);
+  if (!bounds) return null;
+  const minX = Number(bounds.minX ?? bounds.min_x);
+  const maxX = Number(bounds.maxX ?? bounds.max_x);
+  const minY = Number(bounds.minY ?? bounds.min_y);
+  const maxY = Number(bounds.maxY ?? bounds.max_y);
+  if (![minX, maxX, minY, maxY].every(Number.isFinite) || minX === maxX || minY === maxY) return null;
+  const width = maxX - minX;
+  const height = maxY - minY;
+  const pad = Math.max(width, height) * 0.08;
+  return {
+    minX: minX - pad,
+    maxX: maxX + pad,
+    minY: minY - pad,
+    maxY: maxY + pad,
+  };
+}
+
+function cloudBackgroundSignature(nodes, bounds, theme, width, height) {
+  let hash = 2166136261;
+  const write = value => {
+    const text = String(value ?? "");
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  };
+  write(theme);
+  write(Math.round(width));
+  write(Math.round(height));
+  write(Math.round(bounds.minX));
+  write(Math.round(bounds.maxX));
+  write(Math.round(bounds.minY));
+  write(Math.round(bounds.maxY));
+  write(nodes.length);
+  for (const node of nodes) {
+    write(node.id);
+    write(Math.round(Number(node.x) * 10));
+    write(Math.round(Number(node.y) * 10));
+    write(cloudBackgroundNodeColor(node));
+    write(Math.round(Number(node.monthly_views_p30 ?? node.popularity ?? 1)));
+    write(Math.round(Number(node.color_confidence ?? node.colorConfidence ?? 1) * 1000));
+  }
+  return `${nodes.length}:${hash >>> 0}`;
+}
+
+function addOklab(a, b, weight = 1) {
+  a.L += b.L * weight;
+  a.a += b.a * weight;
+  a.b += b.b * weight;
+  return a;
+}
+
+function scaleOklab(color, weight) {
+  return {
+    L: color.L * weight,
+    a: color.a * weight,
+    b: color.b * weight,
+  };
+}
+
+function nodeColorOklab(node) {
+  const rgb = parseColorToRgb(cloudBackgroundNodeColor(node));
+  return rgb ? rgbToOklab(rgb) : null;
+}
+
+function computeGraphSmoothedColors(nodes, nodeById, options) {
+  const rawColors = new Map();
+  for (const node of nodes) {
+    const color = nodeColorOklab(node);
+    if (color) rawColors.set(node.id, color);
+  }
+  const result = new Map();
+  for (const node of nodes) {
+    const self = rawColors.get(node.id);
+    if (!self) continue;
+    let accum = scaleOklab(self, options.selfWeight);
+    let total = options.selfWeight;
+    const neighbors = Array.isArray(node.neighbors) ? node.neighbors : [];
+    const sortedNeighbors = neighbors
+      .slice()
+      .sort((a, b) => {
+        const aScore = Number.isFinite(Number(a?.similarity)) ? Number(a.similarity) : -Number(a?.distance ?? Infinity);
+        const bScore = Number.isFinite(Number(b?.similarity)) ? Number(b.similarity) : -Number(b?.distance ?? Infinity);
+        return bScore - aScore;
+      })
+      .slice(0, options.graphNeighborLimit);
+    for (const edge of sortedNeighbors) {
+      const other = nodeById.get(edge?.id);
+      const color = other ? rawColors.get(other.id) : null;
+      if (!color) continue;
+      let edgeWeight = 0;
+      if (Number.isFinite(Number(edge.similarity))) {
+        edgeWeight = options.graphWeight * clamp(Number(edge.similarity), 0, 1);
+      } else if (Number.isFinite(Number(edge.distance))) {
+        const sigmaGraph = Math.max(0.001, Number(options.sigmaGraph) || 1);
+        const distance = Number(edge.distance);
+        edgeWeight = options.graphWeight * Math.exp(-(distance * distance) / (2 * sigmaGraph * sigmaGraph));
+      }
+      if (edgeWeight <= 0) continue;
+      addOklab(accum, color, edgeWeight);
+      total += edgeWeight;
+    }
+    result.set(node.id, scaleOklab(accum, 1 / total));
+  }
+  return result;
+}
+
+function buildSpatialBuckets(nodes, cellSize) {
+  const buckets = new Map();
+  for (const node of nodes) {
+    const key = `${Math.floor(node.x / cellSize)}:${Math.floor(node.y / cellSize)}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(node);
+  }
+  return { buckets, cellSize };
+}
+
+function nearbyBackgroundNodes(index, x, y, radius) {
+  const { buckets, cellSize } = index;
+  const minX = Math.floor((x - radius) / cellSize);
+  const maxX = Math.floor((x + radius) / cellSize);
+  const minY = Math.floor((y - radius) / cellSize);
+  const maxY = Math.floor((y + radius) / cellSize);
+  const result = [];
+  for (let bx = minX; bx <= maxX; bx += 1) {
+    for (let by = minY; by <= maxY; by += 1) {
+      for (const node of buckets.get(`${bx}:${by}`) || []) result.push(node);
+    }
+  }
+  return result;
+}
+
+function predominantContributorColor(contributors, limit, bucketCount) {
+  const top = contributors
+    .filter(contributor => contributor.weight > 0 && contributor.color)
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, limit);
+  if (!top.length) return { color: null, dominant: null, colorWeight: 0, dominance: 0 };
+  const buckets = new Map();
+  let totalWeight = 0;
+  for (const contributor of top) {
+    const oklch = oklabToOklch(contributor.color);
+    const hue = ((oklch.h % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    const bucket = oklch.C < 0.012 ? "neutral" : Math.floor((hue / (Math.PI * 2)) * bucketCount);
+    const entry = buckets.get(bucket) || { weight: 0, contributors: [] };
+    entry.weight += contributor.weight;
+    entry.contributors.push(contributor);
+    buckets.set(bucket, entry);
+    totalWeight += contributor.weight;
+  }
+  let winner = null;
+  for (const entry of buckets.values()) {
+    if (!winner || entry.weight > winner.weight) winner = entry;
+  }
+  const selected = winner?.contributors?.length ? winner.contributors : top.slice(0, 1);
+  const accum = { L: 0, a: 0, b: 0 };
+  let colorWeight = 0;
+  for (const contributor of selected) {
+    addOklab(accum, contributor.color, contributor.weight);
+    colorWeight += contributor.weight;
+  }
+  return {
+    color: colorWeight > 0 ? scaleOklab(accum, 1 / colorWeight) : top[0].color,
+    dominant: top[0].color,
+    hueBucket: winner ? [...buckets.entries()].find(([, entry]) => entry === winner)?.[0] : null,
+    colorWeight,
+    dominance: totalWeight > 0 ? (winner?.weight || top[0].weight) / totalWeight : 1,
+  };
+}
+
+function computeSpatialField(nodes, smoothedColors, width, height, bounds, sigma, contributorLimit = 24, hueBucketCount = 18) {
+  const cells = new Array(width * height);
+  const radius = sigma * 3;
+  const index = buildSpatialBuckets(nodes, Math.max(64, radius / 2));
+  const worldWidth = bounds.maxX - bounds.minX;
+  const worldHeight = bounds.maxY - bounds.minY;
+  for (let gy = 0; gy < height; gy += 1) {
+    const y = bounds.minY + ((gy + 0.5) / height) * worldHeight;
+    for (let gx = 0; gx < width; gx += 1) {
+      const x = bounds.minX + ((gx + 0.5) / width) * worldWidth;
+      const contributors = [];
+      let density = 0;
+      for (const node of nearbyBackgroundNodes(index, x, y, radius)) {
+        const dx = x - node.x;
+        const dy = y - node.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > radius * radius) continue;
+        const spatialWeight = Math.exp(-d2 / (2 * sigma * sigma));
+        const popularity = Number(node.popularity ?? node.monthly_views_p30 ?? 1);
+        const popularityWeight = clamp(Math.sqrt(Math.log10(Math.max(0, Number.isFinite(popularity) ? popularity : 1) + 10)), 0.65, 2.1);
+        const rawConfidence = node.colorConfidence ?? node.color_confidence;
+        const confidence = Number(rawConfidence);
+        const confidenceWeight = rawConfidence == null ? 0.42 : clamp(Number.isFinite(confidence) ? confidence : 1, 0.25, 1.5);
+        const localWeight = Math.pow(spatialWeight, 1.18);
+        const weight = localWeight * popularityWeight * confidenceWeight;
+        const color = smoothedColors.get(node.id);
+        if (!color) continue;
+        contributors.push({ color, weight });
+        density += localWeight;
+      }
+      contributors.sort((a, b) => b.weight - a.weight);
+      const predominant = predominantContributorColor(contributors, contributorLimit, hueBucketCount);
+      cells[gy * width + gx] = {
+        color: predominant.color,
+        dominant: predominant.dominant,
+        hueBucket: predominant.hueBucket,
+        dominance: predominant.dominance,
+        density,
+      };
+    }
+  }
+  return { width, height, cells };
+}
+
+function blendSpatialFields(largeField, mediumField, largeWeight, mediumWeight) {
+  const cells = new Array(largeField.cells.length);
+  const totalBlendWeight = Math.max(0.001, largeWeight + mediumWeight);
+  const lw = largeWeight / totalBlendWeight;
+  const mw = mediumWeight / totalBlendWeight;
+  for (let index = 0; index < cells.length; index += 1) {
+    const large = largeField.cells[index];
+    const medium = mediumField.cells[index];
+    const localColor = medium?.color || large?.color || null;
+    const broadColor = large?.color || localColor;
+    let color = null;
+    if (localColor) {
+      color = broadColor
+        ? {
+            L: localColor.L + (broadColor.L - localColor.L) * lw,
+            a: localColor.a + (broadColor.a - localColor.a) * lw * 0.9,
+            b: localColor.b + (broadColor.b - localColor.b) * lw * 0.9,
+          }
+        : localColor;
+    }
+    cells[index] = {
+      color,
+      hueBucket: medium?.hueBucket ?? large?.hueBucket ?? null,
+      dominance: medium?.dominance ?? large?.dominance ?? 0,
+      density: (large?.density || 0) * lw + (medium?.density || 0) * mw,
+    };
+  }
+  return { width: largeField.width, height: largeField.height, cells };
+}
+
+function smoothstep(edge0, edge1, value) {
+  const t = clamp((value - edge0) / Math.max(0.0001, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function sameHueBucket(a, b, bucketCount) {
+  if (a == null || b == null) return false;
+  if (a === "neutral" || b === "neutral") return a === b;
+  const ai = Number(a);
+  const bi = Number(b);
+  if (!Number.isFinite(ai) || !Number.isFinite(bi)) return false;
+  const delta = Math.abs(ai - bi);
+  return Math.min(delta, bucketCount - delta) <= 1;
+}
+
+function hueBucketBlendWeight(a, b, bucketCount) {
+  if (a == null || b == null) return 0.72;
+  if (a === "neutral" || b === "neutral") return a === b ? 1 : 0.56;
+  const ai = Number(a);
+  const bi = Number(b);
+  if (!Number.isFinite(ai) || !Number.isFinite(bi)) return 0.72;
+  const delta = Math.abs(ai - bi);
+  const ringDelta = Math.min(delta, bucketCount - delta);
+  if (ringDelta <= 1) return 1;
+  if (ringDelta <= 3) return 0.86;
+  if (ringDelta <= 6) return 0.64;
+  return 0.48;
+}
+
+function percentile(sortedValues, ratio) {
+  if (!sortedValues.length) return 0;
+  const index = clamp(Math.round((sortedValues.length - 1) * ratio), 0, sortedValues.length - 1);
+  return sortedValues[index];
+}
+
+function muteForBackground(oklab, theme, options) {
+  const oklch = oklabToOklch(oklab);
+  if (theme === "light") {
+    oklch.L = oklch.L + (options.lightTargetLightness - oklch.L) * 0.60;
+    oklch.C = Math.min(oklch.C * options.lightChromaScale, options.lightChromaMax);
+  } else {
+    oklch.L = oklch.L + (options.darkTargetLightness - oklch.L) * 0.45;
+    oklch.C = Math.min(oklch.C * options.darkChromaScale, options.darkChromaMax);
+  }
+  return oklchToOklab(oklch);
+}
+
+function hashNoise2d(ix, iy, seed) {
+  let h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(seed, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+
+function valueNoise2d(x, y, seed) {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const sx = tx * tx * (3 - 2 * tx);
+  const sy = ty * ty * (3 - 2 * ty);
+  const n00 = hashNoise2d(x0, y0, seed);
+  const n10 = hashNoise2d(x0 + 1, y0, seed);
+  const n01 = hashNoise2d(x0, y0 + 1, seed);
+  const n11 = hashNoise2d(x0 + 1, y0 + 1, seed);
+  const nx0 = n00 + (n10 - n00) * sx;
+  const nx1 = n01 + (n11 - n01) * sx;
+  return (nx0 + (nx1 - nx0) * sy) * 2 - 1;
+}
+
+function sampleSpatialField(field, x, y, options = {}) {
+  const clampedX = clamp(x, 0, field.width - 1);
+  const clampedY = clamp(y, 0, field.height - 1);
+  const x0 = Math.floor(clampedX);
+  const y0 = Math.floor(clampedY);
+  const x1 = Math.min(field.width - 1, x0 + 1);
+  const y1 = Math.min(field.height - 1, y0 + 1);
+  const tx = clampedX - x0;
+  const ty = clampedY - y0;
+  const samples = [
+    { cell: field.cells[y0 * field.width + x0], weight: (1 - tx) * (1 - ty) },
+    { cell: field.cells[y0 * field.width + x1], weight: tx * (1 - ty) },
+    { cell: field.cells[y1 * field.width + x0], weight: (1 - tx) * ty },
+    { cell: field.cells[y1 * field.width + x1], weight: tx * ty },
+  ];
+  let anchor = null;
+  let bestColorScore = 0;
+  let density = 0;
+  for (const sample of samples) {
+    density += (sample.cell?.density || 0) * sample.weight;
+    if (!sample.cell?.color || sample.weight <= 0) continue;
+    const colorScore = sample.weight * (sample.cell.density || 0) * (0.35 + (sample.cell.dominance || 0));
+    if (colorScore > bestColorScore) {
+      bestColorScore = colorScore;
+      anchor = sample.cell;
+    }
+  }
+  const color = { L: 0, a: 0, b: 0 };
+  let colorWeight = 0;
+  for (const sample of samples) {
+    if (!sample.cell?.color || sample.weight <= 0 || !anchor) continue;
+    const hueWeight = hueBucketBlendWeight(
+      sample.cell.hueBucket,
+      anchor.hueBucket,
+      options.hueBucketCount || 18
+    );
+    const weight = sample.weight * hueWeight * (0.45 + (sample.cell.dominance || 0));
+    addOklab(color, sample.cell.color, weight);
+    colorWeight += weight;
+  }
+  return {
+    color: colorWeight > 0 ? scaleOklab(color, 1 / colorWeight) : anchor?.color || null,
+    density,
+  };
+}
+
+function generateGenreBackgroundField(nodes, canvasWidth, canvasHeight, options = {}) {
+  const mergedOptions = { ...CLOUD_BACKGROUND_OPTIONS, ...options };
+  const theme = mergedOptions.theme || "dark";
+  const bounds = mergedOptions.bounds || cloudBackgroundBounds(nodes);
+  if (!bounds || !nodes.length) return null;
+  const fieldWidth = Math.max(32, Math.round(mergedOptions.fieldWidth));
+  const worldAspect = Math.max(0.2, Math.min(5, canvasHeight / Math.max(1, canvasWidth)));
+  const fieldHeight = Math.max(24, Math.round(fieldWidth * worldAspect));
+  const worldWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const spatialSigmaLarge = mergedOptions.spatialSigmaLarge || worldWidth * mergedOptions.spatialSigmaLargeRatio;
+  const spatialSigmaMedium = mergedOptions.spatialSigmaMedium || worldWidth * mergedOptions.spatialSigmaMediumRatio;
+  const nodeById = new Map(nodes.map(node => [node.id, node]));
+  const smoothedColors = computeGraphSmoothedColors(nodes, nodeById, mergedOptions);
+  const largeField = computeSpatialField(
+    nodes,
+    smoothedColors,
+    fieldWidth,
+    fieldHeight,
+    bounds,
+    spatialSigmaLarge,
+    mergedOptions.largeContributorLimit,
+    mergedOptions.hueBucketCount
+  );
+  const mediumField = computeSpatialField(
+    nodes,
+    smoothedColors,
+    fieldWidth,
+    fieldHeight,
+    bounds,
+    spatialSigmaMedium,
+    mergedOptions.mediumContributorLimit,
+    mergedOptions.hueBucketCount
+  );
+  const field = blendSpatialFields(
+    largeField,
+    mediumField,
+    mergedOptions.largeFieldWeight,
+    mergedOptions.mediumFieldWeight
+  );
+  const canvas = document.createElement("canvas");
+  canvas.width = fieldWidth;
+  canvas.height = fieldHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const image = ctx.createImageData(fieldWidth, fieldHeight);
+  const data = image.data;
+  const baseAlpha = theme === "light" ? mergedOptions.lightBaseAlpha : mergedOptions.darkBaseAlpha;
+  const densityValues = field.cells
+    .map(cell => cell?.density || 0)
+    .filter(value => value > 0)
+    .sort((a, b) => a - b);
+  const densityLow = densityValues.length
+    ? Math.max(mergedOptions.densityLow, percentile(densityValues, 0.42))
+    : mergedOptions.densityLow;
+  const densityHigh = densityValues.length
+    ? Math.max(densityLow + 0.001, percentile(densityValues, 0.90))
+    : mergedOptions.densityHigh;
+  for (let gy = 0; gy < fieldHeight; gy += 1) {
+    for (let gx = 0; gx < fieldWidth; gx += 1) {
+      const noiseX = valueNoise2d(gx * mergedOptions.noiseScale, gy * mergedOptions.noiseScale, mergedOptions.noiseSeed);
+      const noiseY = valueNoise2d(gx * mergedOptions.noiseScale, gy * mergedOptions.noiseScale, mergedOptions.noiseSeed + 1);
+      const sample = sampleSpatialField(
+        field,
+        gx + noiseX * mergedOptions.warpStrength,
+        gy + noiseY * mergedOptions.warpStrength,
+        mergedOptions
+      );
+      const offset = (gy * fieldWidth + gx) * 4;
+      if (!sample.color) {
+        data[offset + 3] = 0;
+        continue;
+      }
+      const densityNorm = Math.pow(
+        smoothstep(densityLow, densityHigh, sample.density),
+        1.35
+      );
+      const alpha = clamp(baseAlpha * densityNorm, 0, 0.16);
+      if (alpha <= 0.002) {
+        data[offset + 3] = 0;
+        continue;
+      }
+      const rgb = oklabToRgb(muteForBackground(sample.color, theme, mergedOptions));
+      data[offset] = clamp(rgb.r, 0, 255);
+      data[offset + 1] = clamp(rgb.g, 0, 255);
+      data[offset + 2] = clamp(rgb.b, 0, 255);
+      data[offset + 3] = Math.round(alpha * 255);
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  const sourceCanvas = document.createElement("canvas");
+  sourceCanvas.width = fieldWidth;
+  sourceCanvas.height = fieldHeight;
+  const sourceCtx = sourceCanvas.getContext("2d");
+  if (sourceCtx) sourceCtx.putImageData(image, 0, 0);
+  ctx.clearRect(0, 0, fieldWidth, fieldHeight);
+  ctx.globalAlpha = 1;
+  ctx.filter = "blur(7px)";
+  ctx.drawImage(sourceCanvas, 0, 0);
+  ctx.filter = "none";
+  ctx.globalAlpha = 0.12;
+  ctx.drawImage(sourceCanvas, 0, 0);
+  ctx.filter = "none";
+  ctx.globalAlpha = 1;
+  canvas.__genreBackgroundBounds = bounds;
+  canvas.__genreBackgroundDensity = { densityLow, densityHigh };
+  return canvas;
+}
+
+function ensureCloudBackgroundField(width, height, options = {}) {
+  if (!cloudMode || !cloudScene?.nodesById?.size) return null;
+  const nodes = cloudBackgroundNodes(Array.from(cloudScene.nodesById.values()));
+  if (nodes.length < 3) return null;
+  const totalNodes = Number(cloudScene.stats?.total_nodes || nodes.length);
+  const warmupNodeCount = Math.min(260, Math.max(3, Math.floor(totalNodes * 0.16)));
+  if (!cloudScene.complete && nodes.length < warmupNodeCount) return cloudBackgroundCache;
+  if (!cloudScene.complete && cloudBackgroundCache?.createdAt && Date.now() - cloudBackgroundCache.createdAt < 900) {
+    return cloudBackgroundCache;
+  }
+  const bounds = cloudBackgroundBounds(nodes);
+  if (!bounds) return null;
+  const theme = cloudBackgroundTheme();
+  const signature = cloudBackgroundSignature(nodes, bounds, theme, width, height);
+  if (cloudBackgroundCache?.signature === signature) return cloudBackgroundCache;
+  if (!options.allowBuild) {
+    scheduleCloudBackgroundBuild(width, height, signature);
+    return cloudBackgroundCache;
+  }
+  const canvas = generateGenreBackgroundField(nodes, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, {
+    ...CLOUD_BACKGROUND_OPTIONS,
+    bounds,
+    theme,
+  });
+  cloudBackgroundCache = canvas ? {
+    signature,
+    canvas,
+    bounds,
+    theme,
+    density: canvas.__genreBackgroundDensity || null,
+    createdAt: Date.now(),
+  } : null;
+  return cloudBackgroundCache;
+}
+
+function scheduleCloudBackgroundBuild(width, height, signature = "") {
+  if (!cloudMode || cloudBackgroundBuildSignature === signature) return;
+  cloudBackgroundBuildSignature = signature;
+  window.clearTimeout(cloudBackgroundBuildTimer);
+  cloudBackgroundBuildTimer = window.setTimeout(() => {
+    cloudBackgroundBuildTimer = 0;
+    if (!cloudMode) return;
+    if (cloudFadeFrame || cloudCanvasFrame || cloudRenderFrame) {
+      cloudBackgroundBuildSignature = "";
+      scheduleCloudBackgroundBuild(width, height, signature);
+      return;
+    }
+    ensureCloudBackgroundField(width, height, { allowBuild: true });
+    scheduleCloudCanvasRender();
+  }, cloudScene?.complete ? 70 : 140);
+}
+
+function cloudBackgroundZoomOpacity() {
+  const effectiveScale = cloudEffectiveLodScale();
+  return clamp(0.18 + smoothstep(0.92, 2.3, effectiveScale) * 0.82, 0.18, 1);
+}
+
+function drawCloudBackgroundField(ctx, width, height) {
+  const background = ensureCloudBackgroundField(width, height);
+  if (!background?.canvas || !background.bounds) return;
+  const { bounds, canvas } = background;
+  const x = bounds.minX * viewScale + viewTx;
+  const y = bounds.minY * viewScale + viewTy;
+  const drawWidth = (bounds.maxX - bounds.minX) * viewScale;
+  const drawHeight = (bounds.maxY - bounds.minY) * viewScale;
+  if (x > width || y > height || x + drawWidth < 0 || y + drawHeight < 0) return;
+  const previousAlpha = ctx.globalAlpha;
+  const previousFilter = ctx.filter;
+  const previousSmoothing = ctx.imageSmoothingEnabled;
+  const previousSmoothingQuality = ctx.imageSmoothingQuality;
+  ctx.imageSmoothingEnabled = true;
+  if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "high";
+  ctx.globalAlpha = cloudBackgroundZoomOpacity();
+  ctx.filter = "blur(4px)";
+  ctx.drawImage(canvas, x, y, drawWidth, drawHeight);
+  ctx.filter = previousFilter;
+  ctx.globalAlpha = previousAlpha;
+  ctx.imageSmoothingEnabled = previousSmoothing;
+  if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = previousSmoothingQuality;
+}
+
+function cloudCanvasTextColor(node, fallbackColor = "") {
+  if (node.similarity_color) return node.similarity_color;
+  return fallbackColor || "#777";
+}
+
+function cloudCanvasRenderStyles() {
+  if (cloudCanvasStyleCache) return cloudCanvasStyleCache;
+  const styles = getComputedStyle(document.documentElement);
+  cloudCanvasStyleCache = {
+    fontFamily: styles.getPropertyValue("--font").trim() || "system-ui, sans-serif",
+    fallbackTextColor: styles.getPropertyValue("--text-muted").trim() || "#777",
+  };
+  return cloudCanvasStyleCache;
+}
+
+function cloudNodeRelationshipTargetAlpha(node) {
+  const relationshipGenreId = cloudRelationshipSelectedGenreId();
+  if (!relationshipGenreId || relationshipGenreId === ROOT_KEY) return 1;
+  if (!node?.id || node.id === relationshipGenreId) return 1;
+  const distance = Number(node.selected_distance);
+  if (!Number.isFinite(distance)) return CLOUD_RELATIONSHIP_ALPHA_FLOOR;
+  const progress = clamp(distance / CLOUD_RELATIONSHIP_ALPHA_DISTANCE_STEPS, 0, 1);
+  const fadeOut = easeOutCubic(progress);
+  return clamp(
+    CLOUD_RELATIONSHIP_ALPHA_FLOOR
+      + (1 - CLOUD_RELATIONSHIP_ALPHA_FLOOR) * (1 - fadeOut),
+    CLOUD_RELATIONSHIP_ALPHA_FLOOR,
+    1,
+  );
+}
+
+function cloudRelationshipSelectedGenreId() {
+  if (cloudRelationshipSwitchPending()) {
+    return cloudScene?.stats?.selected_genre_id || null;
+  }
+  return cloudScene?.stats?.selected_genre_id || cloudSelectedGenreId || null;
+}
+
+function cloudRelationshipSwitchPending() {
+  return Boolean(
+    cloudScene?.pendingAtlasSignature &&
+    cloudScene.pendingAtlasSignature !== cloudScene.atlasSignature
+  );
+}
+
+function cloudNodeRelationshipAlpha(node, now = performance.now()) {
+  const fade = cloudRelationshipAlphaById.get(String(node?.id || ""));
+  if (!fade) return cloudNodeRelationshipTargetAlpha(node);
+  return clamp(cloudCanvasFadeAlpha(fade, now), 0, 1);
+}
+
+function cloudSelectedMarkerColor(node, fallbackColor = "") {
+  const baseColor = cloudCanvasTextColor(node, fallbackColor);
+  const rgb = parseCssColor(baseColor);
+  if (!rgb) return baseColor;
+  const hsl = rgbToHsl(rgb);
+  return rgbToHex(hslToRgb({
+    ...hsl,
+    s: clamp(hsl.s * 0.22, 0, 1),
+    l: clamp(0.94 + hsl.l * 0.03, 0, 0.975),
+  }));
+}
+
+function cloudSelectedPillFillColor(node, fallbackColor = "") {
+  const baseColor = cloudCanvasTextColor(node, fallbackColor);
+  const rgb = parseCssColor(baseColor);
+  if (!rgb) return baseColor || "#f2f2f2";
+  const hsl = rgbToHsl(rgb);
+  return rgbToHex(hslToRgb({
+    ...hsl,
+    s: clamp(hsl.s * 0.72, 0.08, 0.72),
+    l: clamp(Math.max(hsl.l, 0.72), 0.72, 0.88),
+  }));
+}
+
+function drawRoundRectPath(ctx, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function cloudCanClickNodes() {
+  return cloudMode &&
+    cloudClickEnabled &&
+    Date.now() >= cloudClickEnableAt &&
+    !document.body.classList.contains("is-panning-canvas");
+}
+
+function syncCloudClickAffordance() {
+  const enabled = cloudCanClickNodes();
+  document.body.classList.toggle("cloud-click-enabled", enabled);
+  svg.classList.toggle("cloud-node-hit", enabled && Boolean(cloudHoveredNodeId));
+  if (window.__wikiGenresCloudCullDebug) {
+    window.__wikiGenresCloudCullDebug.clickEnabled = enabled;
+    window.__wikiGenresCloudCullDebug.hoveredNodeId = cloudHoveredNodeId;
+  }
+}
+
+function clearCloudHover() {
+  if (!cloudHoveredNodeId) {
+    clearScheduledCloudHoverCard();
+    syncCloudClickAffordance();
+    return;
+  }
+  cloudHoveredNodeId = null;
+  clearScheduledCloudHoverCard();
+  syncCloudClickAffordance();
+  scheduleCloudCanvasRender();
+}
+
+function setCloudClickEnabled(enabled) {
+  window.clearTimeout(cloudClickEnableTimer);
+  cloudClickEnableTimer = 0;
+  cloudClickEnabled = Boolean(enabled);
+  if (enabled) cloudClickEnableAt = 0;
+  else clearCloudHover();
+  syncCloudClickAffordance();
+}
+
+function scheduleCloudClickEnable(delay = CLOUD_CLICK_IDLE_ENABLE_MS) {
+  window.clearTimeout(cloudClickEnableTimer);
+  cloudClickEnabled = false;
+  cloudClickEnableAt = Date.now() + delay;
+  clearCloudHover();
+  cloudClickEnableTimer = window.setTimeout(() => {
+    cloudClickEnableTimer = 0;
+    cloudClickEnabled = true;
+    cloudClickEnableAt = 0;
+    updateCloudHoverFromPoint(lastPointerClientX, lastPointerClientY);
+    syncCloudClickAffordance();
+  }, delay);
+}
+
+function updateCloudHoverFromPoint(clientX, clientY) {
+  if (!cloudMode || !Number.isFinite(clientX) || !Number.isFinite(clientY) || !cloudCanClickNodes()) {
+    clearCloudHover();
+    return null;
+  }
+  const hitNode = cloudCanvasHitTest(clientX, clientY);
+  const nextId = hitNode?.id || null;
+  if (nextId !== cloudHoveredNodeId) {
+    cloudHoveredNodeId = nextId;
+    syncCloudClickAffordance();
+    scheduleCloudCanvasRender();
+    if (nextId) scheduleCloudHoverCard(nextId);
+    else clearScheduledCloudHoverCard();
+  }
+  return hitNode;
+}
+
+function cloudLabelSprite(node, selected, fontFamily, fallbackColor) {
+  const label = node.label || node.wikipedia_title || "";
+  const color = selected ? "#050505" : cloudCanvasTextColor(node, fallbackColor);
+  const pillFill = selected ? cloudSelectedPillFillColor(node, fallbackColor) : "";
+  const weight = selected ? 760 : 650;
+  const widthPx = selected ? cloudSelectedPillWidth(node) : cloudBoxWidth(node);
+  const heightPx = cloudBoxHeight(node);
+  const cssWidth = Math.max(1, Math.ceil(widthPx + CLOUD_CANVAS_HIT_PAD_PX * 2));
+  const cssHeight = Math.max(1, Math.ceil(heightPx + 4));
+  const dpr = Math.max(1, cloudCanvasDpr || 1);
+  const key = [
+    node.id,
+    label,
+    color,
+    pillFill,
+    weight,
+    CLOUD_FONT_SIZE,
+    fontFamily,
+    dpr,
+    cssWidth,
+    cssHeight,
+  ].join("|");
+  const cached = cloudLabelSpriteCache.get(key);
+  if (cached) return cached;
+  const canvas = typeof OffscreenCanvas === "function"
+    ? new OffscreenCanvas(Math.ceil(cssWidth * dpr), Math.ceil(cssHeight * dpr))
+    : document.createElement("canvas");
+  canvas.width = Math.ceil(cssWidth * dpr);
+  canvas.height = Math.ceil(cssHeight * dpr);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `${weight} ${CLOUD_FONT_SIZE}px ${fontFamily}`;
+  if (selected) {
+    const pillX = Math.max(1, (cssWidth - widthPx) / 2);
+    const pillY = Math.max(1, (cssHeight - heightPx) / 2);
+    drawRoundRectPath(ctx, pillX, pillY, widthPx, heightPx, Math.min(7, heightPx / 2));
+    ctx.fillStyle = pillFill;
+    ctx.fill();
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(label, cssWidth / 2, cssHeight / 2);
+  const sprite = { canvas, width: cssWidth, height: cssHeight };
+  cloudLabelSpriteCache.set(key, sprite);
+  return sprite;
+}
+
+function cloudScreenRectForNode(node, padPx = 0) {
+  const x = Number(node.x) * viewScale + viewTx;
+  const y = Number(node.y) * viewScale + viewTy;
+  const widthPx = cloudRenderedBoxWidth(node);
+  const heightPx = cloudBoxHeight(node);
+  return {
+    left: x - widthPx / 2 - padPx,
+    right: x + widthPx / 2 + padPx,
+    top: y - heightPx / 2 - padPx,
+    bottom: y + heightPx / 2 + padPx,
+  };
+}
+
+function screenRectsOverlap(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function clampScreenPoint(x, y, margin = 14) {
+  return {
+    x: Math.max(margin, Math.min(vw() - margin, x)),
+    y: Math.max(margin, Math.min(vh() - margin, y)),
+  };
+}
+
+function cloudSelectedMarkerCandidate(node, occupiedRects) {
+  if (!node) return null;
+  const projected = clampScreenPoint(
+    Number(node.x) * viewScale + viewTx,
+    Number(node.y) * viewScale + viewTy,
+    CLOUD_SELECTED_MARKER_RADIUS_PX + CLOUD_SELECTED_MARKER_VIEWPORT_MARGIN_PX
+  );
+  const radius = CLOUD_SELECTED_MARKER_RADIUS_PX;
+  const fits = point => {
+    const rect = {
+      left: point.x - radius - CLOUD_SELECTED_MARKER_CLEARANCE_PX,
+      right: point.x + radius + CLOUD_SELECTED_MARKER_CLEARANCE_PX,
+      top: point.y - radius - CLOUD_SELECTED_MARKER_CLEARANCE_PX,
+      bottom: point.y + radius + CLOUD_SELECTED_MARKER_CLEARANCE_PX,
+    };
+    return !occupiedRects.some(existing => screenRectsOverlap(rect, existing));
+  };
+  if (fits(projected)) return projected;
+  const steps = [4, 6, 8, 10, 14, 18, 24, 32, 44, 60];
+  for (const distance of steps) {
+    const samples = Math.max(8, Math.ceil(distance / 4));
+    for (let index = 0; index < samples; index += 1) {
+      const angle = (Math.PI * 2 * index) / samples;
+      const point = clampScreenPoint(
+        projected.x + Math.cos(angle) * distance,
+        projected.y + Math.sin(angle) * distance,
+        radius + CLOUD_SELECTED_MARKER_VIEWPORT_MARGIN_PX
+      );
+      if (fits(point)) return point;
+    }
+  }
+  return projected;
+}
+
+function clearCloudSelectedMarkerAnimation() {
+  if (cloudSelectedMarkerFrame) {
+    cancelAnimationFrame(cloudSelectedMarkerFrame);
+    cloudSelectedMarkerFrame = 0;
+  }
+}
+
+function scheduleCloudSelectedMarkerAnimation() {
+  if (cloudSelectedMarkerFrame || prefersReducedMotion()) return;
+  cloudSelectedMarkerFrame = requestAnimationFrame(() => {
+    cloudSelectedMarkerFrame = 0;
+    scheduleCloudCanvasRender();
+    if (cloudSelectedMarker?.transition) {
+      scheduleCloudSelectedMarkerAnimation();
+    }
+  });
+}
+
+function stepCloudSelectedMarker(now = performance.now()) {
+  if (!cloudSelectedMarker?.transition) return;
+  const transition = cloudSelectedMarker.transition;
+  const duration = Math.max(1, Number(transition.duration) || 1);
+  const progress = clamp((now - Number(transition.startedAt || 0)) / duration, 0, 1);
+  const eased = 1 - Math.pow(1 - progress, 3);
+  cloudSelectedMarker.alpha = Number(transition.fromAlpha || 0) +
+    (Number(transition.toAlpha || 0) - Number(transition.fromAlpha || 0)) * eased;
+  if (progress < 1) return;
+  cloudSelectedMarker.alpha = transition.toAlpha;
+  if (transition.next) {
+    cloudSelectedMarker = {
+      ...transition.next,
+      alpha: 0,
+      transition: {
+        fromAlpha: 0,
+        toAlpha: 1,
+        startedAt: now,
+        duration: CLOUD_SELECTED_MARKER_FADE_IN_MS,
+        next: null,
+      },
+    };
+    return;
+  }
+  if (cloudSelectedMarker.alpha <= 0.01) {
+    cloudSelectedMarker = null;
+    return;
+  }
+  cloudSelectedMarker.transition = null;
+}
+
+function startCloudSelectedMarkerTransition(toAlpha, duration, next = null, now = performance.now()) {
+  if (!cloudSelectedMarker) return;
+  const alpha = Number(cloudSelectedMarker.alpha);
+  cloudSelectedMarker.transition = {
+    fromAlpha: Number.isFinite(alpha) ? alpha : 1,
+    toAlpha,
+    startedAt: now,
+    duration,
+    next,
+  };
+  scheduleCloudSelectedMarkerAnimation();
+}
+
+function cloudSelectedMarkerMatches(a, b) {
+  return Boolean(
+    a &&
+    b &&
+    a.id === b.id &&
+    Math.abs(Number(a.x) - Number(b.x)) <= 0.5 &&
+    Math.abs(Number(a.y) - Number(b.y)) <= 0.5
+  );
+}
+
+function syncCloudSelectedMarker(desiredMarker, now = performance.now()) {
+  if (prefersReducedMotion()) {
+    cloudSelectedMarker = desiredMarker ? { ...desiredMarker, alpha: 1, transition: null } : null;
+    clearCloudSelectedMarkerAnimation();
+    return;
+  }
+  const zoomChanged = cloudSelectedMarker
+    ? Math.abs(Number(desiredMarker?.scale ?? viewScale) - Number(cloudSelectedMarker.scale ?? viewScale)) > 0.0005
+    : false;
+  if (!desiredMarker) {
+    if (cloudSelectedMarker && !zoomChanged) {
+      cloudSelectedMarker = null;
+      clearCloudSelectedMarkerAnimation();
+      return;
+    }
+    if (cloudSelectedMarker && !(cloudSelectedMarker.transition?.toAlpha === 0 && !cloudSelectedMarker.transition?.next)) {
+      startCloudSelectedMarkerTransition(0, CLOUD_SELECTED_MARKER_FADE_OUT_MS, null, now);
+    }
+    return;
+  }
+  if (!cloudSelectedMarker) {
+    cloudSelectedMarker = {
+      ...desiredMarker,
+      alpha: 0,
+      transition: null,
+    };
+    startCloudSelectedMarkerTransition(1, CLOUD_SELECTED_MARKER_FADE_IN_MS, null, now);
+    return;
+  }
+  if (cloudSelectedMarkerMatches(cloudSelectedMarker, desiredMarker)) {
+    cloudSelectedMarker.id = desiredMarker.id;
+    cloudSelectedMarker.x = desiredMarker.x;
+    cloudSelectedMarker.y = desiredMarker.y;
+    cloudSelectedMarker.radius = desiredMarker.radius;
+    cloudSelectedMarker.color = desiredMarker.color;
+    cloudSelectedMarker.scale = desiredMarker.scale;
+    if (cloudSelectedMarker.transition?.toAlpha === 0) {
+      startCloudSelectedMarkerTransition(1, CLOUD_SELECTED_MARKER_FADE_IN_MS, null, now);
+    }
+    return;
+  }
+  if (!zoomChanged) {
+    cloudSelectedMarker = {
+      ...desiredMarker,
+      alpha: 1,
+      transition: null,
+    };
+    clearCloudSelectedMarkerAnimation();
+    return;
+  }
+  const nextMarker = { ...desiredMarker };
+  if (cloudSelectedMarker.transition?.toAlpha === 0) {
+    cloudSelectedMarker.transition.next = nextMarker;
+    scheduleCloudSelectedMarkerAnimation();
+    return;
+  }
+  startCloudSelectedMarkerTransition(0, CLOUD_SELECTED_MARKER_FADE_OUT_MS, nextMarker, now);
+}
+
+function resizeCloudCanvas() {
+  if (!cloudLabelCanvas || !cloudLabelCtx) return false;
+  const width = Math.max(1, Math.ceil(vw()));
+  const height = Math.max(1, Math.ceil(vh()));
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const dprChanged = Math.abs(dpr - cloudCanvasDpr) > 0.001;
+  const pixelWidth = Math.ceil(width * dpr);
+  const pixelHeight = Math.ceil(height * dpr);
+  const changed = cloudLabelCanvas.width !== pixelWidth || cloudLabelCanvas.height !== pixelHeight;
+  if (changed) {
+    cloudLabelCanvas.width = pixelWidth;
+    cloudLabelCanvas.height = pixelHeight;
+    cloudLabelCanvas.style.width = `${width}px`;
+      cloudLabelCanvas.style.height = `${height}px`;
+  }
+  cloudCanvasDpr = dpr;
+  if (dprChanged) cloudLabelSpriteCache = new Map();
+  cloudLabelCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return changed;
+}
+
+function updateCloudCanvasFadeTargets(nodes, options = {}) {
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : performance.now();
+  const noFade = Boolean(options.noFade) || prefersReducedMotion();
+  const targetIds = new Set(nodes.map(node => String(node.id)));
+  const signature = cloudRenderTargetSignature(nodes);
+  cloudCanvasAlphaById.clear();
+  cloudCanvasVisibleIds = targetIds;
+  applyCloudPresentationTargets(nodes, {
+    noFade,
+    hydrateNew: Boolean(options.hydrateNew),
+    now,
+    signature,
+  });
+}
+
+function cloudPresentationSelectedTarget(nodeId) {
+  return nodeId === String(cloudSelectedGenreId || "") ? 1 : 0;
+}
+
+function cloudPresentationRecordEntry(record) {
+  if (!record?.node) return null;
+  return {
+    node: record.node,
+    alpha: clamp(Number(record.alpha) || 0, 0, 1),
+    relationshipAlpha: clamp(Number(record.relationshipAlpha ?? cloudNodeRelationshipTargetAlpha(record.node)), 0, 1),
+    selectedAlpha: clamp(Number(record.selectedAlpha) || 0, 0, 1),
+    active: record.active !== false,
+    exiting: record.active === false,
+  };
+}
+
+function cloudPresentationMaxDelta() {
+  let maxDelta = 0;
+  for (const record of cloudPresentationById.values()) {
+    maxDelta = Math.max(
+      maxDelta,
+      Math.abs(Number(record.alpha || 0) - Number(record.targetAlpha || 0)),
+      Math.abs(Number(record.selectedAlpha || 0) - Number(record.targetSelectedAlpha || 0)),
+      Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)),
+    );
+  }
+  return maxDelta;
+}
+
+function cloudPresentationAnimating() {
+  return cloudPresentationMaxDelta() > CLOUD_PRESENTATION_EPSILON;
+}
+
+function applyCloudPresentationTargets(nodes, options = {}) {
+  const now = Number(options.now) || performance.now();
+  const noFade = Boolean(options.noFade);
+  const hydrateNew = Boolean(options.hydrateNew);
+  const targetIds = new Set();
+  let needsFrame = false;
+  if (!cloudPresentationLastAt) cloudPresentationLastAt = now;
+
+  for (const node of nodes || []) {
+    if (!node?.id) continue;
+    const nodeId = String(node.id);
+    targetIds.add(nodeId);
+    const targetSelectedAlpha = cloudPresentationSelectedTarget(nodeId);
+    const targetRelationshipAlpha = cloudNodeRelationshipTargetAlpha(node);
+    let record = cloudPresentationById.get(nodeId);
+    if (!record) {
+      const initialAlpha = noFade || hydrateNew ? 1 : 0;
+      record = {
+        node,
+        alpha: initialAlpha,
+        targetAlpha: 1,
+        selectedAlpha: noFade ? targetSelectedAlpha : 0,
+        targetSelectedAlpha,
+        relationshipAlpha: noFade ? targetRelationshipAlpha : targetRelationshipAlpha,
+        targetRelationshipAlpha,
+        fadeInMs: CLOUD_CANVAS_FADE_IN_MS,
+        fadeOutMs: CLOUD_CANVAS_FADE_OUT_MS,
+        active: true,
+      };
+      cloudPresentationById.set(nodeId, record);
+      if (!noFade) needsFrame = true;
+      continue;
+    }
+    record.node = node;
+    record.active = true;
+    record.targetAlpha = 1;
+    record.targetSelectedAlpha = targetSelectedAlpha;
+    record.targetRelationshipAlpha = targetRelationshipAlpha;
+    record.fadeInMs = CLOUD_CANVAS_FADE_IN_MS;
+    record.fadeOutMs = CLOUD_CANVAS_FADE_OUT_MS;
+    if (noFade) {
+      record.alpha = record.targetAlpha;
+      record.selectedAlpha = record.targetSelectedAlpha;
+      record.relationshipAlpha = record.targetRelationshipAlpha;
+    }
+    if (
+      Math.abs(Number(record.alpha || 0) - record.targetAlpha) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.selectedAlpha || 0) - record.targetSelectedAlpha) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.relationshipAlpha || 0) - record.targetRelationshipAlpha) > CLOUD_PRESENTATION_EPSILON
+    ) {
+      needsFrame = true;
+    }
+  }
+
+  for (const [nodeId, record] of cloudPresentationById.entries()) {
+    if (targetIds.has(nodeId)) continue;
+    record.active = false;
+    record.targetAlpha = 0;
+    record.targetSelectedAlpha = 0;
+    record.targetRelationshipAlpha = Number(record.relationshipAlpha ?? record.targetRelationshipAlpha ?? 1);
+    record.fadeOutMs = CLOUD_CANVAS_FADE_OUT_MS;
+    if (noFade) {
+      cloudPresentationById.delete(nodeId);
+      continue;
+    }
+    if (
+      Math.abs(Number(record.alpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.selectedAlpha || 0)) > CLOUD_PRESENTATION_EPSILON
+    ) {
+      needsFrame = true;
+    } else {
+      cloudPresentationById.delete(nodeId);
+    }
+  }
+
+  cloudPresentationTargetSignature = options.signature || "";
+  cloudRenderTransition = null;
+  cloudRenderSnapshot = null;
+  if (needsFrame && !noFade) scheduleCloudFade();
+}
+
+function cloudPresentationApproach(current, target, maxStep) {
+  const value = Number(current) || 0;
+  const next = Number(target) || 0;
+  const delta = next - value;
+  if (Math.abs(delta) <= CLOUD_PRESENTATION_EPSILON) return next;
+  return value + Math.sign(delta) * Math.min(Math.abs(delta), maxStep);
+}
+
+function stepCloudPresentation(now = performance.now()) {
+  if (!cloudPresentationById.size) {
+    cloudPresentationLastAt = now;
+    return false;
+  }
+  const previousAt = cloudPresentationLastAt || now;
+  const dt = Math.min(64, Math.max(0, now - previousAt || 16));
+  cloudPresentationLastAt = now;
+  let active = false;
+  for (const [nodeId, record] of cloudPresentationById.entries()) {
+    const alphaDuration = Number(record.targetAlpha || 0) < Number(record.alpha || 0)
+      ? Number(record.fadeOutMs || CLOUD_CANVAS_FADE_OUT_MS)
+      : Number(record.fadeInMs || CLOUD_CANVAS_FADE_IN_MS);
+    const alphaStep = clamp(dt / Math.max(1, alphaDuration), 0, 1);
+    const selectedStep = clamp(dt / Math.max(1, CLOUD_CANVAS_TRANSITION_MS), 0, 1);
+    const relationshipStep = clamp(dt / Math.max(1, CLOUD_RELATIONSHIP_ALPHA_FADE_MS), 0, 1);
+    record.alpha = cloudPresentationApproach(record.alpha, record.targetAlpha, alphaStep);
+    record.selectedAlpha = cloudPresentationApproach(record.selectedAlpha, record.targetSelectedAlpha, selectedStep);
+    record.relationshipAlpha = cloudPresentationApproach(record.relationshipAlpha, record.targetRelationshipAlpha, relationshipStep);
+    const isAnimating =
+      Math.abs(Number(record.alpha || 0) - Number(record.targetAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.selectedAlpha || 0) - Number(record.targetSelectedAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)) > CLOUD_PRESENTATION_EPSILON;
+    active = active || isAnimating;
+    if (
+      !record.active &&
+      !isAnimating &&
+      Number(record.alpha || 0) <= CLOUD_PRESENTATION_EPSILON &&
+      Number(record.selectedAlpha || 0) <= CLOUD_PRESENTATION_EPSILON
+    ) {
+      cloudPresentationById.delete(nodeId);
+    }
+  }
+  cloudRenderSnapshot = null;
+  return active;
+}
+
+function cloudCanvasFadeAlpha(fade, now = performance.now()) {
+  if (!fade) return 0;
+  const duration = Math.max(1, Number(fade.duration) || 1);
+  const progress = clamp((now - Number(fade.startedAt || 0)) / duration, 0, 1);
+  const eased = 1 - Math.pow(1 - progress, 3);
+  return Number(fade.from || 0) + (Number(fade.target || 0) - Number(fade.from || 0)) * eased;
+}
+
+function cloudRenderTargetSignature(nodes) {
+  const relationshipGenreId = cloudRelationshipSelectedGenreId() || "";
+  const selectedGenreId = cloudSelectedGenreId || "";
+  const nodeIds = nodes.map(node => String(node.id)).sort();
+  return [
+    relationshipGenreId,
+    selectedGenreId,
+    nodeIds.join(","),
+  ].join("|");
+}
+
+function cloudBuildRenderSnapshot(nodes, signature = cloudRenderTargetSignature(nodes), alpha = 1) {
+  const entriesById = new Map();
+  for (const node of nodes) {
+    if (!node?.id) continue;
+    const nodeId = String(node.id);
+    entriesById.set(nodeId, {
+      node,
+      alpha,
+      relationshipAlpha: cloudNodeRelationshipTargetAlpha(node),
+      selectedAlpha: nodeId === String(cloudSelectedGenreId || "") ? 1 : 0,
+    });
+  }
+  return {
+    signature,
+    entriesById,
+  };
+}
+
+function cloudBuildLodRenderTargetSnapshot(nodes, signature, fromSnapshot) {
+  const snapshot = cloudBuildRenderSnapshot(nodes, signature, 1);
+  const targetIds = new Set(nodes.map(node => String(node.id)));
+  for (const [nodeId, entry] of fromSnapshot?.entriesById?.entries?.() || []) {
+    if (targetIds.has(nodeId)) continue;
+    snapshot.entriesById.set(nodeId, {
+      node: entry.node,
+      alpha: 0,
+      relationshipAlpha: entry.relationshipAlpha,
+      selectedAlpha: 0,
+      fadingOut: true,
+    });
+  }
+  return snapshot;
+}
+
+function cloudPrunedRenderSnapshot(snapshot) {
+  if (!snapshot?.entriesById) return snapshot;
+  const entriesById = new Map();
+  for (const [nodeId, entry] of snapshot.entriesById.entries()) {
+    if (Number(entry.alpha) <= 0.01 && Number(entry.selectedAlpha || 0) <= 0.01) continue;
+    entriesById.set(nodeId, entry);
+  }
+  return {
+    ...snapshot,
+    entriesById,
+  };
+}
+
+function cloudRenderTransitionProgress(now = performance.now()) {
+  if (!cloudRenderTransition) return 1;
+  const duration = Math.max(1, Number(cloudRenderTransition.duration) || 1);
+  const progress = clamp((now - Number(cloudRenderTransition.startedAt || 0)) / duration, 0, 1);
+  return easeInOutCubic(progress);
+}
+
+function cloudResolvedRenderEntry(nodeId, now = performance.now()) {
+  const id = String(nodeId);
+  if (!cloudRenderTransition) {
+    return cloudRenderSnapshot?.entriesById?.get(id) || null;
+  }
+  const progress = cloudRenderTransitionProgress(now);
+  const fromEntry = cloudRenderTransition.from.entriesById.get(id);
+  const toEntry = cloudRenderTransition.to.entriesById.get(id);
+  if (!fromEntry && !toEntry) return null;
+  const fromAlpha = Number(fromEntry?.alpha ?? 0);
+  const toAlpha = Number(toEntry?.alpha ?? 0);
+  const fromRelationshipAlpha = Number(fromEntry?.relationshipAlpha ?? toEntry?.relationshipAlpha ?? 1);
+  const toRelationshipAlpha = Number(toEntry?.relationshipAlpha ?? fromEntry?.relationshipAlpha ?? 1);
+  const fromSelectedAlpha = Number(fromEntry?.selectedAlpha ?? 0);
+  const toSelectedAlpha = Number(toEntry?.selectedAlpha ?? 0);
+  return {
+    node: toEntry?.node || fromEntry?.node,
+    alpha: fromAlpha + (toAlpha - fromAlpha) * progress,
+    relationshipAlpha: fromRelationshipAlpha + (toRelationshipAlpha - fromRelationshipAlpha) * progress,
+    selectedAlpha: fromSelectedAlpha + (toSelectedAlpha - fromSelectedAlpha) * progress,
+  };
+}
+
+function cloudCurrentRenderEntries(now = performance.now()) {
+  if (cloudPresentationById.size) {
+    const exitingEntries = [];
+    const activeEntries = [];
+    for (const record of cloudPresentationById.values()) {
+      const entry = cloudPresentationRecordEntry(record);
+      if (!entry || (entry.alpha <= 0.01 && entry.selectedAlpha <= 0.01)) continue;
+      if (entry.active) activeEntries.push(entry);
+      else exitingEntries.push(entry);
+    }
+    return [...exitingEntries, ...activeEntries];
+  }
+  if (!cloudRenderTransition) {
+    return Array.from(cloudRenderSnapshot?.entriesById?.values?.() || []);
+  }
+  const ids = new Set([
+    ...cloudRenderTransition.from.entriesById.keys(),
+    ...cloudRenderTransition.to.entriesById.keys(),
+  ]);
+  const entries = [];
+  for (const nodeId of ids) {
+    const entry = cloudResolvedRenderEntry(nodeId, now);
+    if (entry && (entry.alpha > 0.01 || entry.selectedAlpha > 0.01)) entries.push(entry);
+  }
+  return entries;
+}
+
+function cloudMaterializedRenderSnapshot(now = performance.now()) {
+  const entriesById = new Map();
+  for (const entry of cloudCurrentRenderEntries(now)) {
+    entriesById.set(String(entry.node.id), {
+      node: entry.node,
+      alpha: entry.alpha,
+      relationshipAlpha: entry.relationshipAlpha,
+      selectedAlpha: entry.selectedAlpha,
+    });
+  }
+  return {
+    signature: `materialized:${now}`,
+    entriesById,
+  };
+}
+
+function stepCloudRenderTransition(now = performance.now()) {
+  if (!cloudRenderTransition) return false;
+  const progress = cloudRenderTransitionProgress(now);
+  if (progress < 0.999) return true;
+  cloudRenderSnapshot = cloudPrunedRenderSnapshot(cloudRenderTransition.to);
+  cloudRenderTransition = null;
   return false;
 }
 
-function cloudOccupyRect(rect, occupiedBuckets) {
-  for (const key of cloudRectCollisionBuckets(rect)) {
-    if (!occupiedBuckets.has(key)) occupiedBuckets.set(key, []);
-    occupiedBuckets.get(key).push(rect);
+function cloudCanvasNodeAlpha(nodeId, now = performance.now()) {
+  const record = cloudPresentationById.get(String(nodeId));
+  if (record) return clamp(Number(record.alpha) || 0, 0, 1);
+  const entry = cloudResolvedRenderEntry(String(nodeId), now);
+  return entry ? entry.alpha : 0;
+}
+
+function updateCloudSelectedLabelFadeTargets(nodes) {
+  cloudSelectedLabelAlphaById.clear();
+}
+
+function startCloudSelectedLabelFade(nodeId, now = performance.now()) {
+  scheduleCloudCanvasRender();
+}
+
+function updateCloudHoverUnderlineAlphaTargets(nodes) {
+  const hoverKey = detailIndicatorPreviewKey && String(detailIndicatorPreviewKey).startsWith("cloud-")
+    ? detailIndicatorPreviewKey
+    : null;
+  const now = performance.now();
+  const activeIds = new Set(nodes.map(node => String(node.id)));
+  let needsFrame = false;
+  for (const node of nodes) {
+    const nodeId = String(node.id);
+    const target = hoverKey === detailKeyForCloudNodeId(nodeId) ? 1 : 0;
+    const existing = cloudHoverUnderlineAlphaById.get(nodeId);
+    const current = existing ? cloudCanvasFadeAlpha(existing, now) : 0;
+    if (!existing && target <= 0) continue;
+    if (existing?.target === target) {
+      existing.alpha = Math.abs(current - target) <= 0.01 ? target : current;
+      if (existing.alpha !== target) needsFrame = true;
+      continue;
+    }
+    cloudHoverUnderlineAlphaById.set(nodeId, {
+      alpha: prefersReducedMotion() ? target : current,
+      from: prefersReducedMotion() ? target : current,
+      target,
+      startedAt: now,
+      duration: prefersReducedMotion()
+        ? 1
+        : target > 0
+          ? CLOUD_HOVER_UNDERLINE_FADE_IN_MS
+          : CLOUD_HOVER_UNDERLINE_FADE_OUT_MS,
+    });
+    if (!prefersReducedMotion()) needsFrame = true;
+  }
+  for (const [nodeId, fade] of cloudHoverUnderlineAlphaById.entries()) {
+    if (activeIds.has(nodeId) || fade.target === 0) continue;
+    const alpha = cloudCanvasFadeAlpha(fade, now);
+    cloudHoverUnderlineAlphaById.set(nodeId, {
+      alpha,
+      from: alpha,
+      target: 0,
+      startedAt: now,
+      duration: prefersReducedMotion() ? 1 : CLOUD_HOVER_UNDERLINE_FADE_OUT_MS,
+    });
+    if (!prefersReducedMotion()) needsFrame = true;
+  }
+  if (needsFrame) scheduleCloudHoverUnderlineFade();
+}
+
+function cloudHoverUnderlineAlpha(nodeId, now = performance.now()) {
+  const fade = cloudHoverUnderlineAlphaById.get(String(nodeId));
+  if (!fade) return 0;
+  return clamp(cloudCanvasFadeAlpha(fade, now), 0, 1);
+}
+
+function stepCloudFadeMap(map, now, shouldDeleteSettled = () => false) {
+  let active = false;
+  for (const [nodeId, fade] of map.entries()) {
+    const alpha = cloudCanvasFadeAlpha(fade, now);
+    fade.alpha = alpha;
+    if (Math.abs(alpha - fade.target) > 0.01) {
+      active = true;
+      continue;
+    }
+    fade.alpha = fade.target;
+    fade.from = fade.target;
+    if (shouldDeleteSettled(fade, nodeId)) map.delete(nodeId);
+  }
+  return active;
+}
+
+function stepCloudFades() {
+  cloudFadeFrame = 0;
+  cloudCanvasFadeFrame = 0;
+  cloudSelectedLabelFadeFrame = 0;
+  cloudHoverUnderlineFadeFrame = 0;
+  cloudRelationshipFadeFrame = 0;
+  if (!cloudMode) return;
+  const now = performance.now();
+  const activePresentation = cloudPresentationAnimating();
+  const activeRenderTransition = stepCloudRenderTransition(now);
+  const activeCanvas = stepCloudFadeMap(
+    cloudCanvasAlphaById,
+    now,
+    () => true
+  );
+  const activeSelected = stepCloudFadeMap(
+    cloudSelectedLabelAlphaById,
+    now,
+    fade => fade.target <= 0
+  );
+  const activeHover = stepCloudFadeMap(
+    cloudHoverUnderlineAlphaById,
+    now,
+    fade => fade.target <= 0
+  );
+  const activeRelationship = stepCloudFadeMap(
+    cloudRelationshipAlphaById,
+    now,
+    fade => fade.target >= 0.995 && (!cloudSelectedGenreId || cloudSelectedGenreId === ROOT_KEY)
+  );
+  const hasFadeState =
+    cloudPresentationById.size ||
+    Boolean(cloudRenderTransition) ||
+    cloudCanvasAlphaById.size ||
+    cloudSelectedLabelAlphaById.size ||
+    cloudHoverUnderlineAlphaById.size ||
+    cloudRelationshipAlphaById.size;
+  if (hasFadeState || activePresentation || activeRenderTransition || activeCanvas || activeSelected || activeHover || activeRelationship) {
+    scheduleCloudCanvasRender();
+  }
+  if (activePresentation || activeRenderTransition || activeCanvas || activeSelected || activeHover || activeRelationship) {
+    scheduleCloudFade();
   }
 }
 
-function mergeCloudLayerSnapshot(snapshot) {
+function scheduleCloudFade() {
+  if (cloudFadeFrame || prefersReducedMotion()) return;
+  cloudFadeFrame = requestAnimationFrame(stepCloudFades);
+  cloudCanvasFadeFrame = cloudFadeFrame;
+  cloudSelectedLabelFadeFrame = cloudFadeFrame;
+  cloudHoverUnderlineFadeFrame = cloudFadeFrame;
+  cloudRelationshipFadeFrame = cloudFadeFrame;
+}
+
+function cancelCloudFadeFrame() {
+  if (!cloudFadeFrame) return;
+  cancelAnimationFrame(cloudFadeFrame);
+  cloudFadeFrame = 0;
+  cloudCanvasFadeFrame = 0;
+  cloudSelectedLabelFadeFrame = 0;
+  cloudHoverUnderlineFadeFrame = 0;
+  cloudRelationshipFadeFrame = 0;
+}
+
+function stepCloudHoverUnderlineFades() {
+  stepCloudFades();
+}
+
+function scheduleCloudHoverUnderlineFade() {
+  scheduleCloudFade();
+}
+
+function updateCloudRelationshipAlphaTargets(nodes) {
+  cloudRelationshipAlphaById.clear();
+}
+
+function cloudSelectedLabelAlpha(nodeId, now = performance.now()) {
+  const fade = cloudSelectedLabelAlphaById.get(String(nodeId));
+  if (!fade) return 0;
+  return clamp(cloudCanvasFadeAlpha(fade, now), 0, 1);
+}
+
+function stepCloudSelectedLabelFades() {
+  stepCloudFades();
+}
+
+function scheduleCloudSelectedLabelFade() {
+  scheduleCloudFade();
+}
+
+function stepCloudRelationshipFades() {
+  stepCloudFades();
+}
+
+function scheduleCloudRelationshipFade() {
+  scheduleCloudFade();
+}
+
+function stepCloudCanvasFades() {
+  stepCloudFades();
+}
+
+function scheduleCloudCanvasFade() {
+  scheduleCloudFade();
+}
+
+function cloudDrawableNodes(now = performance.now()) {
+  return cloudDrawableEntries(now).map(entry => entry.node);
+}
+
+function cloudDrawableEntries(now = performance.now()) {
+  const entries = [];
+  const seen = new Set();
+  const addEntry = entry => {
+    const node = entry?.node;
+    if (!node?.id) return;
+    const nodeId = String(node.id);
+    if (seen.has(nodeId)) return;
+    const selectedAlpha = clamp(Number(entry.selectedAlpha) || 0, 0, 1);
+    const hoverAlpha = cloudHoverUnderlineAlpha(nodeId, now);
+    if (entry.alpha <= 0.01 && selectedAlpha <= 0.01 && hoverAlpha <= 0.01) return;
+    seen.add(nodeId);
+    entries.push(entry);
+  };
+  for (const entry of cloudCurrentRenderEntries(now)) addEntry(entry);
+  if (cloudSelectedGenreId && !seen.has(String(cloudSelectedGenreId))) {
+    const node = cloudScene?.nodesById?.get(cloudSelectedGenreId);
+    if (node) {
+      addEntry({
+        node,
+        alpha: 0,
+        relationshipAlpha: cloudNodeRelationshipTargetAlpha(node),
+        selectedAlpha: 1,
+      });
+    }
+  }
+  return entries;
+}
+
+function renderCloudCanvasNow(frameNow = performance.now()) {
+  const now = Number.isFinite(Number(frameNow)) ? Number(frameNow) : performance.now();
+  const renderStartedAt = performance.now();
+  cloudCanvasFrame = 0;
+  if (!cloudLabelCanvas || !cloudLabelCtx) return;
+  resizeCloudCanvas();
+  const activePresentation = stepCloudPresentation(now);
+  if (activePresentation) scheduleCloudFade();
+  stepCloudSelectedMarker(now);
+  const ctx = cloudLabelCtx;
+  const width = vw();
+  const height = vh();
+  ctx.clearRect(0, 0, width, height);
+  if (!cloudMode) {
+    if (cloudInitialRenderPending) setCloudInitialLoading(false);
+    cloudCanvasHitNodes = [];
+    cloudSelectedMarker = null;
+    clearCloudSelectedMarkerAnimation();
+    return;
+  }
+  drawCloudBackgroundField(ctx, width, height);
+  const selectedSceneNode = cloudSelectedGenreId ? cloudScene?.nodesById?.get(cloudSelectedGenreId) : null;
+  if (
+    !cloudCanvasNodes.length &&
+    !cloudPresentationById.size &&
+    !cloudRenderSnapshot?.entriesById?.size &&
+    !cloudRenderTransition &&
+    !selectedSceneNode
+  ) {
+    cloudCanvasHitNodes = [];
+    cloudSelectedMarker = null;
+    clearCloudSelectedMarkerAnimation();
+    return;
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const { fontFamily, fallbackTextColor } = cloudCanvasRenderStyles();
+  ctx.font = `650 ${CLOUD_FONT_SIZE}px ${fontFamily}`;
+  const drawableEntries = cloudDrawableEntries(now);
+  const occupiedRects = [];
+  const drawEntry = entry => {
+    const node = entry?.node;
+    if (!node) return false;
+    const alpha = clamp(Number(entry.alpha) || 0, 0, 1);
+    const selectedAlpha = clamp(Number(entry.selectedAlpha) || 0, 0, 1);
+    if (alpha <= 0.01 && selectedAlpha <= 0.01) return false;
+    const x = Number(node.x) * viewScale + viewTx;
+    const y = Number(node.y) * viewScale + viewTy;
+    const widthPx = cloudRenderedBoxWidth(node);
+    const heightPx = cloudBoxHeight(node);
+    const halfWidth = widthPx / 2;
+    const halfHeight = heightPx / 2;
+    if (
+      x + halfWidth < -CLOUD_CANVAS_HIT_PAD_PX ||
+      x - halfWidth > width + CLOUD_CANVAS_HIT_PAD_PX ||
+      y + halfHeight < -CLOUD_CANVAS_HIT_PAD_PX ||
+      y - halfHeight > height + CLOUD_CANVAS_HIT_PAD_PX
+    ) {
+      return false;
+    }
+    occupiedRects.push({
+      left: x - halfWidth,
+      right: x + halfWidth,
+      top: y - halfHeight,
+      bottom: y + halfHeight,
+    });
+    const hoverUnderlineAlpha = cloudHoverUnderlineAlpha(node.id, now);
+    const relationshipAlpha = clamp(Number(entry.relationshipAlpha) || 0, 0, 1);
+    const normalAlpha = 0.94 * alpha * relationshipAlpha * Math.max(0, 1 - selectedAlpha);
+    const textColor = cloudCanvasTextColor(node, fallbackTextColor);
+    if (normalAlpha > 0.01) {
+      ctx.globalAlpha = normalAlpha;
+      const sprite = cloudLabelSprite(node, false, fontFamily, fallbackTextColor);
+      if (sprite) {
+        ctx.drawImage(sprite.canvas, x - sprite.width / 2, y - sprite.height / 2, sprite.width, sprite.height);
+      } else {
+        ctx.font = `650 ${CLOUD_FONT_SIZE}px ${fontFamily}`;
+        ctx.fillStyle = textColor;
+        ctx.fillText(node.label || node.wikipedia_title || "", x, y);
+      }
+    }
+    if (hoverUnderlineAlpha > 0.01 && node.id !== cloudSelectedGenreId) {
+      const underlineWidth = Math.max(12, cloudTextWidth(node) - 2);
+      ctx.save();
+      ctx.globalAlpha = 0.96 * alpha * relationshipAlpha * hoverUnderlineAlpha;
+      ctx.strokeStyle = textColor;
+      ctx.lineWidth = 1.15;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(x - underlineWidth / 2, y + cloudTextHeight(node) * 0.35);
+      ctx.lineTo(x + underlineWidth / 2, y + cloudTextHeight(node) * 0.35);
+      ctx.stroke();
+      ctx.restore();
+    }
+    if (selectedAlpha > 0.01) {
+      ctx.globalAlpha = selectedAlpha;
+      const selectedSprite = cloudLabelSprite(node, true, fontFamily, fallbackTextColor);
+      if (selectedSprite) {
+        ctx.drawImage(
+          selectedSprite.canvas,
+          x - selectedSprite.width / 2,
+          y - selectedSprite.height / 2,
+          selectedSprite.width,
+          selectedSprite.height
+        );
+      }
+    }
+    return true;
+  };
+  let selectedLabelDrawn = false;
+  for (const entry of drawableEntries) {
+    const drew = drawEntry(entry);
+    const node = entry.node;
+    if (drew && node.id === cloudSelectedGenreId) selectedLabelDrawn = true;
+  }
+  const selectedNode = selectedSceneNode;
+  if (selectedNode && !selectedLabelDrawn && !drawableEntries.some(entry => entry.node.id === cloudSelectedGenreId)) {
+    selectedLabelDrawn = drawEntry({
+      node: selectedNode,
+      alpha: 0,
+      relationshipAlpha: cloudNodeRelationshipTargetAlpha(selectedNode),
+    });
+  }
+  cloudSelectedMarker = null;
+  clearCloudSelectedMarkerAnimation();
+  ctx.globalAlpha = 1;
+	  const activeDrawableEntries = drawableEntries.filter(entry => entry?.active !== false);
+	  cloudCanvasHitNodes = activeDrawableEntries;
+	  if (window.__wikiGenresCloudCullDebug) {
+	    const presentationDelta = cloudPresentationMaxDelta();
+	    const exitingPresentationNodes = drawableEntries.length - activeDrawableEntries.length;
+	    window.__wikiGenresCloudCullDebug.canvasFadeNodes = cloudCanvasAlphaById.size;
+	    window.__wikiGenresCloudCullDebug.presentationNodes = cloudPresentationById.size;
+	    window.__wikiGenresCloudCullDebug.exitingPresentationNodes = exitingPresentationNodes;
+	    window.__wikiGenresCloudCullDebug.presentationDelta = presentationDelta;
+	    window.__wikiGenresCloudCullDebug.drawableNodes = drawableEntries.length;
+    window.__wikiGenresCloudCullDebug.canvasHitNodes = cloudCanvasHitNodes.length;
+    window.__wikiGenresCloudCullDebug.clickEnabled = cloudCanClickNodes();
+    window.__wikiGenresCloudCullDebug.hoveredNodeId = cloudHoveredNodeId;
+    window.__wikiGenresCloudCullDebug.selectedMarker = null;
+    window.__wikiGenresCloudCullDebug.renderTransitionActive = presentationDelta > CLOUD_PRESENTATION_EPSILON || Boolean(cloudRenderTransition);
+    window.__wikiGenresCloudCullDebug.renderTransitionProgress = cloudRenderTransition
+      ? cloudRenderTransitionProgress(now)
+      : 1 - clamp(presentationDelta, 0, 1);
+    window.__wikiGenresCloudCullDebug.renderMs = performance.now() - renderStartedAt;
+  }
+}
+
+function scheduleCloudCanvasRender() {
+  if (cloudCanvasFrame) return;
+  cloudCanvasFrame = requestAnimationFrame(renderCloudCanvasNow);
+}
+
+function cloudCanvasHitTest(clientX, clientY) {
+  if (!cloudMode || !cloudCanvasHitNodes.length) return null;
+  const rect = svg.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+	  for (let index = cloudCanvasHitNodes.length - 1; index >= 0; index -= 1) {
+	    const entry = cloudCanvasHitNodes[index];
+	    const node = entry?.node || entry;
+	    if (!node?.id) continue;
+	    const visualAlpha = Number(entry?.alpha ?? cloudCanvasNodeAlpha(node.id));
+	    if (visualAlpha <= 0.45 && node.id !== cloudSelectedGenreId) continue;
+    const screenX = Number(node.x) * viewScale + viewTx;
+    const screenY = Number(node.y) * viewScale + viewTy;
+    const widthPx = cloudRenderedBoxWidth(node);
+    const heightPx = cloudBoxHeight(node);
+    const halfWidth = widthPx / 2 + CLOUD_CANVAS_HIT_PAD_PX;
+    const halfHeight = heightPx / 2 + CLOUD_CANVAS_HIT_PAD_PX;
+    if (
+      x >= screenX - halfWidth &&
+      x <= screenX + halfWidth &&
+      y >= screenY - halfHeight &&
+      y <= screenY + halfHeight
+    ) {
+      return node;
+    }
+  }
+  return null;
+}
+
+function cloudSelectedMarkerHit(clientX, clientY) {
+  return false;
+}
+
+function cloudDomWindowSignature(activeLayerScale = cloudActiveLayerScale()) {
+  const scale = Math.max(0.001, viewScale);
+  const tileWorld = CLOUD_DOM_WINDOW_TILE_PX / scale;
+  const left = (0 - viewTx) / scale;
+  const top = (0 - viewTy) / scale;
+  const scaleBucket = Math.round(Math.log(scale) / Math.log(1.035));
+  return [
+    activeLayerScale ?? "",
+    scaleBucket,
+    Math.floor(left / tileWorld),
+    Math.floor(top / tileWorld),
+    Math.ceil(vw() / CLOUD_DOM_WINDOW_TILE_PX),
+    Math.ceil(vh() / CLOUD_DOM_WINDOW_TILE_PX),
+  ].join("|");
+}
+
+function mergeCloudLayerSnapshot(snapshot, options = {}) {
   const data = normalizedCloudData(snapshot);
   if (!cloudScene) resetCloudScene(data.stats || {});
+  const snapshotSignature = options.atlasSignature || cloudLastFetchSignature || cloudAtlasSignature();
+  if (
+    data.stream?.kind === "scale_layer" &&
+    snapshotSignature &&
+    cloudScene.atlasSignature !== snapshotSignature
+  ) {
+    activateCloudScaleLayersForSignature(snapshotSignature);
+  }
   cloudScene.stats = {
     ...cloudScene.stats,
     ...(data.stats || {}),
@@ -9091,6 +14317,45 @@ function mergeCloudLayerSnapshot(snapshot) {
     layerIds.add(node.id);
   }
   cloudScene.layersByTier.set(tier, layerIds);
+  if (data.stream?.kind === "scale_layer") {
+    const scale = Number(data.stream.scale);
+    if (Number.isFinite(scale)) {
+      let ids = cloudScene.layerIdsByScale.get(scale);
+      if (!ids) {
+        const previousScales = cloudSortedLayerScales(cloudScene).filter(existingScale => existingScale < scale);
+        const previousScale = previousScales.length ? previousScales[previousScales.length - 1] : null;
+        ids = new Set(previousScale == null ? [] : cloudScene.layerIdsByScale.get(previousScale) || []);
+      }
+	      const addIds = data.stream.delta
+	        ? data.stream.add_node_ids || data.stream.visible_node_ids || []
+	        : data.stream.visible_node_ids || [];
+	      for (const nodeId of addIds) ids.add(String(nodeId));
+	      for (const nodeId of data.stream.remove_node_ids || []) ids.delete(String(nodeId));
+	      for (const node of data.nodes || []) ids.add(String(node.id));
+	      cloudScene.layerIdsByScale.set(scale, ids);
+	      cloudScene.layerSpatialByScale?.delete(scale);
+	      if (Array.isArray(data.stream.tiles) && data.stream.tiles.length) {
+	        const cells = new Map();
+	        for (const tile of data.stream.tiles) {
+	          const tileX = Number(tile?.x);
+	          const tileY = Number(tile?.y);
+	          if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) continue;
+	          const nodeIds = Array.isArray(tile?.node_ids)
+	            ? tile.node_ids.map(nodeId => String(nodeId))
+	            : [];
+	          cells.set(`${tileX}:${tileY}`, nodeIds);
+	        }
+	        cloudScene.layerTilesByScale?.set(scale, {
+	          scale,
+	          tileSize: Number(data.stream.tile_size) || CLOUD_DOM_WINDOW_TILE_PX,
+	          cells,
+	        });
+	      }
+	      cloudScene.layerScales = [];
+      cloudScene.layerScales = cloudSortedLayerScales(cloudScene);
+      cloudScene.awaitingScaleLayer = false;
+    }
+  }
   cloudScene.loadedLayers.add(layer);
   cloudScene.complete = Boolean(data.stream?.complete);
   cloudNodeById = cloudScene.nodesById;
@@ -9103,13 +14368,34 @@ function mergeCloudLayerSnapshot(snapshot) {
   return data;
 }
 
-function fitCloudView(data = cloudData) {
+function cloudNodeFromData(data, genreId) {
+  if (!genreId) return null;
+  return cloudScene?.nodesById?.get?.(genreId) ||
+    (data?.nodes || []).find(node => node.id === genreId) ||
+    null;
+}
+
+function fitCloudView(data = cloudData, options = {}) {
   const bounds = cloudStatsBounds(data);
   if (!bounds) return;
   cloudBounds = bounds;
-  viewScale = 1;
-  viewTx = focusX();
-  viewTy = focusY();
+  const selectedId = options.selectedGenreId && options.selectedGenreId !== ROOT_KEY
+    ? options.selectedGenreId
+    : null;
+  const focusNode = cloudNodeFromData(data, selectedId) ||
+    cloudNodeFromData(data, cloudRootGenreId) ||
+    cloudNodeFromData(data, ROOT_KEY);
+  const baselineScale = cloudLodBaselineScale(bounds);
+  viewScale = selectedId
+    ? clampViewScale(Math.max(0.92, baselineScale * 3.2))
+    : clampViewScale(baselineScale);
+  if (focusNode) {
+    viewTx = focusX() - Number(focusNode.x || 0) * viewScale;
+    viewTy = focusY() - Number(focusNode.y || 0) * viewScale;
+  } else {
+    viewTx = focusX() - ((Number(bounds.minX) + Number(bounds.maxX)) / 2) * viewScale;
+    viewTy = focusY() - ((Number(bounds.minY) + Number(bounds.maxY)) / 2) * viewScale;
+  }
   writeWorldTransform();
 }
 
@@ -9119,9 +14405,24 @@ function removeNonCloudSceneNodes() {
   }
 }
 
+function prepareCloudSceneDom() {
+  if (cloudSceneDomPrepared) return;
+  edgesG.innerHTML = "";
+  removeNonCloudSceneNodes();
+  for (const el of cloudNodeEls.values()) el.remove();
+  cloudNodeEls = new Map();
+  cloudTextEls = new Map();
+  nodeEls = new Map();
+  edgeEls = new Map();
+  edgeGradientEls = new Map();
+  ensureEdgeGradientDefs().innerHTML = "";
+  cloudSceneDomPrepared = true;
+}
+
 function buildCloudNodeEl(node, inverseScale, isEntering = false) {
+  const isSelected = node.id === cloudSelectedGenreId;
   const group = svgEl("g", {
-    class: `cloud-node${isEntering ? "" : " cloud-node-visible"}${node.id === cloudSelectedGenreId ? " cloud-node-selected" : ""}`,
+    class: `cloud-node${isEntering ? "" : " cloud-node-visible"}${isSelected ? " cloud-node-selected" : ""}${detailKeyForCloudNodeId(node.id) === cloudDetailIndicatorKey() ? " cloud-node-detail-preview" : ""}`,
     transform: `translate(${node.x} ${node.y})`,
     tabindex: "0",
     role: "button",
@@ -9131,15 +14432,34 @@ function buildCloudNodeEl(node, inverseScale, isEntering = false) {
   const readableColor = node.similarity_color;
   if (readableColor) group.style.setProperty("--genre-color", readableColor);
   if (node.id === ROOT_KEY) group.classList.add("cloud-node-root");
+  const textWidth = cloudTextWidth(node);
+  const underline = svgEl("line", {
+    class: "cloud-node-underline",
+    x1: -(textWidth / 2) + 1,
+    x2: (textWidth / 2) - 1,
+    y1: CLOUD_FONT_SIZE * 0.58,
+    y2: CLOUD_FONT_SIZE * 0.58,
+  });
   const text = svgEl("text", {
     class: "cloud-node-label",
     "font-size": CLOUD_FONT_SIZE,
     transform: `scale(${inverseScale})`,
     x: 0,
     y: 0,
+    "dominant-baseline": "central",
   });
   text.textContent = node.label;
+  group.append(underline);
   group.append(text);
+  group.__cloudTextEl = text;
+  group.addEventListener("pointerenter", () => {
+    if (!cloudMode || !cloudCanClickNodes()) return;
+    scheduleCloudHoverCard(node.id);
+  });
+  group.addEventListener("pointerleave", () => {
+    if (!cloudMode) return;
+    clearScheduledCloudHoverCard(detailKeyForCloudNodeId(node.id));
+  });
   group.addEventListener("click", () => {
     void openCloudGenre(node.id);
   });
@@ -9157,6 +14477,7 @@ function retireCloudNodeAfterFade(nodeId, el) {
     if (!el.classList.contains("cloud-node-exiting")) return;
     if (el.parentNode) el.remove();
     cloudNodeEls.delete(nodeId);
+    cloudTextEls.delete(nodeId);
   }, prefersReducedMotion() ? 0 : 160);
 }
 
@@ -9181,7 +14502,9 @@ function renderCloud(data = cloudData, options = {}) {
     const existing = cloudNodeEls.get(node.id);
     if (existing) {
       existing.setAttribute("transform", `translate(${node.x} ${node.y})`);
-      existing.classList.toggle("cloud-node-selected", node.id === cloudSelectedGenreId);
+      const isSelected = node.id === cloudSelectedGenreId;
+      existing.classList.toggle("cloud-node-selected", isSelected);
+      existing.classList.toggle("cloud-node-detail-preview", detailKeyForCloudNodeId(node.id) === cloudDetailIndicatorKey());
       existing.classList.toggle("cloud-node-root", node.id === ROOT_KEY);
       existing.classList.remove("cloud-node-exiting");
       existing.classList.add("cloud-node-visible");
@@ -9192,6 +14515,7 @@ function renderCloud(data = cloudData, options = {}) {
       if (text) {
         text.setAttribute("transform", `scale(${inverseScale})`);
         if (text.textContent !== node.label) text.textContent = node.label;
+        cloudTextEls.set(node.id, text);
       }
       continue;
     }
@@ -9199,6 +14523,7 @@ function renderCloud(data = cloudData, options = {}) {
     const group = buildCloudNodeEl(node, inverseScale, !options.noFade);
     nodesG.appendChild(group);
     cloudNodeEls.set(node.id, group);
+    if (group.__cloudTextEl) cloudTextEls.set(node.id, group.__cloudTextEl);
     if (!options.noFade) enteringNodes.push(group);
   }
 
@@ -9228,63 +14553,30 @@ function updateCloudLodVisibility(options = {}) {
     updateCloudNodeScale();
     return;
   }
+  if (options.immediate && cloudRenderFrame) {
+    cancelAnimationFrame(cloudRenderFrame);
+    cloudRenderFrame = null;
+  }
   if (cloudRenderFrame && !options.immediate) return;
-  const run = () => {
+  const run = frameNow => {
+    const now = Number.isFinite(Number(frameNow)) ? Number(frameNow) : performance.now();
     cloudRenderFrame = null;
     if (!cloudMode || !cloudScene) return;
-    edgesG.innerHTML = "";
-    removeNonCloudSceneNodes();
-    nodeEls = new Map();
-    edgeEls = new Map();
-    edgeGradientEls = new Map();
-    ensureEdgeGradientDefs().innerHTML = "";
+    prepareCloudSceneDom();
 
     const inverseScale = 1 / Math.max(0.001, viewScale);
-    const bounds = cloudViewportWorldBounds();
-    const nextNodeIds = new Set();
+    let nextNodeIds = new Set();
     const enteringNodes = [];
-    const occupiedBuckets = new Map();
-    const nodesToConsider = Array.from(cloudScene.nodesById.values())
-      .sort((a, b) => (
-        (Number(a.lod_rank) || 0) - (Number(b.lod_rank) || 0) ||
-        (Number(a.lod_tier) || 0) - (Number(b.lod_tier) || 0) ||
-        (Number(b.lod_score) || 0) - (Number(a.lod_score) || 0) ||
-        String(a.label || a.wikipedia_title || "").localeCompare(String(b.label || b.wikipedia_title || ""))
-      ));
-    for (const node of nodesToConsider) {
-      const wasVisible = cloudVisibleNodeIds.has(node.id);
-      if (!cloudNodePassesLod(node, wasVisible) || !cloudNodeIntersectsViewport(node, bounds)) continue;
-      const rect = cloudNodeScreenRect(node);
-      const forceVisible = node.id === cloudSelectedGenreId || node.id === ROOT_KEY;
-      if (!forceVisible && cloudRectOverlapsOccupied(rect, occupiedBuckets)) continue;
-      cloudOccupyRect(rect, occupiedBuckets);
-      nextNodeIds.add(node.id);
-      const existing = cloudNodeEls.get(node.id);
-      if (existing) {
-        existing.setAttribute("transform", `translate(${node.x} ${node.y})`);
-        existing.classList.toggle("cloud-node-selected", node.id === cloudSelectedGenreId);
-        existing.classList.toggle("cloud-node-root", node.id === ROOT_KEY);
-        existing.classList.remove("cloud-node-exiting");
-        existing.classList.add("cloud-node-visible");
-        existing.setAttribute("aria-label", node.label);
-        existing.dataset.lodTier = String(node.lod_tier ?? "");
-        existing.dataset.lodRank = String(node.lod_rank ?? "");
-        if (node.similarity_color) existing.style.setProperty("--genre-color", node.similarity_color);
-        else existing.style.removeProperty("--genre-color");
-        const text = existing.querySelector(".cloud-node-label");
-        if (text) {
-          text.setAttribute("transform", `scale(${inverseScale})`);
-          if (text.textContent !== node.label) text.textContent = node.label;
-        }
-        continue;
-      }
-      const group = buildCloudNodeEl(node, inverseScale, !options.noFade);
-      group.dataset.lodTier = String(node.lod_tier ?? "");
-      group.dataset.lodRank = String(node.lod_rank ?? "");
-      nodesG.appendChild(group);
-      cloudNodeEls.set(node.id, group);
-      if (!options.noFade) enteringNodes.push(group);
-    }
+    const activeLayerScale = cloudActiveLayerScale(cloudScene);
+    const windowSignature = cloudDomWindowSignature(activeLayerScale);
+    const lodTarget = cloudClientLodTarget(cloudScene, activeLayerScale);
+    nextNodeIds = lodTarget.nextNodeIds;
+    const layerIds = lodTarget.layerIds;
+    let hiddenForLayer = Math.max(0, cloudScene.nodesById.size - layerIds.size);
+    let hiddenForViewport = lodTarget.hiddenForViewport;
+    const hiddenForOverlap = lodTarget.hiddenForOverlap;
+    const candidateIds = lodTarget.candidateIds;
+    hiddenForLayer += lodTarget.missingCandidates;
 
     for (const [nodeId, el] of cloudNodeEls.entries()) {
       if (nextNodeIds.has(nodeId)) continue;
@@ -9301,8 +14593,49 @@ function updateCloudLodVisibility(options = {}) {
     } else {
       for (const el of enteringNodes) el.classList.add("cloud-node-visible");
     }
-    const total = cloudScene.stats?.total_nodes || cloudScene.nodesById.size;
-    const loaded = cloudScene.nodesById.size;
+	    const total = cloudScene.stats?.total_nodes || cloudScene.nodesById.size;
+	    const loaded = cloudScene.nodesById.size;
+	    const activeLayerReady = cloudActiveLayerCaughtUp(cloudScene);
+	    window.__wikiGenresCloudCullDebug = {
+      visible: nextNodeIds.size,
+      total,
+      loaded,
+      spatialCandidates: candidateIds.size,
+      hiddenForLayer,
+      hiddenForViewport,
+      hiddenForOverlap,
+      blockers: [],
+      zoom: viewScale,
+      activeLayerScale,
+      windowSignature,
+      renderBackend: "canvas",
+	      canvasNodes: nextNodeIds.size,
+	      canvasFadeNodes: cloudCanvasAlphaById.size,
+	      loadedLayerScales: cloudSortedLayerScales(cloudScene),
+	      lodBaselineScale: cloudLodBaselineScale(),
+	      activeLayerReady,
+	      cloudLoading: cloudInitialRenderPending,
+	      lodTargetSource: lodTarget.source,
+	    };
+    cloudCanvasNodes = Array.from(nextNodeIds)
+      .map(nodeId => cloudScene.nodesById.get(nodeId))
+      .filter(Boolean);
+    updateCloudCanvasFadeTargets(cloudCanvasNodes, {
+      noFade: options.noFade || cloudInitialRenderPending,
+      hydrateNew: options.hydrateNew,
+      now,
+    });
+    const drawableNodes = cloudDrawableNodes();
+    updateCloudSelectedLabelFadeTargets(drawableNodes);
+    updateCloudHoverUnderlineAlphaTargets(drawableNodes);
+    updateCloudRelationshipAlphaTargets(drawableNodes);
+    cloudRenderedLayerScale = activeLayerScale;
+    cloudRenderedTextScale = viewScale;
+    cloudRenderedWindowSignature = windowSignature;
+    scheduleCloudCanvasRender();
+    if (cloudInitialRenderPending && cloudActiveLayerCaughtUp(cloudScene)) {
+      finishCloudInitialLoadingAfterPaint();
+    }
     setStatus(`${nextNodeIds.size} visible of ${total} cloud genres${loaded < total ? ` (${loaded} preloaded)` : ""}`);
     updateTargetButtonVisibility();
   };
@@ -9311,12 +14644,15 @@ function updateCloudLodVisibility(options = {}) {
 }
 
 function updateCloudNodeScale() {
-  if (!cloudMode || !cloudNodeEls.size) return;
-  const inverseScale = 1 / Math.max(0.001, viewScale);
-  for (const el of cloudNodeEls.values()) {
-    const text = el.querySelector(".cloud-node-label");
-    if (text) text.setAttribute("transform", `scale(${inverseScale})`);
-  }
+  if (!cloudMode) return;
+  if (Math.abs(cloudRenderedTextScale - viewScale) < 0.0005) return;
+  cloudRenderedTextScale = viewScale;
+	  if (cloudCanvasNodes.length) {
+	    updateCloudSelectedLabelFadeTargets(cloudCanvasNodes);
+	    updateCloudHoverUnderlineAlphaTargets(cloudCanvasNodes);
+	    updateCloudRelationshipAlphaTargets(cloudCanvasNodes);
+	  }
+  scheduleCloudCanvasRender();
 }
 
 async function loadCloudMode(options = {}) {
@@ -9326,39 +14662,54 @@ async function loadCloudMode(options = {}) {
     viewTx = focusX();
     viewTy = focusY();
     writeWorldTransform();
+    setCloudInitialLoading(true);
+  } else if (!cloudInitialRenderPending) {
+    setCloudInitialLoading(false);
   }
   setStatus("Loading cloud...");
   cloudLastFetchAt = Date.now();
-  cloudLastFetchSignature = [
-    cloudRootGenreId || "",
-    cloudSelectedGenreId || "",
-    "atlas",
-  ].join("|");
+  const atlasSignature = cloudAtlasSignature();
+  cloudLastFetchSignature = atlasSignature;
   if (cloudStreamController) cloudStreamController.abort();
   const controller = new AbortController();
   cloudStreamController = controller;
   let fittedInitialView = false;
-  resetCloudScene();
+  let renderedInitialSnapshot = false;
+  prepareCloudSceneForReload({ ...options, atlasSignature });
   try {
     await streamNdjson(cloudStreamUrl(), {
       signal: controller.signal,
       onSnapshot: snapshot => {
         if (token !== cloudRequestToken || !cloudMode) return;
-        const data = mergeCloudLayerSnapshot(snapshot);
+        const data = mergeCloudLayerSnapshot(snapshot, { atlasSignature });
         if (options.initial && !fittedInitialView) {
-          fitCloudView(cloudData);
+          fitCloudView(cloudData, {
+            selectedGenreId: cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY
+              ? cloudSelectedGenreId
+              : null,
+          });
           fittedInitialView = true;
         }
-        updateCloudLodVisibility({ noFade: options.noFade, immediate: true });
+        updateCloudLodVisibility({
+          noFade: options.noFade,
+          hydrateNew: options.preserveView && !options.initial,
+          immediate: !renderedInitialSnapshot,
+        });
+        renderedInitialSnapshot = true;
       },
     });
   } catch (err) {
     if (err?.name === "AbortError") return;
+    setCloudInitialLoading(false);
     cloudStreamRetryAfter = Date.now() + 1200;
     if (cloudScene?.nodesById?.size) {
       console.warn("[wiki-genres] cloud stream ended after partial atlas; keeping loaded layers", err);
       cloudScene.complete = false;
-      updateCloudLodVisibility({ noFade: options.noFade, immediate: true });
+      updateCloudLodVisibility({
+        noFade: options.noFade,
+        hydrateNew: options.preserveView && !options.initial,
+        immediate: true,
+      });
       return;
     }
     console.warn("[wiki-genres] cloud stream failed; falling back to JSON", err);
@@ -9366,16 +14717,33 @@ async function loadCloudMode(options = {}) {
       const data = normalizedCloudData(await getCloudData({ atlas: true }));
       if (token !== cloudRequestToken || !cloudMode) return;
       resetCloudScene(data.stats || {});
+      cloudScene.atlasSignature = atlasSignature;
+      cloudScene.pendingAtlasSignature = "";
       for (const node of data.nodes || []) cloudScene.nodesById.set(node.id, node);
       cloudScene.complete = true;
       cloudNodeById = cloudScene.nodesById;
       cloudData = data;
-      if (options.initial && !fittedInitialView) fitCloudView(data);
-      updateCloudLodVisibility({ noFade: options.noFade, immediate: true });
+      if (options.initial && !fittedInitialView) {
+        fitCloudView(data, {
+          selectedGenreId: cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY
+            ? cloudSelectedGenreId
+            : null,
+        });
+      }
+      finishCloudInitialLoadingAfterPaint();
+      updateCloudLodVisibility({
+        noFade: options.noFade,
+        hydrateNew: options.preserveView && !options.initial,
+        immediate: true,
+      });
     } catch (fallbackErr) {
       if (cloudScene?.nodesById?.size) {
         console.warn("[wiki-genres] cloud fallback failed; keeping partial atlas", fallbackErr);
-        updateCloudLodVisibility({ noFade: options.noFade, immediate: true });
+        updateCloudLodVisibility({
+          noFade: options.noFade,
+          hydrateNew: options.preserveView && !options.initial,
+          immediate: true,
+        });
         return;
       }
       throw fallbackErr;
@@ -9396,6 +14764,7 @@ async function loadCloudMode(options = {}) {
     }
   }
   if (token !== cloudRequestToken || !cloudMode || !cloudScene) return;
+  finishCloudInitialLoadingAfterPaint();
   cloudData = {
     nodes: Array.from(cloudScene.nodesById.values()),
     stats: cloudScene.stats,
@@ -9404,15 +14773,11 @@ async function loadCloudMode(options = {}) {
 
 function scheduleCloudFetch(delay = 90) {
   if (!cloudMode) return;
-  if (cloudScene?.complete) {
+  const signature = cloudAtlasSignature();
+  if (cloudScene?.complete && signature === cloudLastFetchSignature) {
     updateCloudLodVisibility();
     return;
   }
-  const signature = [
-    cloudRootGenreId || "",
-    cloudSelectedGenreId || "",
-    cloudScene?.nodesById?.size || 0,
-  ].join("|");
   if (signature === cloudLastFetchSignature && cloudScene?.nodesById?.size) return;
   if (Date.now() < cloudStreamRetryAfter) delay = Math.max(delay, cloudStreamRetryAfter - Date.now());
   if (cloudStreamController) {
@@ -9432,21 +14797,26 @@ function scheduleCloudFetch(delay = 90) {
   }, wait);
 }
 
-async function openCloudGenre(genreId) {
+async function openCloudGenre(genreId, options = {}) {
   if (!genreId) return;
-  if (cloudSelectedGenreId === genreId && genreId !== ROOT_KEY) {
+  if (cloudSelectedGenreId === genreId && genreId !== ROOT_KEY && !options.forceOpen) {
     cloudSelectedGenreId = null;
-    detailCardNodeKey = null;
+    resetCloudScaleLayersForSignature();
+    setDetailCardNodeKey(null);
     hoverCardToken++;
     setStatus("");
     updateDetailCardVisibility();
     updateUrlState({ push: true });
     updateCloudLodVisibility({ immediate: true });
+    scheduleCloudFetch(0);
+    void updateMapCard(nodes.get(ROOT_KEY));
     return;
   }
   allowDetailCardForManualSelection();
   cloudSelectedGenreId = genreId;
-  detailCardNodeKey = `cloud-${genreId}`;
+  startCloudSelectedLabelFade(genreId);
+  resetCloudScaleLayersForSignature();
+  setDetailCardNodeKey(detailKeyForCloudNodeId(genreId));
   updateDetailCardVisibility();
   updateUrlState({ push: true });
   updateCloudLodVisibility({ immediate: true });
@@ -9457,11 +14827,15 @@ async function openCloudGenre(genreId) {
   }
   panToSelectedCenterTarget({ holdDetailCard: true });
   scheduleCloudFetch(0);
-  if (genreId === ROOT_KEY) return;
+  if (genreId === ROOT_KEY) {
+    void updateMapCard(nodes.get(ROOT_KEY));
+    return;
+  }
+  if (cloudNode) void updateMapCard(cloudNodeFromPayload(cloudNode));
   try {
     const detail = await getGenreDetail(genreId);
     if (!cloudMode || cloudSelectedGenreId !== genreId) return;
-    detailCardNodeKey = `cloud-${genreId}`;
+    setDetailCardNodeKey(detailKeyForCloudNodeId(genreId));
     updateCard(detail);
     updateYoutubeCardForSelection(detail);
     void updateMapCard(detail);
@@ -9474,15 +14848,17 @@ async function openCloudGenre(genreId) {
 }
 
 function openRegionalCloud(item) {
-  if (!item?.genre_id) return;
+  if (!item?.genre_id || !item?.region_id) return;
   allowDetailCardForManualSelection();
-  cloudRootGenreId = item.genre_id;
+  cloudRootGenreId = null;
+  cloudRegionId = item.region_id;
   cloudSelectedGenreId = item.genre_id;
-  detailCardNodeKey = `cloud-${item.genre_id}`;
+  startCloudSelectedLabelFade(item.genre_id);
+  setDetailCardNodeKey(detailKeyForCloudNodeId(item.genre_id));
   updateUrlState({ push: true });
   void loadCloudMode({ initial: true }).then(() => {
-    if (!cloudMode || cloudRootGenreId !== item.genre_id) return;
-    return openCloudGenre(item.genre_id);
+    if (!cloudMode || cloudRegionId !== item.region_id) return;
+    return openCloudGenre(item.genre_id, { forceOpen: true });
   }).catch(err => {
     console.error("[wiki-genres] regional cloud failed", err);
     setStatus("Cloud unavailable.");
@@ -9499,20 +14875,36 @@ function panToCloudSelection() {
   );
 }
 
+function focusCloudSelectedMarker() {
+  const node = cloudSelectedGenreId ? cloudNodeById.get(cloudSelectedGenreId) : null;
+  if (!node) return;
+  const targetScale = Math.max(viewScale, 1);
+  tweenPanTo(
+    focusX() - node.x * targetScale,
+    focusY() - node.y * targetScale,
+    520,
+    null,
+    targetScale
+  );
+}
+
 function setCloudMode(enabled, options = {}) {
   const wantsCloud = Boolean(enabled);
-  const selectedBeforeSwap = activeSelectedGenreId() || selectedGenreIdFromUrlPath();
+  const selectedBeforeSwap = selectedGenreIdForModeTransfer();
   const realSelectedBeforeSwap = selectedBeforeSwap && selectedBeforeSwap !== ROOT_KEY ? selectedBeforeSwap : null;
   if (wantsCloud && timelineMode) {
     historyNavigating = true;
-    setTimelineMode(false);
+    setTimelineMode(false, { skipGraphRestore: true });
     historyNavigating = false;
   }
   cloudMode = wantsCloud;
   document.body.classList.toggle("cloud-mode", cloudMode);
-  cloudToggleButton?.classList.toggle("active", cloudMode);
-  cloudToggleButton?.setAttribute("aria-label", cloudMode ? "Close word cloud" : "Open word cloud");
-  setModeButtonIcon(cloudToggleButton, cloudMode ? "polyline" : "mist");
+  updateManualUiDimClass();
+  cloudToggleButton?.classList.remove("active");
+  setModeButtonState(cloudToggleButton, cloudMode
+    ? { icon: "polyline", label: "Graph", ariaLabel: "Return to graph" }
+    : { icon: "mist", label: "Cloud", ariaLabel: "Open word cloud" }
+  );
   if (cloudMode) {
     if (panAnimTimer) {
       clearInterval(panAnimTimer);
@@ -9529,9 +14921,14 @@ function setCloudMode(enabled, options = {}) {
     edgeEls = new Map();
     edgeGradientEls = new Map();
     cloudRootGenreId = null;
+    cloudRegionId = null;
     cloudSelectedGenreId = realSelectedBeforeSwap;
+    clearScheduledCloudHoverCard();
+    cloudHoverCardDelayTimer = 0;
+    pendingCloudHoverCardKey = null;
+    cloudHoverUnderlineAlphaById = new Map();
     if (realSelectedBeforeSwap) {
-      detailCardNodeKey = `cloud-${realSelectedBeforeSwap}`;
+      setDetailCardNodeKey(detailKeyForCloudNodeId(realSelectedBeforeSwap));
       const maybeDetail = detailCache.get(realSelectedBeforeSwap) || nodes.get(activeLeafKey) || nodes.get(currentKey) || null;
       if (maybeDetail) {
         updateCard(maybeDetail);
@@ -9544,24 +14941,78 @@ function setCloudMode(enabled, options = {}) {
       void loadCloudMode({ initial: true }).then(() => {
         if (!cloudMode || !cloudSelectedGenreId || cloudSelectedGenreId === ROOT_KEY) {
           updateDetailCardVisibility();
+          void updateMapCard(nodes.get(ROOT_KEY));
           return;
         }
-        return openCloudGenre(cloudSelectedGenreId);
+        return openCloudGenre(cloudSelectedGenreId, { forceOpen: true });
       }).catch(err => {
         console.error("[wiki-genres] cloud mode failed", err);
         setStatus("Cloud unavailable.");
       });
     }
   } else {
+    setCloudInitialLoading(false);
     const cloudSelectedBeforeExit = (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY)
       ? cloudSelectedGenreId
       : realSelectedBeforeSwap;
-    cloudRootGenreId = null;
-    cloudSelectedGenreId = null;
-    detailCardNodeKey = null;
-    cloudNodeEls = new Map();
-    cloudScene = null;
-    cloudVisibleNodeIds = new Set();
+	    cloudRootGenreId = null;
+	    cloudRegionId = null;
+	    cloudSelectedGenreId = null;
+	    clearScheduledCloudHoverCard();
+	    cloudHoverCardDelayTimer = 0;
+	    pendingCloudHoverCardKey = null;
+	    setDetailCardNodeKey(null);
+	    cloudNodeEls = new Map();
+	    cloudTextEls = new Map();
+	    cloudScene = null;
+	    cloudVisibleNodeIds = new Set();
+	    cloudSceneDomPrepared = false;
+	    cloudRenderedLayerScale = null;
+	    cloudRenderedTextScale = 0;
+	    cloudRenderedWindowSignature = "";
+		    cloudCanvasNodes = [];
+			    cloudCanvasHitNodes = [];
+			    cloudCanvasVisibleIds = new Set();
+			    cloudCanvasAlphaById = new Map();
+			    cloudRenderSnapshot = null;
+			    cloudRenderTransition = null;
+			    cloudPresentationById = new Map();
+			    cloudPresentationLastAt = 0;
+			    cloudPresentationTargetSignature = "";
+				    cloudSelectedLabelAlphaById = new Map();
+			    cloudHoverUnderlineAlphaById = new Map();
+			    cloudRelationshipAlphaById = new Map();
+	    cancelCloudFadeFrame();
+		    cloudBackgroundCache = null;
+	    cloudBackgroundBuildSignature = "";
+	    window.clearTimeout(cloudBackgroundBuildTimer);
+	    cloudBackgroundBuildTimer = 0;
+	    cloudLabelSpriteCache = new Map();
+	    cloudHoveredNodeId = null;
+	    cloudSelectedMarker = null;
+	    clearCloudSelectedMarkerAnimation();
+	    cloudClickEnabled = true;
+	    cloudClickEnableAt = 0;
+	    window.clearTimeout(cloudClickEnableTimer);
+	    cloudClickEnableTimer = 0;
+	    syncCloudClickAffordance();
+	    if (cloudCanvasFadeFrame) {
+	      cancelAnimationFrame(cloudCanvasFadeFrame);
+	      cloudCanvasFadeFrame = 0;
+	    }
+		    if (cloudSelectedLabelFadeFrame) {
+		      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
+		      cloudSelectedLabelFadeFrame = 0;
+		    }
+		    if (cloudHoverUnderlineFadeFrame) {
+		      cancelAnimationFrame(cloudHoverUnderlineFadeFrame);
+		      cloudHoverUnderlineFadeFrame = 0;
+		    }
+		    if (cloudRelationshipFadeFrame) {
+		      cancelAnimationFrame(cloudRelationshipFadeFrame);
+		      cloudRelationshipFadeFrame = 0;
+		    }
+	    scheduleCloudCanvasRender();
 	    window.clearTimeout(cloudFetchTimer);
 	    cloudFetchTimer = 0;
 	    cloudQueuedFetch = false;
@@ -9591,19 +15042,67 @@ function setCloudMode(enabled, options = {}) {
     updateFooter(nodes.get(currentKey));
     updateUrlState({ push: true });
     if (cloudSelectedBeforeExit) {
-      void ensureGraphSelectionByGenreId(cloudSelectedBeforeExit);
+      void ensureGraphSelectionByGenreId(cloudSelectedBeforeExit).then(() => {
+        if (!cloudMode && !timelineMode) updateUrlState({ push: false });
+      });
     }
   }
 }
 
-function setTimelineMode(enabled) {
-  const selectedBeforeSwap = activeSelectedGenreId();
+function setTimelineMode(enabled, options = {}) {
+  const selectedBeforeSwap = selectedGenreIdForModeTransfer();
   if (enabled && cloudMode) {
+    setCloudInitialLoading(false);
     cloudMode = false;
+    cloudRootGenreId = null;
+    cloudRegionId = null;
     cloudSelectedGenreId = null;
     cloudNodeEls = new Map();
+    cloudTextEls = new Map();
     cloudScene = null;
     cloudVisibleNodeIds = new Set();
+    cloudSceneDomPrepared = false;
+    cloudRenderedLayerScale = null;
+    cloudRenderedTextScale = 0;
+    cloudRenderedWindowSignature = "";
+	    cloudCanvasNodes = [];
+	    cloudCanvasHitNodes = [];
+	    cloudCanvasVisibleIds = new Set();
+	    cloudCanvasAlphaById = new Map();
+	    cloudRenderSnapshot = null;
+	    cloudRenderTransition = null;
+	    cloudPresentationById = new Map();
+	    cloudPresentationLastAt = 0;
+	    cloudPresentationTargetSignature = "";
+	    cloudSelectedLabelAlphaById = new Map();
+	    cloudRelationshipAlphaById = new Map();
+    cancelCloudFadeFrame();
+    cloudBackgroundCache = null;
+    cloudBackgroundBuildSignature = "";
+    window.clearTimeout(cloudBackgroundBuildTimer);
+    cloudBackgroundBuildTimer = 0;
+    cloudLabelSpriteCache = new Map();
+    cloudHoveredNodeId = null;
+    cloudSelectedMarker = null;
+    clearCloudSelectedMarkerAnimation();
+    cloudClickEnabled = true;
+    cloudClickEnableAt = 0;
+    window.clearTimeout(cloudClickEnableTimer);
+    cloudClickEnableTimer = 0;
+    syncCloudClickAffordance();
+    if (cloudCanvasFadeFrame) {
+      cancelAnimationFrame(cloudCanvasFadeFrame);
+      cloudCanvasFadeFrame = 0;
+    }
+    if (cloudSelectedLabelFadeFrame) {
+      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
+      cloudSelectedLabelFadeFrame = 0;
+    }
+    if (cloudRelationshipFadeFrame) {
+      cancelAnimationFrame(cloudRelationshipFadeFrame);
+      cloudRelationshipFadeFrame = 0;
+    }
+    scheduleCloudCanvasRender();
     window.clearTimeout(cloudFetchTimer);
     cloudFetchTimer = 0;
     cloudQueuedFetch = false;
@@ -9620,12 +15119,11 @@ function setTimelineMode(enabled) {
   timelineMode = Boolean(enabled);
   document.body.classList.toggle("timeline-mode", timelineMode);
   if (timelinePanel) timelinePanel.hidden = true;
-  timelineToggleButton?.classList.toggle("active", timelineMode);
-  timelineToggleButton?.setAttribute(
-    "aria-label",
-    timelineMode ? "Close timeline map" : "Open timeline map"
+  timelineToggleButton?.classList.remove("active");
+  setModeButtonState(timelineToggleButton, timelineMode
+    ? { icon: "scatterPlot", label: "Graph", ariaLabel: "Return to graph" }
+    : { icon: "clockArrowDown", label: "Timeline", ariaLabel: "Open timeline map" }
   );
-  setModeButtonIcon(timelineToggleButton, timelineMode ? "scatterPlot" : "clockArrowDown");
   if (timelineMode) {
     // Stop any in-flight camera motion from graph mode so timeline opens at
     // a stable default.
@@ -9657,7 +15155,7 @@ function setTimelineMode(enabled) {
     timelineSelectedGenreId = selectedBeforeSwap;
     timelineDetailCardOpen = Boolean(selectedBeforeSwap);
     if (selectedBeforeSwap) {
-      detailCardNodeKey = `timeline-${selectedBeforeSwap}`;
+      setDetailCardNodeKey(detailKeyForTimelineNodeId(selectedBeforeSwap));
       // Keep playback continuous by reusing the same selection key where possible.
       const maybeDetail = detailCache.get(selectedBeforeSwap) || nodes.get(activeLeafKey) || nodes.get(currentKey) || null;
       if (maybeDetail) {
@@ -9750,8 +15248,10 @@ function setTimelineMode(enabled) {
     updateUrlState({ push: true });
 
     // Restore timeline selection into graph mode.
-    if (timelineSelectedBeforeExit) {
-      void ensureGraphSelectionByGenreId(timelineSelectedBeforeExit);
+    if (timelineSelectedBeforeExit && !options.skipGraphRestore) {
+      void ensureGraphSelectionByGenreId(timelineSelectedBeforeExit).then(() => {
+        if (!cloudMode && !timelineMode) updateUrlState({ push: false });
+      });
     }
   }
 }
@@ -9923,9 +15423,11 @@ function timelineTickStep(yearMin, yearMax) {
 function updateTimelineYearMarkers() {
   if (!timelineYearRail) return;
   if (!timelineMode || !timelineYearRows.length) {
-    timelineYearRail.innerHTML = "";
-    timelineYearMarkerEls = new Map();
-    timelineYearMarkerSignature = "";
+    if (timelineYearMarkerSignature || timelineYearMarkerEls.size || timelineYearRail.childNodes.length) {
+      timelineYearRail.innerHTML = "";
+      timelineYearMarkerEls = new Map();
+      timelineYearMarkerSignature = "";
+    }
     return;
   }
   const viewportHeight = vh();
@@ -10536,7 +16038,7 @@ function clearTimelineSelectionMode() {
   if (!timelineMode) return;
   timelineSelectedGenreId = null;
   timelineDetailCardOpen = false;
-  detailCardNodeKey = null;
+  setDetailCardNodeKey(null);
   hoverCardToken++;
   timelineDataRequestToken += 1;
   timelineLoadingRank = 0;
@@ -11129,6 +16631,7 @@ function timelineNodeFromPayload(node) {
     instruments: [],
     categories: [],
     monthlyViews: node.monthly_views_p30,
+    ...textMetricsFromPayload(node),
     x: node.x,
     y: node.y,
     homeX: node.x,
@@ -11137,10 +16640,14 @@ function timelineNodeFromPayload(node) {
   };
 }
 
+function timelinePillWidth(node, label) {
+  return pillWidthFromPretext(node, label, 15, 500, 14, 1, 230);
+}
+
 function buildTimelineNodeEl(node, isEntering = false) {
   const label = displayLabel(node.label || node.wikipedia_title);
   const year = timelineYearLabel(node);
-  const widthEstimate = Math.max(72, Math.min(230, label.length * 7.5 + 28));
+  const widthEstimate = timelinePillWidth(node, label);
   const isSelected = node.id === timelineSelectedGenreId;
   const detail = detailCache.get(node.id);
     const color = detail?.color || node.similarity_color || (isSelected ? "var(--accent)" : null);
@@ -11152,6 +16659,7 @@ function buildTimelineNodeEl(node, isEntering = false) {
   if (isSelected) classes.push("node-active-leaf", "timeline-node-selected");
   if (color) classes.push("has-color");
   if (isEntering) classes.push("timeline-node-entering");
+  if (detailKeyForTimelineNodeId(node.id) === detailCardIndicatorKey()) classes.push("timeline-node-detail-preview");
   if (timelineSelectedFocusActive()) {
     if (timelineVisibility.focusNodeIds.has(node.id)) classes.push("timeline-node-focus");
     else classes.push("timeline-node-unfocused");
@@ -11186,7 +16694,7 @@ function buildTimelineNodeEl(node, isEntering = false) {
     class: "node-pill timeline-node-pill",
   }));
   const text = svgEl("text", {
-    y: 0,
+    y: TIMELINE_LABEL_Y,
     class: "node-label timeline-node-label",
     "dominant-baseline": "central",
     "text-anchor": "middle",
@@ -11194,8 +16702,22 @@ function buildTimelineNodeEl(node, isEntering = false) {
   if (!isSelected && color) text.style.fill = color;
   text.textContent = label;
   inner.appendChild(text);
+  inner.appendChild(svgEl("rect", {
+    x: -widthEstimate / 2,
+    y: -18,
+    width: widthEstimate,
+    height: 36,
+    rx: 18,
+    ry: 18,
+    class: "node-hit-area timeline-node-hit-area",
+  }));
   group.addEventListener("pointerenter", () => {
-    void showTimelineHoverCard(node);
+    if (!timelineNodeAllowsHoverDetail(group)) return;
+    scheduleTimelineHoverCard(node);
+  });
+  group.addEventListener("pointerleave", () => {
+    if (!timelineNodeAllowsHoverDetail(group)) return;
+    cancelScheduledHoverCard(detailKeyForTimelineNodeId(node.id));
   });
   group.addEventListener("click", () => {
     void openTimelineNode(node);
@@ -11209,6 +16731,16 @@ function buildTimelineNodeEl(node, isEntering = false) {
   return group;
 }
 
+function timelineNodeAllowsHoverDetail(el) {
+  if (!el) return false;
+  return !(
+    el.classList.contains("timeline-node-unfocused") ||
+    el.classList.contains("timeline-node-hidden-detail") ||
+    el.classList.contains("timeline-node-entering") ||
+    el.classList.contains("timeline-node-exiting")
+  );
+}
+
 function timelineNodeClassName(node, color, isEntering = false) {
   const classes = [
     "node",
@@ -11219,6 +16751,7 @@ function timelineNodeClassName(node, color, isEntering = false) {
   if (isSelected) classes.push("node-active-leaf", "timeline-node-selected");
   if (color) classes.push("has-color");
   if (isEntering) classes.push("timeline-node-entering");
+  if (detailKeyForTimelineNodeId(node.id) === detailCardIndicatorKey()) classes.push("timeline-node-detail-preview");
   if (timelineSelectedFocusActive()) {
     if (timelineVisibility.focusNodeIds.has(node.id)) classes.push("timeline-node-focus");
     else classes.push("timeline-node-unfocused");
@@ -11230,15 +16763,17 @@ async function showTimelineHoverCard(node) {
   if (!timelineMode || !node?.id) return;
   if (node.id !== timelineSelectedGenreId || !timelineDetailCardOpen) return;
   const token = ++hoverCardToken;
-  detailCardNodeKey = `timeline-${node.id}`;
-  updateCard(timelineNodeFromPayload(node));
+  setDetailCardNodeKey(detailKeyForTimelineNodeId(node.id));
   try {
     const detail = await getGenreDetail(node.id);
     if (token !== hoverCardToken || !timelineMode) return;
-    detailCardNodeKey = `timeline-${node.id}`;
-    updateCard(detail);
+    setDetailCardNodeKey(detailKeyForTimelineNodeId(node.id));
+    updateCard(detail, { hoverSwap: true });
   } catch (err) {
     console.error("[wiki-genres] timeline hover detail failed", err);
+    if (token === hoverCardToken && timelineMode) {
+      updateCard(timelineNodeFromPayload(node), { hoverSwap: true });
+    }
   }
 }
 
@@ -11247,7 +16782,7 @@ async function openTimelineNode(node) {
   if (timelineSelectedGenreId === node.id) {
     timelineSelectedGenreId = null;
     timelineDetailCardOpen = false;
-    detailCardNodeKey = null;
+    setDetailCardNodeKey(null);
     hoverCardToken++;
     setStatus("");
     updateDetailCardVisibility();
@@ -11284,7 +16819,7 @@ async function openTimelineNode(node) {
     panToSelectedCenterTarget({ holdDetailCard: true });
     const detail = await detailLoad;
     if (!timelineMode || timelineSelectedGenreId !== node.id) return;
-    detailCardNodeKey = `timeline-${node.id}`;
+    setDetailCardNodeKey(detailKeyForTimelineNodeId(node.id));
     updateCard(detail);
     updateYoutubeCardForSelection(detail);
     void updateMapCard(detail);
@@ -11554,10 +17089,10 @@ function refreshGraphAfterSelectionChange(node, { push = true, follow = true } =
   }
   rebuildSim();
   bumpSim(0.36);
-  detailCardNodeKey = node?.key || null;
+  setDetailCardNodeKey(node?.key || null);
   if (node) {
     updateCard(node);
-    void updateMapCard(node);
+    scheduleMapCardUpdate(node);
     updateFooter(node);
   }
   scheduleTimelineRefresh();
@@ -11679,10 +17214,10 @@ async function focusLeafNode(nodeKey, options = {}) {
 
     const hydrated = await detailPromise;
     if (token !== focusToken || activeLeafKey !== leaf.key) return;
-    detailCardNodeKey = hydrated.key;
+    setDetailCardNodeKey(hydrated.key);
     updateCard(hydrated);
     updateYoutubeCardForSelection(hydrated);
-    void updateMapCard(hydrated);
+    scheduleMapCardUpdate(hydrated);
     scheduleTimelineRefresh();
     updateFooter(parent);
     updateUrlState({ push: true });
@@ -11735,10 +17270,10 @@ async function focusOn(nodeKey, options = {}) {
     }
     rebuildSim();
     bumpSim(0.45);
-    detailCardNodeKey = focusedNode?.key || null;
+    setDetailCardNodeKey(focusedNode?.key || null);
     updateCard(focusedNode);
     updateYoutubeCardForSelection(focusedNode);
-    void updateMapCard(focusedNode);
+    scheduleMapCardUpdate(focusedNode);
     scheduleTimelineRefresh();
     updateUrlState({ push: true });
     if (!options.noFollow) startFollow();
@@ -11768,10 +17303,10 @@ async function focusOn(nodeKey, options = {}) {
     }
     rebuildSim();
     bumpSim(children.length ? 0.62 : 0.35);
-    detailCardNodeKey = focusedNode?.key || null;
+    setDetailCardNodeKey(focusedNode?.key || null);
     updateCard(focusedNode);
     updateYoutubeCardForSelection(focusedNode);
-    void updateMapCard(focusedNode);
+    scheduleMapCardUpdate(focusedNode);
     scheduleTimelineRefresh();
     updateFooter(focusedNode);
     updateUrl();
@@ -11823,14 +17358,14 @@ async function focusOn(nodeKey, options = {}) {
       summary: node.summary || "The API did not return graph data for this selection.",
     });
     updateYoutubeCardForSelection(node);
-    void updateMapCard(node);
+    scheduleMapCardUpdate(node);
   } finally {
     if (token === focusToken) setBusy(false);
   }
 }
 
 function detailCardIdentity(g) {
-  return String(g?.key || g?.genreId || g?.id || g?.title || g?.label || "");
+  return String(g?.genreId || g?.id || g?.title || g?.label || g?.key || "");
 }
 
 function renderCardContent(g, options = {}) {
@@ -11843,14 +17378,15 @@ function renderCardContent(g, options = {}) {
   cardTitle.textContent = g.label || "";
   cardSummary.textContent = g.summary || "";
 
-  if (g.aliases?.length) {
-    cardSynonyms.textContent = uniqueStrings(g.aliases)
-      .slice(0, 8)
-      .map(capitalizeDisplayTerm)
-      .join(", ");
+  const aliases = displayAliasesForCard(g);
+  detailCard?.classList.toggle("card-aliases-empty", !aliases.length);
+  if (aliases.length) {
+    cardSynonyms.textContent = aliases.join(", ");
+    cardSynonyms.hidden = false;
     cardSynonyms.style.display = "";
   } else {
     cardSynonyms.textContent = "";
+    cardSynonyms.hidden = true;
     cardSynonyms.style.display = "none";
   }
 
@@ -11861,7 +17397,7 @@ function renderCardContent(g, options = {}) {
       const chip = document.createElement("span");
       chip.className = `metadata-chip metadata-${item.kind}`;
       const icon = document.createElement("span");
-      icon.className = "metadata-icon";
+      icon.className = "material-symbols-rounded metadata-icon";
       icon.setAttribute("aria-hidden", "true");
       icon.textContent = metadataIcon(item.kind);
       const text = document.createElement("span");
@@ -11880,39 +17416,166 @@ function renderCardContent(g, options = {}) {
   updateTargetButtonVisibility();
 }
 
-function updateCard(g, options = {}) {
-  if (!g) return;
-  const nextKey = detailCardIdentity(g);
-  const visible = document.body.classList.contains("detail-card-visible");
-  const shouldTransition =
-    !options.skipTransition &&
-    visible &&
-    detailCardRenderedKey &&
-    nextKey &&
-    nextKey !== detailCardRenderedKey;
+function cancelDetailCardContentSwap() {
+  window.clearTimeout(detailCardContentSwapTimer);
+  window.clearTimeout(detailCardHeightResetTimer);
+  window.clearTimeout(detailCardTransitionCleanupTimer);
+  detailCardContentSwapTimer = 0;
+  detailCardHeightResetTimer = 0;
+  detailCardTransitionCleanupTimer = 0;
+  detailCardContentSwapToken++;
+  detailCard?.classList.remove("card-content-fading");
+  detailCard?.classList.remove("detail-card-entering");
+  detailCard?.classList.remove("detail-card-height-animating");
+  detailCardSlot?.classList.remove("detail-card-swap-transitioning");
+  detailCardTransitionClone?.remove();
+  detailCardTransitionClone = null;
+  if (detailCard) {
+    detailCard.style.height = "";
+    detailCard.style.minHeight = "";
+  }
+}
 
-  detailCardTransitionToken++;
-  window.clearTimeout(detailCardTransitionTimer);
+function commitCardContent(g, options, nextKey) {
+  renderCardContent(g, options);
+  detailCardRenderedKey = nextKey || detailCardRenderedKey;
+  syncDetailNodeIndicators();
+}
 
-  if (!shouldTransition || prefersReducedMotion()) {
-    detailCard?.classList.remove("card-content-fading");
-    renderCardContent(g, options);
-    detailCardRenderedKey = nextKey || detailCardRenderedKey;
+function shouldAnimateDetailCardHeight() {
+  return Boolean(
+    detailCard &&
+    window.matchMedia("(max-width: 899px)").matches &&
+    document.body.classList.contains("detail-card-visible") &&
+    !document.body.classList.contains("mobile-cards-hidden")
+  );
+}
+
+function measuredDetailCardAutoHeight() {
+  if (!detailCard) return 0;
+  const previousHeight = detailCard.style.height;
+  detailCard.style.height = "auto";
+  const height = Math.ceil(detailCard.getBoundingClientRect().height || 0);
+  detailCard.style.height = previousHeight;
+  return height;
+}
+
+function cleanupDetailCardTransition(token = detailCardContentSwapToken) {
+  if (token !== detailCardContentSwapToken) return;
+  window.clearTimeout(detailCardTransitionCleanupTimer);
+  detailCardTransitionCleanupTimer = 0;
+  detailCardTransitionClone?.remove();
+  detailCardTransitionClone = null;
+  detailCard?.classList.remove("detail-card-entering");
+  detailCardSlot?.classList.remove("detail-card-swap-transitioning");
+}
+
+const DETAIL_CARD_SNAPSHOT_CLASSES = {
+  "card-title": "detail-card-snapshot-title",
+  "card-target-button": "detail-card-snapshot-target-button",
+  "card-close-button": "detail-card-snapshot-close-button",
+  "card-summary": "detail-card-snapshot-summary",
+};
+
+function sanitizeDetailCardTransitionClone(clone) {
+  if (!clone) return;
+  for (const el of clone.querySelectorAll("[id]")) {
+    const snapshotClass = DETAIL_CARD_SNAPSHOT_CLASSES[el.id];
+    if (snapshotClass) el.classList.add(snapshotClass);
+    el.removeAttribute("id");
+  }
+  clone.querySelectorAll("button, a, input, textarea, select").forEach(el => {
+    el.tabIndex = -1;
+  });
+}
+
+function beginDetailCardTransition(token) {
+  if (!detailCard || !detailCardSlot) return;
+  window.clearTimeout(detailCardTransitionCleanupTimer);
+  detailCardTransitionClone?.remove();
+  detailCardTransitionClone = detailCard.cloneNode(true);
+  detailCardTransitionClone.removeAttribute("id");
+  detailCardTransitionClone.classList.add("detail-card-transition-clone");
+  detailCardTransitionClone.dataset.detailCardKey = detailCardRenderedKey || "";
+  detailCardTransitionClone.setAttribute("aria-hidden", "true");
+  detailCardTransitionClone.inert = true;
+  sanitizeDetailCardTransitionClone(detailCardTransitionClone);
+  detailCardSlot.appendChild(detailCardTransitionClone);
+  detailCardSlot.classList.add("detail-card-swap-transitioning");
+  detailCard.classList.remove("detail-card-entering");
+  detailCard.getBoundingClientRect();
+  detailCard.classList.add("detail-card-entering");
+  detailCardTransitionCleanupTimer = window.setTimeout(() => {
+    cleanupDetailCardTransition(token);
+  }, 220);
+}
+
+function swapCardContent(g, options, nextKey, shouldFade) {
+  if (!shouldFade || prefersReducedMotion() || !document.body.classList.contains("detail-card-visible")) {
+    cancelDetailCardContentSwap();
+    commitCardContent(g, options, nextKey);
     return;
   }
 
-  const token = detailCardTransitionToken;
-  detailCard?.classList.add("card-content-fading");
-  detailCardTransitionTimer = window.setTimeout(() => {
-    if (token !== detailCardTransitionToken) return;
-    renderCardContent(g, options);
-    detailCardRenderedKey = nextKey;
+  const token = ++detailCardContentSwapToken;
+  window.clearTimeout(detailCardContentSwapTimer);
+  window.clearTimeout(detailCardHeightResetTimer);
+  detailCardContentSwapTimer = 0;
+  detailCardHeightResetTimer = 0;
+
+  const previousHeight = detailCard?.getBoundingClientRect().height || 0;
+  const animateHeight = shouldAnimateDetailCardHeight() && previousHeight > 0;
+  if (animateHeight) {
+    detailCard.classList.add("detail-card-height-animating");
+    detailCard.style.minHeight = "";
+    detailCard.style.height = `${Math.ceil(previousHeight)}px`;
+    detailCard.getBoundingClientRect();
+  }
+  beginDetailCardTransition(token);
+  commitCardContent(g, options, nextKey);
+
+  if (detailCard && animateHeight) {
+    const nextHeight = measuredDetailCardAutoHeight();
+    detailCard.style.height = `${Math.ceil(previousHeight)}px`;
     requestAnimationFrame(() => {
-      if (token === detailCardTransitionToken) {
-        detailCard?.classList.remove("card-content-fading");
-      }
+      if (token !== detailCardContentSwapToken) return;
+      detailCard.style.height = `${Math.max(1, nextHeight)}px`;
     });
-  }, 110);
+    detailCardHeightResetTimer = window.setTimeout(() => {
+      if (token !== detailCardContentSwapToken) return;
+      detailCardHeightResetTimer = 0;
+      detailCard.classList.remove("detail-card-height-animating");
+      detailCard.style.height = "";
+    }, DETAIL_CARD_HEIGHT_ANIMATION_MS + 40);
+  } else if (detailCard && previousHeight > 0) {
+    detailCard.style.minHeight = `${Math.ceil(previousHeight)}px`;
+    detailCardHeightResetTimer = window.setTimeout(() => {
+      if (token !== detailCardContentSwapToken) return;
+      detailCardHeightResetTimer = 0;
+      detailCard.style.minHeight = "";
+    }, DETAIL_CARD_HEIGHT_STABILIZE_MS);
+  }
+  window.requestAnimationFrame(() => {
+    if (token !== detailCardContentSwapToken) return;
+    detailCard?.classList.remove("card-content-fading");
+  });
+}
+
+function updateCard(g, options = {}) {
+  if (!g) return;
+  if (!options.preserveRelation && g.key) {
+    setDetailCardNodeKey(g.key);
+  }
+  const nextKey = detailCardIdentity(g);
+  const isContentSwap = Boolean(detailCardRenderedKey && nextKey && nextKey !== detailCardRenderedKey);
+  setDetailCardHoverSwapActive(Boolean(
+    options.hoverSwap &&
+    document.body.classList.contains("ui-manual-moving") &&
+    (isContentSwap || detailCardHoverSwapActive)
+  ));
+  swapCardContent(g, options, nextKey, isContentSwap);
+  if (options.idleReturn) clearDetailCardIdleTimer();
+  else scheduleDetailCardIdleReturn(nextKey);
 }
 
 function updateFooter(node) {
@@ -11927,9 +17590,8 @@ function updateFooter(node) {
   }
 }
 
-async function restorePathFromUrl() {
-  const url = new URL(window.location.href);
-  const rawPath = url.searchParams.get("path");
+async function restorePathFromUrl(rawPath = null) {
+  rawPath = rawPath ?? new URL(window.location.href).searchParams.get("path");
   if (!rawPath) return false;
   const ids = rawPath.split(",").map(v => v.trim()).filter(Boolean);
   if (!ids.length) return false;
@@ -11972,10 +17634,12 @@ async function restorePathFromUrl() {
     fullRender();
     rebuildSim();
     bumpSim(0.5);
-    updateCard(nodes.get(currentKey));
-    updateYoutubeCardForSelection(nodes.get(currentKey));
-    void updateMapCard(nodes.get(currentKey));
-    updateFooter(nodes.get(currentKey));
+    const currentNode = nodes.get(currentKey);
+    setDetailCardNodeKey(currentNode?.key || null);
+    updateCard(currentNode);
+    updateYoutubeCardForSelection(currentNode);
+    void updateMapCard(currentNode);
+    updateFooter(currentNode);
     startFollow();
     panToSelectedCenterTarget({ holdDetailCard: true, normalizeZoom: true });
     const restoredKey = currentKey;
@@ -12001,6 +17665,7 @@ function renderRootState() {
   bumpSim(1.0);
   const root = nodes.get(ROOT_KEY);
   if (!root) return;
+  setDetailCardNodeKey(root.key);
   updateCard(root);
   updateYoutubeCardForSelection(root);
   void updateMapCard(root);
@@ -12033,7 +17698,7 @@ async function init() {
   try {
     focusToken += 1;
     activeLeafKey = null;
-    detailCardNodeKey = null;
+    setDetailCardNodeKey(null);
     if (panAnimTimer) {
       clearInterval(panAnimTimer);
       panAnimTimer = null;
@@ -12041,10 +17706,9 @@ async function init() {
     stopPanInertia();
     setBusy(true);
     setStatus("Loading graph data...");
-    const url = new URL(window.location.href);
-    const mode = (url.searchParams.get("mode") || "").trim();
-    const wantsTimeline = mode === "timeline";
-    const wantsCloud = mode === "cloud";
+    const resolvedState = resolvedExplorerUrlState();
+    const wantsTimeline = resolvedState.mode === "timeline";
+    const wantsCloud = resolvedState.mode === "cloud";
     if (sim) sim.stop();
     nodes.clear();
     edges.length = 0;
@@ -12052,16 +17716,13 @@ async function init() {
     followMode = false;
     viewScale = defaultScale();
     placeRoot();
-    setModeButtonIcon(cloudToggleButton, "mist");
-    setModeButtonIcon(timelineToggleButton, "clockArrowDown");
+    setModeButtonState(cloudToggleButton, { icon: "mist", label: "Cloud", ariaLabel: "Open word cloud" });
+    setModeButtonState(timelineToggleButton, { icon: "clockArrowDown", label: "Timeline", ariaLabel: "Open timeline map" });
     await expand(ROOT_KEY);
-    if (!wantsTimeline && !wantsCloud) {
-      renderRootState();
-    }
     let restored = false;
     if (!wantsTimeline && !wantsCloud) {
       try {
-        restored = await restorePathFromUrl();
+        restored = await restorePathFromUrl(resolvedState.rawPath);
       } catch (err) {
         console.error("[wiki-genres] path restore failed", err);
         setStatus("Could not restore the requested path");
@@ -12101,7 +17762,7 @@ async function init() {
       get activeLeafKey() { return activeLeafKey; },
     };
     recordAppHistory(window.location.href, { push: false });
-    void applyModeFromUrl();
+    void applyModeFromUrl(resolvedState);
   } catch (err) {
     console.error("[wiki-genres] init failed", err);
     updateCard({
@@ -12118,17 +17779,21 @@ async function init() {
     setStatus("API data unavailable");
   } finally {
     setBusy(false);
+    if (window.__wikiGenresBootWatchdog) {
+      window.clearTimeout(window.__wikiGenresBootWatchdog);
+      window.__wikiGenresBootWatchdog = 0;
+    }
+    document.body.classList.remove("app-booting");
   }
 }
 
-async function applyModeFromUrl() {
-  const url = new URL(window.location.href);
-  const mode = (url.searchParams.get("mode") || "").trim();
-  const wantsTimeline = mode === "timeline";
-  const wantsCloud = mode === "cloud";
-  const selectedTimeline = (url.searchParams.get("timeline_selected") || "").trim() || null;
-  const cloudRoot = (url.searchParams.get("cloud_root") || "").trim() || null;
-  const selectedCloud = (url.searchParams.get("cloud_selected") || "").trim() || null;
+async function applyModeFromUrl(resolvedState = resolvedExplorerUrlState()) {
+  const wantsTimeline = resolvedState.mode === "timeline";
+  const wantsCloud = resolvedState.mode === "cloud";
+  const selectedTimeline = resolvedState.selectedTimeline;
+  const cloudRoot = resolvedState.cloudRoot;
+  const cloudRegion = resolvedState.cloudRegion;
+  const selectedCloud = resolvedState.selectedCloud;
 
   if (wantsCloud) {
     if (!cloudMode) {
@@ -12137,13 +17802,16 @@ async function applyModeFromUrl() {
       historyNavigating = false;
     }
     cloudRootGenreId = cloudRoot;
-    cloudSelectedGenreId = selectedCloud || cloudRoot || cloudSelectedGenreId || ROOT_KEY;
+    cloudRegionId = cloudRegion;
+    cloudSelectedGenreId = selectedCloud || cloudRoot || null;
+    if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) startCloudSelectedLabelFade(cloudSelectedGenreId);
     void loadCloudMode({ initial: true }).then(() => {
       if (!cloudMode) return;
       if (cloudSelectedGenreId) {
-        void openCloudGenre(cloudSelectedGenreId);
+        void openCloudGenre(cloudSelectedGenreId, { forceOpen: true });
       } else {
         updateDetailCardVisibility();
+        void updateMapCard(nodes.get(ROOT_KEY));
       }
     }).catch(err => {
       console.error("[wiki-genres] cloud mode failed", err);
@@ -12175,7 +17843,7 @@ async function applyModeFromUrl() {
       });
       void getGenreDetail(selectedTimeline).then(detail => {
         if (!timelineMode || timelineSelectedGenreId !== selectedTimeline) return;
-        detailCardNodeKey = `timeline-${selectedTimeline}`;
+        setDetailCardNodeKey(detailKeyForTimelineNodeId(selectedTimeline));
         updateCard(detail);
         updateYoutubeCardForSelection(detail);
         void updateMapCard(detail);
@@ -12200,20 +17868,101 @@ async function applyModeFromUrl() {
 }
 
 window.addEventListener("resize", () => {
+  resizeCloudCanvas();
+  refitMapAutoView({ animate: false });
+  if (cloudMode) {
+    cloudRenderedWindowSignature = "";
+    updateCloudLodVisibility();
+    syncYoutubeVolumePanelPosition();
+    return;
+  }
   recomputeLayout();
   fullRender();
   rebuildSim();
   panToCurrent();
   syncYoutubeVolumePanelPosition();
-  if (mapListMode) renderVisibleMapListRows();
+  if (mapListMode) {
+    updateMapListCardHeight(mapListViewState?.totalHeight || 0);
+    renderVisibleMapListRows();
+  }
+  fitMapLabelMeta();
+});
+
+footerZoom?.addEventListener("pointerdown", event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  footerZoomDragging = true;
+  footerZoom.classList.add("zoom-progress-active");
+  footerZoom.setPointerCapture?.(event.pointerId);
+  beginManualMovementGesture(event.clientX, event.clientY);
+  setZoomFromFooterClientX(event.clientX);
+});
+
+footerZoom?.addEventListener("pointermove", event => {
+  if (!footerZoomDragging) return;
+  event.preventDefault();
+  event.stopPropagation();
+  markManualUiMovingAfterGestureThreshold(event.clientX, event.clientY, 360);
+  setZoomFromFooterClientX(event.clientX);
+});
+
+function stopFooterZoomDrag(event = null) {
+  if (!footerZoomDragging) return;
+  if (event?.pointerId != null && event.type !== "lostpointercapture") {
+    try {
+      footerZoom?.releasePointerCapture?.(event.pointerId);
+    } catch {}
+  }
+  footerZoomDragging = false;
+  footerZoom?.classList.remove("zoom-progress-active");
+  clearManualMovementGesture();
+}
+
+footerZoom?.addEventListener("pointerup", stopFooterZoomDrag);
+footerZoom?.addEventListener("pointercancel", stopFooterZoomDrag);
+footerZoom?.addEventListener("lostpointercapture", stopFooterZoomDrag);
+
+footerZoom?.addEventListener("keydown", event => {
+  const step = event.shiftKey ? 0.1 : 0.04;
+  let nextProgress = null;
+  if (event.key === "ArrowLeft" || event.key === "ArrowDown") nextProgress = currentZoomProgress() - step;
+  else if (event.key === "ArrowRight" || event.key === "ArrowUp") nextProgress = currentZoomProgress() + step;
+  else if (event.key === "Home") nextProgress = 0;
+  else if (event.key === "End") nextProgress = 1;
+  if (nextProgress == null) return;
+  event.preventDefault();
+  setZoomFromFooterProgress(nextProgress);
 });
 
 document.addEventListener("pointermove", event => {
+  setActivePointerButtons(event.buttons);
   updateLastPointerPosition(event.clientX, event.clientY);
+  if (activePointerButtons > 0 && manualMovementGesture) {
+    markManualUiMovingAfterGestureThreshold(event.clientX, event.clientY);
+  }
   uiHovering = isUiHoverTarget(event.target) || Boolean(liveUiHoverRoot());
   if (uiHovering) triggerUiHoverRestoreHold();
   if (manualUiDimPending) updateManualUiDimClass();
 }, { passive: true });
+
+document.addEventListener("pointerdown", event => {
+  setActivePointerButtons(event.buttons || 1);
+  if ((event.buttons || 1) > 0 && isManualGraphDragTarget(event.target)) {
+    beginManualMovementGesture(event.clientX, event.clientY);
+  }
+  updateManualUiDimClass();
+}, true);
+
+function clearActivePointerButtons() {
+  setActivePointerButtons(0);
+  clearManualMovementGesture();
+  updateManualUiDimClass();
+}
+
+window.addEventListener("pointerup", clearActivePointerButtons, true);
+window.addEventListener("pointercancel", clearActivePointerButtons, true);
+window.addEventListener("blur", clearActivePointerButtons);
 
 document.addEventListener("pointerover", event => {
   if (!isUiHoverTarget(event.target)) return;
@@ -12238,30 +17987,153 @@ window.addEventListener("popstate", () => {
   });
 });
 
+function setMobileCardsHidden(hidden) {
+  document.body.classList.toggle("mobile-cards-hidden", hidden);
+  updateDetailCardVisibility();
+}
+
 function setMobilePanel(panel) {
-  const showMap = panel === "map";
-  document.body.classList.toggle("mobile-map-active", showMap);
-  mobileDetailTab?.classList.toggle("active", !showMap);
-  mobileMapTab?.classList.toggle("active", showMap);
+  const showRadio = panel === "radio";
+  const isSmallMobile = window.matchMedia("(max-width: 599px)").matches;
+  const isAlreadyActive = document.body.classList.contains("mobile-radio-active") === showRadio;
+  if (isSmallMobile && isAlreadyActive && !document.body.classList.contains("mobile-cards-hidden")) {
+    setMobileCardsHidden(true);
+    return;
+  }
+  setMobileCardsHidden(false);
+  document.body.classList.toggle("mobile-radio-active", showRadio);
+  document.body.classList.remove("mobile-map-active");
+  mobileDetailTab?.classList.toggle("active", !showRadio);
+  mobileMapTab?.classList.toggle("active", showRadio);
   updateDetailCardVisibility();
 }
 
 function setMapExpanded(isExpanded) {
   mapCard?.classList.toggle("map-expanded", isExpanded);
+  document.body.classList.toggle("map-expanded-active", Boolean(isExpanded));
   mapExpandButton?.setAttribute("aria-expanded", String(isExpanded));
   mapExpandButton?.setAttribute("aria-label", isExpanded ? "Collapse map" : "Expand map");
+  if (mapExpandButton) mapExpandButton.dataset.tooltip = isExpanded ? "Collapse map" : "Expand map";
   mapGesturePointers.clear();
   mapGestureLast = null;
   mapGestureMoved = false;
-  if (!isExpanded) {
-    resetMapViewBox();
-  } else {
-    updateMapResetButton();
-  }
+  clearMapHoveredCountry();
+  refitMapAutoView({ animate: true });
+  requestAnimationFrame(() => refitMapAutoView({ animate: true }));
+  syncMapCountryInteractivity();
+  fitMapLabelMeta();
+  window.setTimeout(fitMapLabelMeta, 560);
 }
 
+const TOOLTIP_SELECTOR = "[data-tooltip]";
+let activeTooltipTarget = null;
+let tooltipTimer = 0;
+let tooltipEl = null;
+
+function tooltipTargetFromEvent(event) {
+  const target = event.target;
+  if (!(target instanceof Element)) return null;
+  const tooltipTarget = target.closest(TOOLTIP_SELECTOR);
+  if (!tooltipTarget || !tooltipTarget.isConnected) return null;
+  return tooltipTarget;
+}
+
+function tooltipTextForTarget(target) {
+  return String(target?.getAttribute("data-tooltip") || "").trim();
+}
+
+function ensureTooltipEl() {
+  if (tooltipEl) return tooltipEl;
+  tooltipEl = document.createElement("div");
+  tooltipEl.className = "ui-tooltip";
+  tooltipEl.hidden = true;
+  document.body.appendChild(tooltipEl);
+  return tooltipEl;
+}
+
+function positionTooltip(target) {
+  const el = ensureTooltipEl();
+  const rect = target.getBoundingClientRect();
+  const tooltipRect = el.getBoundingClientRect();
+  let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+  left = clamp(left, 12, Math.max(12, vw() - tooltipRect.width - 12));
+  let top = rect.bottom + UI_TOOLTIP_GAP_PX;
+  if (top + tooltipRect.height > vh() - 12) {
+    top = rect.top - tooltipRect.height - UI_TOOLTIP_GAP_PX;
+  }
+  top = clamp(top, 12, Math.max(12, vh() - tooltipRect.height - 12));
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+}
+
+function showTooltip(target) {
+  const text = tooltipTextForTarget(target);
+  if (!text) return;
+  const el = ensureTooltipEl();
+  activeTooltipTarget = target;
+  el.textContent = text;
+  el.hidden = false;
+  positionTooltip(target);
+  requestAnimationFrame(() => {
+    if (activeTooltipTarget === target) el.classList.add("is-visible");
+  });
+}
+
+function scheduleTooltip(target, delay = UI_TOOLTIP_DELAY_MS) {
+  const text = tooltipTextForTarget(target);
+  if (!text) return;
+  window.clearTimeout(tooltipTimer);
+  activeTooltipTarget = target;
+  tooltipTimer = window.setTimeout(() => {
+    tooltipTimer = 0;
+    if (activeTooltipTarget === target) showTooltip(target);
+  }, delay);
+}
+
+function hideTooltip(target = null) {
+  if (target && activeTooltipTarget && activeTooltipTarget !== target) return;
+  window.clearTimeout(tooltipTimer);
+  tooltipTimer = 0;
+  activeTooltipTarget = null;
+  if (!tooltipEl) return;
+  tooltipEl.classList.remove("is-visible");
+  tooltipEl.hidden = true;
+}
+
+document.addEventListener("pointerover", event => {
+  const target = tooltipTargetFromEvent(event);
+  if (!target) return;
+  scheduleTooltip(target);
+}, true);
+
+document.addEventListener("pointerout", event => {
+  const target = tooltipTargetFromEvent(event);
+  if (!target) return;
+  if (event.relatedTarget instanceof Element && target.contains(event.relatedTarget)) return;
+  hideTooltip(target);
+}, true);
+
+document.addEventListener("focusin", event => {
+  const target = tooltipTargetFromEvent(event);
+  if (!target) return;
+  scheduleTooltip(target, 220);
+}, true);
+
+document.addEventListener("focusout", event => {
+  const target = tooltipTargetFromEvent(event);
+  if (target) hideTooltip(target);
+}, true);
+
+document.addEventListener("click", () => hideTooltip(), true);
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") hideTooltip();
+}, true);
+
 mobileDetailTab?.addEventListener("click", () => setMobilePanel("detail"));
-mobileMapTab?.addEventListener("click", () => setMobilePanel("map"));
+mobileMapTab?.addEventListener("click", () => setMobilePanel("radio"));
+youtubeCloseButton?.addEventListener("click", () => {
+  if (window.matchMedia("(max-width: 599px)").matches) setMobileCardsHidden(true);
+});
 randomGenreButton?.addEventListener("click", () => {
   void openRandomTraversableGenre();
 });
@@ -12415,6 +18287,33 @@ feedbackModal?.addEventListener("keydown", event => {
   if (event.key === "Escape") closeFeedbackModal();
 });
 searchInput?.addEventListener("input", scheduleTraversableSearch);
+mapListSearchInput?.addEventListener("input", event => {
+  mapListSearchQuery = event.target?.value || "";
+  if (mapListMode) {
+    void renderMapList(mapListViewState?.items || [], { rootMode: Boolean(mapListViewState?.rootMode) });
+  }
+});
+mapListSearchInput?.addEventListener("keydown", event => {
+  if (event.key !== "Escape") return;
+  event.stopPropagation();
+  if (mapListSearchQuery) {
+    mapListSearchInput.value = "";
+    mapListSearchQuery = "";
+  } else {
+    mapListSearchOpen = false;
+  }
+  if (mapListMode) {
+    void renderMapList(mapListViewState?.items || [], { rootMode: Boolean(mapListViewState?.rootMode) });
+  }
+});
+mapListSearchButton?.addEventListener("click", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!mapListMode || !mapListViewState?.searchAvailable) return;
+  mapListSearchOpen = true;
+  updateMapListSearchVisibility(Boolean(mapListViewState.rootMode), true);
+  requestAnimationFrame(() => mapListSearchInput?.focus());
+});
 searchInput?.addEventListener("keydown", event => {
   if (event.key === "Escape") {
     searchInput.value = "";
@@ -12438,6 +18337,10 @@ document.addEventListener("pointerdown", event => {
   if (!searchCard || searchCard.contains(event.target)) return;
   clearSearchResults();
 });
+regionMap?.addEventListener("pointermove", updateResolvedMapHover);
+regionMap?.addEventListener("pointerleave", () => clearMapHoveredCountry());
+mapHitLayer?.addEventListener("click", selectResolvedMapCountry);
+regionMap?.addEventListener("click", selectResolvedMapCountry);
 regionMap?.addEventListener("wheel", event => {
   if (!isMapExpanded()) return;
   event.preventDefault();
@@ -12449,17 +18352,19 @@ regionMap?.addEventListener("wheel", event => {
   }
 
   const rect = regionMap.getBoundingClientRect();
+  setMapViewManuallyAdjusted(true);
   mapViewBox = clampMapViewBox({
     ...mapViewBox,
     x: mapViewBox.x + (event.deltaX / Math.max(1, rect.width)) * mapViewBox.w,
     y: mapViewBox.y + (event.deltaY / Math.max(1, rect.height)) * mapViewBox.h,
-  });
-  applyMapViewBox();
+  }, { softFocus: true });
+  applyMapViewBox({ softFocus: true });
+  scheduleMapPanSettle();
 }, { passive: false });
 regionMap?.addEventListener("pointerdown", event => {
   if (!isMapExpanded()) return;
   if (event.pointerType === "mouse" && event.button !== 0) return;
-  if (event.target?.closest?.(".map-country-hit-active")) return;
+  if (event.target?.closest?.(".map-country-hit-active") && resolvedMapCountryAtPointer(event)) return;
   mapGesturePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
   mapGestureLast = null;
   mapGestureMoved = false;
@@ -12499,6 +18404,7 @@ function endMapPointer(event) {
   if (!mapGesturePointers.has(event.pointerId)) return;
   mapGesturePointers.delete(event.pointerId);
   mapGestureLast = null;
+  if (!mapGesturePointers.size) settleMapViewBox();
 }
 regionMap?.addEventListener("pointerup", endMapPointer);
 regionMap?.addEventListener("pointercancel", endMapPointer);
@@ -12509,18 +18415,28 @@ regionMap?.addEventListener("click", event => {
   event.stopImmediatePropagation();
   mapGestureMoved = false;
 }, true);
+regionMap?.addEventListener("click", event => {
+  if (isMapExpanded() || mapListMode) return;
+  event.preventDefault();
+  event.stopPropagation();
+  setMapExpanded(true);
+});
 mapWorldButton?.addEventListener("click", event => {
   event.preventDefault();
   event.stopPropagation();
+  if (!isMapExpanded()) {
+    setMapExpanded(true);
+    return;
+  }
   mapDisplayedWorldOverride = true;
-  const node = nodes.get(currentKey) || nodes.get(ROOT_KEY);
+  const node = currentMapNodeForMode();
   void updateMapCard(node);
 });
 mapListButton?.addEventListener("click", event => {
   event.preventDefault();
   event.stopPropagation();
   setMapListMode(!mapListMode);
-  const node = nodes.get(currentKey) || nodes.get(ROOT_KEY);
+  const node = currentMapNodeForMode();
   void updateMapCard(node);
 });
 mapExpandButton?.addEventListener("click", event => {
@@ -12531,16 +18447,38 @@ mapResetButton?.addEventListener("click", event => {
   event.stopPropagation();
   resetMapViewBox();
 });
+mapCard?.addEventListener("click", event => {
+  if (isMapExpanded() || mapListMode) return;
+  if (event.target?.closest?.("button, input")) return;
+  setMapExpanded(true);
+});
 mapCard?.addEventListener("keydown", event => {
   if (event.key === "Escape") setMapExpanded(false);
+});
+mapParentLabel?.addEventListener("click", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  void returnToMapParent();
 });
 cardTargetButton?.addEventListener("click", () => {
   panToSelectedCenterTarget({ holdDetailCard: true, normalizeZoom: true });
 });
-cardCloseButton?.addEventListener("click", () => {
+function closeDetailFromButton(event = null) {
+  if (window.matchMedia("(max-width: 899px)").matches) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setMobileCardsHidden(true);
+    return;
+  }
   suppressDetailCardUntilSelection();
   if (timelineMode) timelineDetailCardOpen = false;
+}
+
+cardCloseButton?.addEventListener("pointerdown", event => {
+  if (!window.matchMedia("(max-width: 899px)").matches) return;
+  closeDetailFromButton(event);
 });
+cardCloseButton?.addEventListener("click", closeDetailFromButton);
 timelineToggleButton?.addEventListener("click", () => {
   setTimelineMode(!timelineMode);
 });
@@ -12566,6 +18504,7 @@ navForwardButton?.addEventListener("click", () => {
 updateDetailCardVisibility();
 updateAppHistoryButtons();
 setMapListMode(false);
+ensureYoutubeApi();
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", init);

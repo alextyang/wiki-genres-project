@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections import deque
 from collections.abc import Iterable
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
@@ -30,15 +31,21 @@ from wiki_genres.api.models import (
     RegionVariantOut,
     RegionVariantsResult,
 )
+from wiki_genres.cloud_text_metrics import (
+    CLOUD_FONT_SIZE,
+    CLOUD_LABEL_PAD_X,
+    CLOUD_LABEL_PAD_Y,
+    measure_cloud_label,
+)
 from wiki_genres.db import session_scope
 from wiki_genres.loader.semantic_cloud_layout import layout_key_for_root
 
 router = APIRouter(prefix="/v1/genres", tags=["genres"])
 
 DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+MAP_VARIANT_RELATIONS = DISPLAY_RELATIONS
+MAP_VARIANT_EVIDENCE_RELATIONS = DISPLAY_RELATIONS
 RELATED_RELATION = "related_genre"
-ORIGIN_PARENT_RELATION = "origin_parent"
-ORIGIN_PARENT_EVIDENCE_RELATIONS = ("stylistic_origin_of",)
 MUSIC_ROOT_ID = "__music_root__"
 REGIONAL_SCENE_RELATION = "regional_scene"
 REGIONAL_SCENE_EVIDENCE_RELATION = "regional_scene_of"
@@ -47,12 +54,22 @@ REGION_PARENT_RELATIONS = (
     REGIONAL_SCENE_RELATION,
     "subclass_of",
 )
+PLAYABLE_PLAYLIST_TRACK_CONDITION = "is_embeddable IS DISTINCT FROM false"
+MUSIC_REGION_TITLE_RE = re.compile(r"\bmusic\s+(?:of|in)\b", re.IGNORECASE)
 
 WORLD_MAP_KEY = "world"
 US_MAP_KEY = "us"
 SPECIAL_REGION_MAPS = {
     "region-united-states": US_MAP_KEY,
 }
+
+
+def _playable_playlist_track_condition(alias: str | None = None) -> str:
+    if alias:
+        return f"{alias}.{PLAYABLE_PLAYLIST_TRACK_CONDITION}"
+    return PLAYABLE_PLAYLIST_TRACK_CONDITION
+
+
 WORLD_FEATURE_ALIASES = {
     "United States": "United States of America",
     "United States of America": "United States of America",
@@ -76,6 +93,15 @@ US_FEATURE_ALIASES = {
     "Virgin Islands": "United States Virgin Islands",
     "Northern Mariana Islands": "Commonwealth of the Northern Mariana Islands",
 }
+ROOT_LIST_CONTINENT_NAMES = (
+    "Africa",
+    "Asia",
+    "Europe",
+    "North America",
+    "South America",
+    "Oceania",
+    "Americas",
+)
 US_FEATURE_NAMES = {
     "Alabama",
     "Alaska",
@@ -143,11 +169,11 @@ def _display_title(title: str | None) -> str:
     return label or (title or "")
 
 
-_CLOUD_FONT_SIZE = 13.0
+_CLOUD_FONT_SIZE = CLOUD_FONT_SIZE
 _CLOUD_VIEWPORT_MARGIN_PX = 180.0
 _CLOUD_ROOT_ID = "__music_root__"
-_CLOUD_BOX_PAD_X = 5.0
-_CLOUD_BOX_PAD_Y = 4.0
+_CLOUD_BOX_PAD_X = CLOUD_LABEL_PAD_X
+_CLOUD_BOX_PAD_Y = CLOUD_LABEL_PAD_Y
 _CLOUD_COLLISION_CELL_SIZE = 96.0
 
 
@@ -179,9 +205,29 @@ def _cloud_regional_phrase_penalty(label: str | None) -> int:
     return 1 if re.search(r"\bmusic\s+(?:of|in)\b", text) else 0
 
 
-def _layout_cloud_nodes(rows: list[dict], *, center_id: str = _CLOUD_ROOT_ID, center_title: str = "Music") -> list[dict]:
+def _cloud_label_metrics(label: str | None) -> dict[str, float]:
+    metrics = measure_cloud_label(label)
+    return {
+        "width": metrics.text_width,
+        "height": metrics.text_height,
+        "text_width": metrics.text_width,
+        "text_height": metrics.text_height,
+        "box_width": metrics.box_width,
+        "box_height": metrics.box_height,
+        "box_pad_x": metrics.box_pad_x,
+        "box_pad_y": metrics.box_pad_y,
+    }
+
+
+def _layout_cloud_nodes(
+    rows: list[dict], *, center_id: str = _CLOUD_ROOT_ID, center_title: str = "Music"
+) -> list[dict]:
     center_row = next((row for row in rows if row.get("id") == center_id), None)
-    center_label = _display_title(center_row.get("wikipedia_title")) if center_row else _display_title(center_title)
+    center_label = (
+        _display_title(center_row.get("wikipedia_title"))
+        if center_row
+        else _display_title(center_title)
+    )
     center_node = {
         **(center_row or {}),
         "id": center_id,
@@ -205,8 +251,7 @@ def _layout_cloud_nodes(rows: list[dict], *, center_id: str = _CLOUD_ROOT_ID, ce
         "lod_tier": 0,
         "x": 0.0,
         "y": 0.0,
-        "width": max(22.0, len(center_label) * _CLOUD_FONT_SIZE * 0.58),
-        "height": _CLOUD_FONT_SIZE * 1.25,
+        **_cloud_label_metrics(center_label),
     }
     rows = [row for row in rows if row.get("id") != center_id]
     if not rows:
@@ -245,19 +290,22 @@ def _layout_cloud_nodes(rows: list[dict], *, center_id: str = _CLOUD_ROOT_ID, ce
             + (_stable_unit(f"{row['id']}:angle") - 0.5) * 0.9
             + (index % 7) * 0.012
         )
-        radius = 180 + depth * 175 + (1 - priority_norm) * 460 + (
-            _stable_unit(f"{row['id']}:radius") - 0.5
-        ) * 170
-        width = max(22.0, len(label) * _CLOUD_FONT_SIZE * 0.58)
-        nodes.append({
-            **row,
-            "label": label,
-            "priority": priority,
-            "x": math.cos(angle) * radius * 1.18,
-            "y": math.sin(angle) * radius * 0.86,
-            "width": width,
-            "height": _CLOUD_FONT_SIZE * 1.25,
-        })
+        radius = (
+            180
+            + depth * 175
+            + (1 - priority_norm) * 460
+            + (_stable_unit(f"{row['id']}:radius") - 0.5) * 170
+        )
+        nodes.append(
+            {
+                **row,
+                "label": label,
+                "priority": priority,
+                "x": math.cos(angle) * radius * 1.18,
+                "y": math.sin(angle) * radius * 0.86,
+                **_cloud_label_metrics(label),
+            }
+        )
     return nodes
 
 
@@ -282,10 +330,13 @@ def _apply_materialized_cloud_layout(
         lod_tier = layout.get("lod_tier")
         radial_x = layout.get("radial_x")
         radial_y = layout.get("radial_y")
-        box_width = layout.get("box_width")
-        box_height = layout.get("box_height")
-        box_pad_x = layout.get("box_pad_x")
-        box_pad_y = layout.get("box_pad_y")
+        fallback_metrics = _cloud_label_metrics(node.get("label") or node.get("wikipedia_title"))
+        text_width = float(layout.get("text_width") or 0.0) or fallback_metrics["text_width"]
+        text_height = float(layout.get("text_height") or 0.0) or fallback_metrics["text_height"]
+        box_pad_x = float(layout.get("box_pad_x") or _CLOUD_BOX_PAD_X)
+        box_pad_y = float(layout.get("box_pad_y") or _CLOUD_BOX_PAD_Y)
+        box_width = float(layout.get("box_width") or 0.0) or text_width + box_pad_x * 2
+        box_height = float(layout.get("box_height") or 0.0) or text_height + box_pad_y * 2
         display_x = radial_x if radial_x is not None and radial_y is not None else layout["x"]
         display_y = radial_y if radial_x is not None and radial_y is not None else layout["y"]
         if radial_x is not None and radial_y is not None:
@@ -296,24 +347,14 @@ def _apply_materialized_cloud_layout(
                 **node,
                 "x": float(display_x),
                 "y": float(display_y),
-                "width": float(layout["width"]),
-                "height": float(layout["height"]),
-                "box_width": (
-                    float(box_width)
-                    if box_width is not None and float(box_width) > 0
-                    else float(layout["width"]) + _CLOUD_BOX_PAD_X * 2
-                ),
-                "box_height": (
-                    float(box_height)
-                    if box_height is not None and float(box_height) > 0
-                    else float(layout["height"]) + _CLOUD_BOX_PAD_Y * 2
-                ),
-                "box_pad_x": (
-                    float(box_pad_x) if box_pad_x is not None else _CLOUD_BOX_PAD_X
-                ),
-                "box_pad_y": (
-                    float(box_pad_y) if box_pad_y is not None else _CLOUD_BOX_PAD_Y
-                ),
+                "width": text_width,
+                "height": text_height,
+                "text_width": text_width,
+                "text_height": text_height,
+                "box_width": box_width,
+                "box_height": box_height,
+                "box_pad_x": box_pad_x,
+                "box_pad_y": box_pad_y,
                 "priority": float(layout["priority"]),
                 "lod_score": float(lod_score) if lod_score is not None else 0.0,
                 "radial_x": float(radial_x) if radial_x is not None else None,
@@ -325,7 +366,9 @@ def _apply_materialized_cloud_layout(
                 "show_scale": (
                     float(show_scale)
                     if show_scale is not None
-                    else float(min_visible_scale) if min_visible_scale is not None else 2.0
+                    else float(min_visible_scale)
+                    if min_visible_scale is not None
+                    else 2.0
                 ),
                 "hide_scale": float(hide_scale) if hide_scale is not None else 1.85,
                 "lod_rank": int(lod_rank) if lod_rank is not None else 0,
@@ -333,6 +376,47 @@ def _apply_materialized_cloud_layout(
             }
         )
     return materialized_nodes, applied, radial_applied
+
+
+def _apply_cloud_display_cache(
+    nodes: list[dict],
+    display_rows: list[dict],
+) -> tuple[list[dict], int, int]:
+    display_by_id = {row["genre_id"]: row for row in display_rows}
+    applied = 0
+    radial_applied = 0
+    cached_nodes: list[dict] = []
+    for node in nodes:
+        layout = display_by_id.get(node["id"])
+        if not layout:
+            cached_nodes.append(node)
+            continue
+        applied += 1
+        if int(layout.get("display_source") or 0) == 2:
+            radial_applied += 1
+        cached_nodes.append(
+            {
+                **node,
+                "x": float(layout["x"]),
+                "y": float(layout["y"]),
+                "width": float(layout["text_width"]),
+                "height": float(layout["text_height"]),
+                "text_width": float(layout["text_width"]),
+                "text_height": float(layout["text_height"]),
+                "box_width": float(layout["box_width"]),
+                "box_height": float(layout["box_height"]),
+                "box_pad_x": float(layout["box_pad_x"]),
+                "box_pad_y": float(layout["box_pad_y"]),
+                "priority": float(layout["priority"]),
+                "lod_score": float(layout["lod_score"]),
+                "min_visible_scale": float(layout["min_visible_scale"]),
+                "show_scale": float(layout["show_scale"]),
+                "hide_scale": float(layout["hide_scale"]),
+                "lod_rank": int(layout["lod_rank"]),
+                "lod_tier": int(layout["lod_tier"]),
+            }
+        )
+    return cached_nodes, applied, radial_applied
 
 
 def _cloud_bounds(nodes: list[dict]) -> dict[str, float]:
@@ -396,6 +480,8 @@ def _sort_cloud_nodes(candidates: list[dict], *, selected_genre_id: str | None) 
     return sorted(
         candidates,
         key=lambda node: (
+            _cloud_anchor_rank(node, selected_genre_id),
+            _cloud_selected_relationship_tier(node, selected_genre_id),
             node["id"] != selected,
             int(node.get("lod_rank") or 0),
             int(node.get("lod_tier") or 0),
@@ -406,7 +492,31 @@ def _sort_cloud_nodes(candidates: list[dict], *, selected_genre_id: str | None) 
     )
 
 
-def _cloud_screen_rect(node: dict, scale: float, view_tx: float, view_ty: float) -> dict[str, float]:
+def _cloud_anchor_rank(node: dict, selected_genre_id: str | None) -> int:
+    node_id = str(node.get("id") or "")
+    if selected_genre_id and selected_genre_id != _CLOUD_ROOT_ID and node_id == selected_genre_id:
+        return 0
+    if node_id == _CLOUD_ROOT_ID:
+        return 1
+    return 2
+
+
+def _cloud_selected_relationship_tier(node: dict, selected_genre_id: str | None) -> int:
+    if not selected_genre_id or selected_genre_id == _CLOUD_ROOT_ID:
+        return 0
+    if str(node.get("id") or "") == selected_genre_id:
+        return 0
+    distance = node.get("selected_distance")
+    if isinstance(distance, bool) or not isinstance(distance, int | float):
+        return 99
+    if not math.isfinite(float(distance)):
+        return 99
+    return max(0, min(98, int(distance)))
+
+
+def _cloud_screen_rect(
+    node: dict, scale: float, view_tx: float, view_ty: float
+) -> dict[str, float]:
     x = node["x"] * scale + view_tx
     y = node["y"] * scale + view_ty
     width = _cloud_box_width(node)
@@ -420,7 +530,12 @@ def _cloud_screen_rect(node: dict, scale: float, view_tx: float, view_ty: float)
 
 
 def _rects_overlap(a: dict[str, float], b: dict[str, float]) -> bool:
-    return a["left"] < b["right"] and a["right"] > b["left"] and a["top"] < b["bottom"] and a["bottom"] > b["top"]
+    return (
+        a["left"] < b["right"]
+        and a["right"] > b["left"]
+        and a["top"] < b["bottom"]
+        and a["bottom"] > b["top"]
+    )
 
 
 class _CloudScreenSpatialIndex:
@@ -518,6 +633,82 @@ def _viewport_cloud_nodes(
         selected_genre_id=selected_genre_id,
     )
     return _sort_cloud_nodes(candidates, selected_genre_id=selected_genre_id)[:limit]
+
+
+def _cloud_selected_distance_opacity_score(distance: int, strongest_edge: float) -> float:
+    distance_score = max(0.0, 1.0 - distance * 0.22)
+    edge_score = max(0.0, min(1.0, strongest_edge))
+    return round(max(0.0, min(1.0, distance_score * 0.74 + edge_score * 0.26)), 4)
+
+
+def _cloud_selected_distance_map(
+    edges: Iterable[dict],
+    *,
+    selected_genre_id: str | None,
+    max_depth: int = 4,
+) -> dict[str, dict[str, int | float]]:
+    if not selected_genre_id or selected_genre_id == _CLOUD_ROOT_ID:
+        return {}
+
+    adjacency: dict[str, list[tuple[str, float]]] = {}
+    for edge in edges:
+        left_id = edge.get("from_genre_id")
+        right_id = edge.get("to_genre_id")
+        if not left_id or not right_id or left_id == right_id:
+            continue
+        weight = max(0.0, min(1.0, float(edge.get("weight") or 0.0)))
+        adjacency.setdefault(left_id, []).append((right_id, weight))
+        adjacency.setdefault(right_id, []).append((left_id, weight))
+
+    distances: dict[str, dict[str, int | float]] = {
+        selected_genre_id: {"distance": 0, "score": 1.0}
+    }
+    queue: deque[tuple[str, int, float]] = deque([(selected_genre_id, 0, 1.0)])
+    while queue:
+        genre_id, distance, path_strength = queue.popleft()
+        if distance >= max_depth:
+            continue
+        for neighbor_id, edge_weight in adjacency.get(genre_id, ()):
+            next_distance = distance + 1
+            next_strength = path_strength * max(0.18, edge_weight)
+            current = distances.get(neighbor_id)
+            if current is not None:
+                if next_distance < int(current["distance"]):
+                    current["distance"] = next_distance
+                    current["score"] = _cloud_selected_distance_opacity_score(
+                        next_distance,
+                        next_strength,
+                    )
+                    queue.append((neighbor_id, next_distance, next_strength))
+                continue
+            distances[neighbor_id] = {
+                "distance": next_distance,
+                "score": _cloud_selected_distance_opacity_score(next_distance, next_strength),
+            }
+            queue.append((neighbor_id, next_distance, next_strength))
+    return distances
+
+
+def _apply_cloud_selected_distances(
+    nodes: list[dict],
+    distances: dict[str, dict[str, int | float]],
+) -> list[dict]:
+    if not distances:
+        return nodes
+    applied: list[dict] = []
+    for node in nodes:
+        distance = distances.get(node.get("id"))
+        if not distance:
+            applied.append(node)
+            continue
+        applied.append(
+            {
+                **node,
+                "selected_distance": int(distance["distance"]),
+                "selected_focus_score": float(distance["score"]),
+            }
+        )
+    return applied
 
 
 class Region(TypedDict):
@@ -734,9 +925,18 @@ async def _get_genre_row(session, genre_id: str, include_deleted: bool = False):
     query = """
         SELECT g.*,
                c.color_hex AS similarity_color,
-               c.confidence AS color_confidence
+               c.confidence AS color_confidence,
+               layout.text_width,
+               layout.text_height,
+               layout.box_width,
+               layout.box_height,
+               layout.box_pad_x,
+               layout.box_pad_y
         FROM wg_genres g
         LEFT JOIN wg_genre_colors c ON c.genre_id = g.id
+        LEFT JOIN wg_genre_semantic_layouts layout
+          ON layout.genre_id = g.id
+         AND layout.layout_key = :layout_key
         WHERE g.id = :id
           AND g.is_non_genre = false
     """
@@ -744,7 +944,7 @@ async def _get_genre_row(session, genre_id: str, include_deleted: bool = False):
         query += "\n          AND g.deleted_at IS NULL"
     row = await session.execute(
         text(query),
-        {"id": genre_id},
+        {"id": genre_id, "layout_key": layout_key_for_root(None)},
     )
     return row.mappings().fetchone()
 
@@ -752,6 +952,7 @@ async def _get_genre_row(session, genre_id: str, include_deleted: bool = False):
 async def _build_genre_detail(session, row) -> GenreDetail:
     """Assemble a GenreDetail from a wg_genres row plus related tables."""
     gid = row["id"]
+    layout_key = layout_key_for_root(None)
 
     edges_out = (
         (
@@ -761,10 +962,19 @@ async def _build_genre_detail(session, row) -> GenreDetail:
                    e.relation, e.source, e.ordinal, e.evidence_relation,
                    to_g.monthly_views_p30 AS to_monthly_views_p30,
                    to_c.color_hex AS to_similarity_color,
-                   to_c.confidence AS to_color_confidence
+                   to_c.confidence AS to_color_confidence,
+                   to_layout.text_width AS to_text_width,
+                   to_layout.text_height AS to_text_height,
+                   to_layout.box_width AS to_box_width,
+                   to_layout.box_height AS to_box_height,
+                   to_layout.box_pad_x AS to_box_pad_x,
+                   to_layout.box_pad_y AS to_box_pad_y
             FROM wg_edges e
             LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
             LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
+            LEFT JOIN wg_genre_semantic_layouts to_layout
+              ON to_layout.genre_id = e.to_genre_id
+             AND to_layout.layout_key = :layout_key
             WHERE e.from_genre_id = :gid
               AND e.is_ignored = false
               AND (
@@ -773,7 +983,7 @@ async def _build_genre_detail(session, row) -> GenreDetail:
               )
             ORDER BY e.relation, e.source, e.ordinal
         """),
-                {"gid": gid},
+                {"gid": gid, "layout_key": layout_key},
             )
         )
         .mappings()
@@ -788,18 +998,27 @@ async def _build_genre_detail(session, row) -> GenreDetail:
                    e.relation, e.source, e.ordinal, e.evidence_relation,
                    to_g.monthly_views_p30 AS to_monthly_views_p30,
                    to_c.color_hex AS to_similarity_color,
-                   to_c.confidence AS to_color_confidence
+                   to_c.confidence AS to_color_confidence,
+                   to_layout.text_width AS to_text_width,
+                   to_layout.text_height AS to_text_height,
+                   to_layout.box_width AS to_box_width,
+                   to_layout.box_height AS to_box_height,
+                   to_layout.box_pad_x AS to_box_pad_x,
+                   to_layout.box_pad_y AS to_box_pad_y
             FROM wg_edges e
             JOIN wg_genres g ON g.id = e.from_genre_id
             LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
             LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
+            LEFT JOIN wg_genre_semantic_layouts to_layout
+              ON to_layout.genre_id = e.to_genre_id
+             AND to_layout.layout_key = :layout_key
             WHERE e.to_genre_id = :gid
               AND e.is_ignored = false
               AND g.deleted_at IS NULL
               AND g.is_non_genre = false
             ORDER BY e.relation, e.source, e.ordinal
         """),
-                {"gid": gid},
+                {"gid": gid, "layout_key": layout_key},
             )
         )
         .mappings()
@@ -861,15 +1080,24 @@ async def _build_genre_detail(session, row) -> GenreDetail:
     youtube_items = (
         (
             await session.execute(
-                text("""
+                text(f"""
                     SELECT tracks.genre_id, tracks.ordinal, tracks.song_title, tracks.artist, tracks.youtube_url
                     FROM wg_genre_youtube_playlist_tracks tracks
                     LEFT JOIN wg_youtube_playback_error_stats errors
                       ON errors.genre_id = tracks.genre_id
                      AND errors.youtube_url = tracks.youtube_url
                     WHERE tracks.genre_id = :gid
-                      AND (tracks.is_embeddable IS DISTINCT FROM false)
-                    ORDER BY coalesce(errors.error_count, 0), tracks.ordinal, tracks.artist, tracks.song_title
+                      AND {_playable_playlist_track_condition("tracks")}
+                    ORDER BY
+                        CASE
+                            WHEN tracks.is_embeddable IS true THEN 0
+                            WHEN tracks.is_embeddable IS NULL THEN 1
+                            ELSE 2
+                        END,
+                        coalesce(errors.error_count, 0),
+                        tracks.ordinal,
+                        tracks.artist,
+                        tracks.song_title
                 """),
                 {"gid": gid},
             )
@@ -887,6 +1115,12 @@ async def _build_genre_detail(session, row) -> GenreDetail:
         infobox_color=row["infobox_color"],
         similarity_color=row["similarity_color"],
         color_confidence=row["color_confidence"],
+        text_width=row["text_width"],
+        text_height=row["text_height"],
+        box_width=row["box_width"],
+        box_height=row["box_height"],
+        box_pad_x=row["box_pad_x"],
+        box_pad_y=row["box_pad_y"],
         summary=row["summary"],
         last_changed_at=row["last_changed_at"],
         last_fetched_at=row["last_fetched_at"],
@@ -1072,7 +1306,9 @@ def _map_item_from_variant(item: RegionVariantOut, *, map_key: str) -> MapRegion
         selectable_for=display_title,
         selection_priority=0 if item.region_kind == "country" else 5,
         represented_genre_ids=_represented_genre_ids(item.genre_id, item.base_genre_id),
-        represented_titles=_represented_titles(item.wikipedia_title, item.display_title, region_name),
+        represented_titles=_represented_titles(
+            item.wikipedia_title, item.display_title, region_name
+        ),
     )
 
 
@@ -1090,7 +1326,12 @@ def _merge_map_item_represented(*items: MapRegionItemOut) -> tuple[list[str], li
     genre_ids: list[str] = []
     titles: list[str] = []
     for item in items:
-        for genre_id in [item.genre_id, item.base_genre_id, item.matched_genre_id, *item.represented_genre_ids]:
+        for genre_id in [
+            item.genre_id,
+            item.base_genre_id,
+            item.matched_genre_id,
+            *item.represented_genre_ids,
+        ]:
             if genre_id and genre_id not in genre_ids:
                 genre_ids.append(genre_id)
         for title in [
@@ -1105,7 +1346,9 @@ def _merge_map_item_represented(*items: MapRegionItemOut) -> tuple[list[str], li
     return genre_ids, titles
 
 
-def _map_item_with_represented(item: MapRegionItemOut, *others: MapRegionItemOut) -> MapRegionItemOut:
+def _map_item_with_represented(
+    item: MapRegionItemOut, *others: MapRegionItemOut
+) -> MapRegionItemOut:
     genre_ids, titles = _merge_map_item_represented(item, *others)
     represented_children: list[dict] = []
     seen_child_ids: set[str] = set()
@@ -1163,8 +1406,8 @@ async def _pure_region_matches_for_genre(
                    region.id AS region_id,
                    region.canonical_name,
                    region.kind AS region_kind,
-                   COALESCE(promoted.genre_id, mapped.genre_id) AS genre_id,
-                   COALESCE(promoted.wikipedia_title, genre.wikipedia_title) AS wikipedia_title,
+                   mapped.genre_id AS genre_id,
+                   genre.wikipedia_title AS wikipedia_title,
                    genre.monthly_views_p30,
                    c.color_hex AS similarity_color,
                    c.confidence AS color_confidence,
@@ -1173,8 +1416,7 @@ async def _pure_region_matches_for_genre(
             FROM wg_region_node_mappings mapped
             JOIN wg_regions region ON region.id = mapped.region_id
             JOIN wg_genres genre ON genre.id = mapped.genre_id
-            LEFT JOIN wg_region_promoted_genres promoted ON promoted.region_id = region.id
-            LEFT JOIN wg_genre_colors c ON c.genre_id = COALESCE(promoted.genre_id, mapped.genre_id)
+            LEFT JOIN wg_genre_colors c ON c.genre_id = mapped.genre_id
             WHERE mapped.genre_id = :genre_id
               AND genre.deleted_at IS NULL
               AND coalesce(region.raw_payload #>> '{region_production_review,status}', '') NOT IN (
@@ -1434,6 +1676,33 @@ async def _region_country_ancestor_rows(session, region_ids: list[str]):
     )
 
 
+async def _region_rows_by_canonical_names(session, region_names: list[str]):
+    if not region_names:
+        return []
+    return (
+        (
+            await session.execute(
+                text("""
+            SELECT region.id,
+                   region.canonical_name,
+                   region.kind
+            FROM wg_regions region
+            WHERE lower(region.canonical_name) = ANY(:region_names)
+              AND coalesce(region.raw_payload #>> '{region_production_review,status}', '') NOT IN (
+                'collapsed',
+                'rejected',
+                'demoted_source',
+                'hidden_from_ui'
+              )
+        """),
+                {"region_names": region_names},
+            )
+        )
+        .mappings()
+        .fetchall()
+    )
+
+
 async def _region_group_ancestor_rows(session, region_ids: list[str]):
     if not region_ids:
         return []
@@ -1493,6 +1762,117 @@ async def _region_group_ancestor_rows(session, region_ids: list[str]):
     )
 
 
+async def _root_continent_group_rows(session, region_ids: list[str]):
+    if not region_ids:
+        return []
+    return (
+        (
+            await session.execute(
+                text("""
+            WITH RECURSIVE accepted_ancestors(seed_region_id, region_id, depth, path) AS (
+                SELECT rel.from_region_id,
+                       rel.to_region_id,
+                       1,
+                       ARRAY[rel.from_region_id, rel.to_region_id]::text[]
+                FROM wg_region_relationships rel
+                WHERE rel.from_region_id = ANY(:region_ids)
+                  AND rel.status = 'accepted'
+                UNION ALL
+                SELECT accepted_ancestors.seed_region_id,
+                       rel.to_region_id,
+                       accepted_ancestors.depth + 1,
+                       accepted_ancestors.path || rel.to_region_id
+                FROM accepted_ancestors
+                JOIN wg_region_relationships rel
+                  ON rel.from_region_id = accepted_ancestors.region_id
+                WHERE rel.status = 'accepted'
+                  AND accepted_ancestors.depth < 8
+                  AND NOT rel.to_region_id = ANY(accepted_ancestors.path)
+            ),
+            pure_ancestors(seed_region_id, region_id, depth, path) AS (
+                SELECT rel.from_region_id,
+                       rel.to_region_id,
+                       1,
+                       ARRAY[rel.from_region_id, rel.to_region_id]::text[]
+                FROM wg_pure_region_relationships rel
+                WHERE rel.from_region_id = ANY(:region_ids)
+                UNION ALL
+                SELECT pure_ancestors.seed_region_id,
+                       rel.to_region_id,
+                       pure_ancestors.depth + 1,
+                       pure_ancestors.path || rel.to_region_id
+                FROM pure_ancestors
+                JOIN wg_pure_region_relationships rel
+                  ON rel.from_region_id = pure_ancestors.region_id
+                WHERE pure_ancestors.depth < 8
+                  AND NOT rel.to_region_id = ANY(pure_ancestors.path)
+            ),
+            ancestors AS (
+                SELECT seed_region_id, region_id, depth, 0 AS source_rank
+                FROM accepted_ancestors
+                UNION ALL
+                SELECT seed_region_id, region_id, depth, 1 AS source_rank
+                FROM pure_ancestors
+            )
+            SELECT DISTINCT ON (ancestors.seed_region_id)
+                   ancestors.seed_region_id,
+                   region.id AS group_region_id,
+                   region.canonical_name AS group_region_name,
+                   'continent' AS group_region_kind,
+                   ancestors.depth
+            FROM ancestors
+            JOIN wg_regions region ON region.id = ancestors.region_id
+            WHERE region.canonical_name = ANY(:continent_names)
+              AND coalesce(region.raw_payload #>> '{region_production_review,status}', '') NOT IN (
+                'collapsed',
+                'rejected',
+                'demoted_source',
+                'hidden_from_ui'
+              )
+            ORDER BY ancestors.seed_region_id,
+                     CASE WHEN region.canonical_name = 'Americas' THEN 1 ELSE 0 END,
+                     ancestors.depth,
+                     CASE region.canonical_name
+                       WHEN 'North America' THEN 0
+                       WHEN 'South America' THEN 1
+                       ELSE 2
+                     END,
+                     ancestors.source_rank,
+                     region.canonical_name
+        """),
+                {
+                    "region_ids": region_ids,
+                    "continent_names": list(ROOT_LIST_CONTINENT_NAMES),
+                },
+            )
+        )
+        .mappings()
+        .fetchall()
+    )
+
+
+async def _annotate_root_map_items_for_list(
+    session,
+    items: list[MapRegionItemOut],
+) -> list[MapRegionItemOut]:
+    region_ids = sorted({item.region_id for item in items if item.region_id})
+    group_by_region = {
+        row["seed_region_id"]: row for row in await _root_continent_group_rows(session, region_ids)
+    }
+    return [
+        item.model_copy(
+            update={
+                "list_group_region_id": group_by_region[item.region_id]["group_region_id"],
+                "list_group_region_name": group_by_region[item.region_id]["group_region_name"],
+                "list_group_region_kind": group_by_region[item.region_id]["group_region_kind"],
+            }
+        )
+        if item.region_id in group_by_region
+        else item
+        for item in items
+    ]
+
+
 async def _annotate_map_items_for_list(
     session,
     items: list[MapRegionItemOut],
@@ -1502,7 +1882,32 @@ async def _annotate_map_items_for_list(
     if not items:
         return items
 
-    region_ids = [item.region_id for item in items if item.region_id]
+    unresolved_region_names = sorted(
+        {
+            item.region_name.strip().casefold()
+            for item in items
+            if item.region_name and not item.region_id
+        }
+    )
+    resolved_region_rows = await _region_rows_by_canonical_names(session, unresolved_region_names)
+    resolved_region_by_name = {
+        row["canonical_name"].casefold(): row for row in resolved_region_rows
+    }
+
+    resolved_region_by_item: dict[int, dict[str, Any]] = {}
+    region_ids: list[str] = []
+    seen_region_ids: set[str] = set()
+    for item in items:
+        resolved_region = None
+        if item.region_name and not item.region_id:
+            resolved_region = resolved_region_by_name.get(item.region_name.strip().casefold())
+        effective_region_id = item.region_id or (resolved_region and resolved_region["id"])
+        if resolved_region is not None:
+            resolved_region_by_item[id(item)] = resolved_region
+        if effective_region_id and effective_region_id not in seen_region_ids:
+            seen_region_ids.add(effective_region_id)
+            region_ids.append(effective_region_id)
+
     descendant_rows = await _pure_region_descendant_country_rows(session, region_ids)
     country_ancestor_rows = await _pure_region_country_ancestor_rows(session, region_ids)
     direct_country_ancestor_rows = await _region_country_ancestor_rows(session, region_ids)
@@ -1517,21 +1922,37 @@ async def _annotate_map_items_for_list(
             existing.append(key)
 
     country_ancestor_by_region = {row["seed_region_id"]: row for row in country_ancestor_rows}
-    country_ancestor_by_region.update({row["seed_region_id"]: row for row in direct_country_ancestor_rows})
+    country_ancestor_by_region.update(
+        {row["seed_region_id"]: row for row in direct_country_ancestor_rows}
+    )
     group_by_region = {row["seed_region_id"]: row for row in group_rows}
     group_by_region.update({row["seed_region_id"]: row for row in direct_group_rows})
 
     annotated: list[MapRegionItemOut] = []
     for item in items:
+        resolved_region = resolved_region_by_item.get(id(item))
+        effective_region_id = item.region_id or (resolved_region and resolved_region["id"])
+        effective_region_name = item.region_name or (
+            resolved_region and resolved_region["canonical_name"]
+        )
+        effective_region_kind = item.region_kind or (resolved_region and resolved_region["kind"])
         icon_feature_keys: list[str] = []
         if map_key == US_MAP_KEY:
             icon_feature_keys = [_feature_key_for_region("United States", map_key=WORLD_MAP_KEY)]
-        elif item.region_id and item.region_id in descendant_keys_by_region and item.region_kind != "country":
-            icon_feature_keys = descendant_keys_by_region[item.region_id]
-        elif item.region_kind != "country" and item.region_id and item.region_id in country_ancestor_by_region:
+        elif (
+            effective_region_id
+            and effective_region_id in descendant_keys_by_region
+            and effective_region_kind != "country"
+        ):
+            icon_feature_keys = descendant_keys_by_region[effective_region_id]
+        elif (
+            effective_region_kind != "country"
+            and effective_region_id
+            and effective_region_id in country_ancestor_by_region
+        ):
             icon_feature_keys = [
                 _feature_key_for_region(
-                    country_ancestor_by_region[item.region_id]["country_name"],
+                    country_ancestor_by_region[effective_region_id]["country_name"],
                     map_key=WORLD_MAP_KEY,
                 )
             ]
@@ -1539,20 +1960,27 @@ async def _annotate_map_items_for_list(
             icon_feature_keys = [item.feature_key]
 
         group = (
-            (item.region_id and group_by_region.get(item.region_id))
+            (effective_region_id and group_by_region.get(effective_region_id))
             or (item.mount_parent_region_id and group_by_region.get(item.mount_parent_region_id))
             or (item.matched_region_id and group_by_region.get(item.matched_region_id))
         )
-        if group is None and item.region_kind not in ("country", "territory", "subregion") and item.region_id:
+        if (
+            group is None
+            and effective_region_kind not in ("country", "territory", "subregion")
+            and effective_region_id
+        ):
             group = {
-                "group_region_id": item.region_id,
-                "group_region_name": item.region_name,
-                "group_region_kind": item.region_kind,
+                "group_region_id": effective_region_id,
+                "group_region_name": effective_region_name,
+                "group_region_kind": effective_region_kind,
             }
 
         annotated.append(
             item.model_copy(
                 update={
+                    "region_id": effective_region_id,
+                    "region_name": effective_region_name,
+                    "region_kind": effective_region_kind,
                     "list_group_region_id": group["group_region_id"] if group else None,
                     "list_group_region_name": group["group_region_name"] if group else None,
                     "list_group_region_kind": group["group_region_kind"] if group else None,
@@ -1577,6 +2005,11 @@ async def _expand_map_items_with_pure_region_graph(
 
     expanded: list[MapRegionItemOut] = list(items)
     superregion_parent_by_country: dict[str, MapRegionItemOut] = {}
+    directly_mapped_country_genres = {
+        item.genre_id
+        for item in items
+        if item.genre_id and item.region_kind in ("country", "territory")
+    }
 
     descendants = await _pure_region_descendant_country_rows(session, seed_region_ids)
     descendant_seed_ids = {row["seed_region_id"] for row in descendants}
@@ -1584,9 +2017,11 @@ async def _expand_map_items_with_pure_region_graph(
         source = by_region_id.get(row["seed_region_id"])
         if source is None or source.region_kind == "country":
             continue
+        if source.genre_id and source.genre_id in directly_mapped_country_genres:
+            continue
         country_name = row["country_name"]
         feature_key = _feature_key_for_region(country_name, map_key=map_key)
-        display_title = row["wikipedia_title"] or f"Music of {country_name}"
+        display_title = source.display_title or source.region_name or country_name
         superregion_parent_by_country.setdefault(row["country_region_id"], source)
         expanded.append(
             MapRegionItemOut(
@@ -1597,12 +2032,12 @@ async def _expand_map_items_with_pure_region_graph(
                 map_key=map_key,
                 feature_key=feature_key,
                 feature_name=feature_key,
-                genre_id=row["genre_id"],
-                wikipedia_title=row["wikipedia_title"],
+                genre_id=source.genre_id,
+                wikipedia_title=source.wikipedia_title,
                 display_title=display_title,
-                monthly_views_p30=row["monthly_views_p30"],
-                similarity_color=row["similarity_color"],
-                color_confidence=row["color_confidence"],
+                monthly_views_p30=source.monthly_views_p30,
+                similarity_color=source.similarity_color,
+                color_confidence=source.color_confidence,
                 match_type="pure_region_descendant_country",
                 selectable=True,
                 role="country",
@@ -1614,8 +2049,8 @@ async def _expand_map_items_with_pure_region_graph(
                 mount_parent_region_id=source.region_id,
                 mount_parent_region_name=source.region_name,
                 selection_priority=20,
-                represented_genre_ids=_represented_genre_ids(row["genre_id"], source.genre_id),
-                represented_titles=_represented_titles(row["wikipedia_title"], display_title, source.display_title),
+                represented_genre_ids=_represented_genre_ids(source.genre_id),
+                represented_titles=_represented_titles(source.wikipedia_title, display_title),
             )
         )
 
@@ -1658,7 +2093,8 @@ async def _expand_map_items_with_pure_region_graph(
                 item.model_copy(
                     update={
                         "mount_parent_region_id": item.mount_parent_region_id or parent.region_id,
-                        "mount_parent_region_name": item.mount_parent_region_name or parent.region_name,
+                        "mount_parent_region_name": item.mount_parent_region_name
+                        or parent.region_name,
                         "matched_region_id": item.matched_region_id or parent.region_id,
                         "matched_region_name": item.matched_region_name or parent.region_name,
                         "matched_region_kind": item.matched_region_kind or parent.region_kind,
@@ -1705,14 +2141,8 @@ async def _direct_regional_child_rows_for_map(session, *, genre_id: str):
         """),
                 {
                     "genre_id": genre_id,
-                    "variant_relations": [
-                        *DISPLAY_RELATIONS,
-                        REGIONAL_SCENE_RELATION,
-                    ],
-                    "variant_evidence_relations": [
-                        *DISPLAY_RELATIONS,
-                        REGIONAL_SCENE_EVIDENCE_RELATION,
-                    ],
+                    "variant_relations": list(MAP_VARIANT_RELATIONS),
+                    "variant_evidence_relations": list(MAP_VARIANT_EVIDENCE_RELATIONS),
                     "related_relation": RELATED_RELATION,
                 },
             )
@@ -1789,7 +2219,10 @@ async def _group_country_map_items_with_regional_children(
         )
         child_genre_ids = _represented_genre_ids(*(child.get("genre_id") for child in children))
         child_titles = _represented_titles(*(child.get("wikipedia_title") for child in children))
-        if len(children) == 1:
+        if len(children) == 1 or (
+            item.genre_id
+            and any(child.get("genre_id") == item.genre_id for child in children)
+        ):
             grouped_items.append(
                 item.model_copy(
                     update={
@@ -1856,18 +2289,16 @@ def _region_name_from_regional_title(title: str | None) -> str | None:
     region = _known_region_for_music_title(title)
     if region:
         return region["name"]
-    explicit_region_name = _regional_title_region_name(title) or _region_name_from_music_title(title)
+    explicit_region_name = _regional_title_region_name(title) or _region_name_from_music_title(
+        title
+    )
     if explicit_region_name:
         return explicit_region_name
     label = _label_for_region_match(title).lower()
     for region in REGIONS:
         names = {str(region["name"]).lower(), str(region["of"]).lower()}
         for name in names:
-            if (
-                label.startswith(f"{name} ")
-                or f" in {name}" in label
-                or f" of {name}" in label
-            ):
+            if label.startswith(f"{name} ") or f" in {name}" in label or f" of {name}" in label:
                 return region["name"]
         for demonym in region["demonyms"]:
             demonym_lower = str(demonym).lower()
@@ -1906,10 +2337,9 @@ def _variant_from_regional_child_row(row, *, match_type: str) -> RegionVariantOu
     if not region_name:
         return None
     child_region_name = _region_name_from_regional_title(row["wikipedia_title"])
-    if (
+    if child_region_name and _normalized_region_match_name(
         child_region_name
-        and _normalized_region_match_name(child_region_name) != _normalized_region_match_name(region_name)
-    ):
+    ) != _normalized_region_match_name(region_name):
         return None
     return RegionVariantOut(
         region_key=region["key"] if region else _slug_region_key(region_name, fallback=row["id"]),
@@ -1926,6 +2356,32 @@ def _variant_from_regional_child_row(row, *, match_type: str) -> RegionVariantOu
         color_confidence=row["color_confidence"],
         match_type=match_type,
     )
+
+
+def _regional_graph_region_rank(row) -> int:
+    kind = row.get("region_kind")
+    if kind in ("country", "territory"):
+        return 0
+    if kind in ("subregion", "city"):
+        return 1
+    if kind in ("cultural_region", "historical_region"):
+        return 2
+    if kind == "continent":
+        return 3
+    return 4
+
+
+def _most_specific_regional_graph_rows(rows):
+    best_rank_by_child: dict[str, int] = {}
+    for row in rows:
+        child_id = row["id"]
+        rank = _regional_graph_region_rank(row)
+        best_rank_by_child[child_id] = min(rank, best_rank_by_child.get(child_id, rank))
+    return [
+        row
+        for row in rows
+        if _regional_graph_region_rank(row) == best_rank_by_child.get(row["id"])
+    ]
 
 
 async def _regional_variants_for_title(
@@ -2041,16 +2497,6 @@ async def _regional_variants_for_title(
                           AND e.evidence_relation = ANY(:variant_evidence_relations)
                         )
                       )
-                    UNION
-                    SELECT DISTINCT e.from_genre_id AS child_id
-                    FROM wg_edges e
-                    JOIN wg_genres child_g ON child_g.id = e.from_genre_id
-                    WHERE e.to_genre_id = :genre_id
-                      AND e.is_ignored = false
-                      AND child_g.deleted_at IS NULL
-                      AND child_g.is_non_genre = false
-                      AND e.relation = :related_relation
-                      AND e.evidence_relation = :regional_scene_evidence_relation
                 ),
                 region_links AS (
                     SELECT DISTINCT region_g.id AS region_genre_id,
@@ -2117,27 +2563,21 @@ async def _regional_variants_for_title(
             """),
                     {
                         "genre_id": genre_id,
-                        "variant_relations": [
-                            *DISPLAY_RELATIONS,
-                            REGIONAL_SCENE_RELATION,
-                        ],
-                        "variant_evidence_relations": [
-                            *DISPLAY_RELATIONS,
-                            REGIONAL_SCENE_EVIDENCE_RELATION,
-                        ],
+                        "variant_relations": list(MAP_VARIANT_RELATIONS),
+                        "variant_evidence_relations": list(MAP_VARIANT_EVIDENCE_RELATIONS),
                         "region_parent_evidence_relations": [
                             *DISPLAY_RELATIONS,
                             REGIONAL_SCENE_EVIDENCE_RELATION,
                         ],
                         "region_parent_relations": list(REGION_PARENT_RELATIONS),
                         "related_relation": RELATED_RELATION,
-                        "regional_scene_evidence_relation": REGIONAL_SCENE_EVIDENCE_RELATION,
                     },
                 )
             )
             .mappings()
             .fetchall()
         )
+        graph_rows = _most_specific_regional_graph_rows(graph_rows)
         for row in graph_rows:
             item = _variant_from_regional_child_row(row, match_type="regional_graph")
             if item:
@@ -2199,7 +2639,7 @@ async def _regional_variants_for_title(
                 )
             )
 
-    seen_regions: set[str] = set()
+    seen_variants: set[tuple[str, str | None, str | None]] = set()
     deduped: list[RegionVariantOut] = []
     items.sort(
         key=lambda item: (
@@ -2209,9 +2649,10 @@ async def _regional_variants_for_title(
         )
     )
     for item in items:
-        if item.region_key in seen_regions:
+        key = (item.region_key, item.genre_id, item.candidate_id)
+        if key in seen_variants:
             continue
-        seen_regions.add(item.region_key)
+        seen_variants.add(key)
         deduped.append(item)
     items = deduped
     items.sort(key=lambda item: (item.region_name, item.wikipedia_title))
@@ -2319,6 +2760,210 @@ async def list_genres(
 # ------------------------------------------------------------------ #
 
 
+async def _region_cloud_rows(session, *, region_id: str):
+    rows = (
+        (
+            await session.execute(
+                text("""
+                    WITH RECURSIVE region_tree AS (
+                        SELECT
+                            region.id AS region_id,
+                            region.canonical_name,
+                            region.kind,
+                            promoted.genre_id AS promoted_genre_id,
+                            promoted.wikipedia_title AS promoted_title,
+                            0 AS region_depth
+                        FROM wg_regions region
+                        JOIN wg_region_promoted_genres promoted ON promoted.region_id = region.id
+                        WHERE region.id = :region_id
+
+                        UNION ALL
+
+                        SELECT
+                            child.id AS region_id,
+                            child.canonical_name,
+                            child.kind,
+                            promoted.genre_id AS promoted_genre_id,
+                            promoted.wikipedia_title AS promoted_title,
+                            parent.region_depth + 1 AS region_depth
+                        FROM region_tree parent
+                        JOIN wg_region_relationships rel ON rel.to_region_id = parent.region_id
+                        JOIN wg_regions child ON child.id = rel.from_region_id
+                        JOIN wg_region_promoted_genres promoted ON promoted.region_id = child.id
+                        WHERE rel.status = 'accepted'
+                          AND parent.region_depth < 4
+                          AND coalesce(child.raw_payload #>> '{region_production_review,status}', '') NOT IN (
+                              'collapsed',
+                              'rejected',
+                              'demoted_source',
+                              'hidden_from_ui'
+                          )
+                    ),
+                    center AS (
+                        SELECT promoted_genre_id, promoted_title
+                        FROM region_tree
+                        WHERE region_id = :region_id
+                        LIMIT 1
+                    ),
+                    related_genres AS (
+                        SELECT DISTINCT ON (promoted_genre_id)
+                            promoted_genre_id AS genre_id,
+                            promoted_genre_id AS semantic_root_id,
+                            promoted_title AS semantic_root_title,
+                            region_depth,
+                            0 AS relation_rank
+                        FROM region_tree
+                        WHERE region_id = :region_id
+                           OR promoted_title !~* '\\mmusic\\s+(of|in)\\M'
+
+                        UNION
+
+                        SELECT DISTINCT ON (edge.to_genre_id)
+                            edge.to_genre_id AS genre_id,
+                            coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)) AS semantic_root_id,
+                            coalesce(region_tree.promoted_title, (SELECT promoted_title FROM center)) AS semantic_root_title,
+                            region_tree.region_depth + 1 AS region_depth,
+                            1 AS relation_rank
+                        FROM region_tree
+                        JOIN wg_edges edge ON edge.from_genre_id = region_tree.promoted_genre_id
+                        JOIN wg_genres child ON child.id = edge.to_genre_id
+                        WHERE region_tree.region_id <> :region_id
+                          AND region_tree.promoted_title ~* '\\mmusic\\s+(of|in)\\M'
+                          AND edge.is_ignored = false
+                          AND edge.to_genre_id IS NOT NULL
+                          AND child.deleted_at IS NULL
+                          AND child.is_non_genre = false
+
+                        UNION
+
+                        SELECT DISTINCT ON (rel.genre_id)
+                            rel.genre_id,
+                            coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)) AS semantic_root_id,
+                            coalesce(region_tree.promoted_title, (SELECT promoted_title FROM center)) AS semantic_root_title,
+                            region_tree.region_depth + 1 AS region_depth,
+                            1 AS relation_rank
+                        FROM region_tree
+                        JOIN wg_region_genre_relationships rel ON rel.region_id = region_tree.region_id
+                        WHERE rel.status = 'accepted'
+                          AND rel.relation NOT IN ('regional_style_mention', 'influence_or_context')
+
+                        UNION
+
+                        SELECT DISTINCT ON (affinity.genre_id)
+                            affinity.genre_id,
+                            (SELECT promoted_genre_id FROM center) AS semantic_root_id,
+                            (SELECT promoted_title FROM center) AS semantic_root_title,
+                            2 AS region_depth,
+                            2 AS relation_rank
+                        FROM wg_genre_country_affinities affinity
+                        WHERE affinity.region_id = :region_id
+                          AND affinity.review_status <> 'rejected'
+                          AND affinity.score >= 0.55
+                          AND affinity.confidence >= 0.50
+                    ),
+                    best_path AS (
+                        SELECT DISTINCT ON (genre_id)
+                            genre_id,
+                            semantic_root_id,
+                            semantic_root_title,
+                            region_depth,
+                            relation_rank
+                        FROM related_genres
+                        ORDER BY genre_id, relation_rank, region_depth, semantic_root_title
+                    ),
+                    playable AS (
+                        SELECT genre_id, true AS has_playlist
+                        FROM wg_genre_youtube_playlist_tracks
+                        WHERE is_embeddable IS DISTINCT FROM false
+                        GROUP BY genre_id
+                    ),
+                    child_counts AS (
+                        SELECT e.from_genre_id AS genre_id, COUNT(DISTINCT e.to_genre_id) AS child_connection_count
+                        FROM wg_edges e
+                        JOIN wg_genres child_g ON child_g.id = e.to_genre_id
+                        WHERE e.to_genre_id IS NOT NULL
+                          AND child_g.deleted_at IS NULL
+                          AND child_g.is_non_genre = false
+                        GROUP BY e.from_genre_id
+                    ),
+                    parent_counts AS (
+                        SELECT e.to_genre_id AS genre_id, COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
+                        FROM wg_edges e
+                        JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
+                        WHERE e.to_genre_id IS NOT NULL
+                          AND parent_g.deleted_at IS NULL
+                          AND parent_g.is_non_genre = false
+                        GROUP BY e.to_genre_id
+                    ),
+                    colored_parents AS (
+                        SELECT DISTINCT ON (r.genre_id)
+                            r.genre_id,
+                            COALESCE(parent_c.color_hex, parent_g.infobox_color) AS parent_color
+                        FROM wg_music_reachable_parents r
+                        JOIN wg_genres parent_g ON parent_g.id = r.parent_genre_id
+                        LEFT JOIN wg_genre_colors parent_c ON parent_c.genre_id = r.parent_genre_id
+                        WHERE parent_g.deleted_at IS NULL
+                          AND parent_g.is_non_genre = false
+                          AND COALESCE(parent_c.color_hex, parent_g.infobox_color) IS NOT NULL
+                        ORDER BY r.genre_id, r.parent_depth_from_music DESC, parent_g.wikipedia_title
+                    )
+                    SELECT
+                        g.id,
+                        g.wikipedia_title,
+                        CASE
+                            WHEN g.id = (SELECT promoted_genre_id FROM center) THEN 0
+                            ELSE greatest(1, best_path.region_depth + 1)
+                        END AS depth_from_music,
+                        best_path.semantic_root_id,
+                        best_path.semantic_root_title,
+                        g.monthly_views_p30,
+                        COALESCE(c.color_hex, g.infobox_color, colored_parent.parent_color) AS similarity_color,
+                        c.confidence AS color_confidence,
+                        COALESCE(p.has_playlist, false) AS has_playlist,
+                        COALESCE(cc.child_connection_count, 0) AS child_connection_count,
+                        COALESCE(pc.parent_connection_count, 0) AS parent_connection_count,
+                        (
+                            COALESCE(cc.child_connection_count, 0)::float * 1000000000
+                            + COALESCE(g.monthly_views_p30, 0)::float
+                            + COALESCE(pc.parent_connection_count, 0)::float / 1000000
+                        ) AS priority
+                    FROM best_path
+                    JOIN wg_genres g ON g.id = best_path.genre_id
+                    LEFT JOIN wg_genre_colors c ON c.genre_id = g.id
+                    LEFT JOIN playable p ON p.genre_id = g.id
+                    LEFT JOIN child_counts cc ON cc.genre_id = g.id
+                    LEFT JOIN parent_counts pc ON pc.genre_id = g.id
+                    LEFT JOIN colored_parents colored_parent ON colored_parent.genre_id = g.id
+                    WHERE g.deleted_at IS NULL
+                      AND g.is_non_genre = false
+                      AND (
+                          g.id = (SELECT promoted_genre_id FROM center)
+                          OR g.wikipedia_title !~* '\\mmusic\\s+(of|in)\\M'
+                      )
+                    ORDER BY priority DESC, g.wikipedia_title
+                """),
+                {"region_id": region_id},
+            )
+        )
+        .mappings()
+        .fetchall()
+    )
+    center_genre_id = next(
+        (
+            row["id"]
+            for row in rows
+            if int(row["depth_from_music"]) == 0
+        ),
+        None,
+    )
+    return [
+        row
+        for row in rows
+        if row["id"] == center_genre_id
+        or not MUSIC_REGION_TITLE_RE.search(row["wikipedia_title"] or "")
+    ]
+
+
 @router.get("/cloud", response_model=GenreCloudResult)
 async def get_genre_cloud(
     limit: int = Query(
@@ -2335,16 +2980,20 @@ async def get_genre_cloud(
     view_tx: float = Query(0.0),
     view_ty: float = Query(0.0),
     root_genre_id: str | None = Query(None),
+    region_id: str | None = Query(None),
     selected_genre_id: str | None = Query(None),
     atlas: bool = Query(False),
 ) -> GenreCloudResult:
     """Server-culled label cloud for the current explorer viewport."""
-    layout_key = layout_key_for_root(root_genre_id)
+    layout_key = layout_key_for_root(root_genre_id, region_id=region_id)
     async with session_scope() as session:
-        rows = (
-            (
-                await session.execute(
-                    text("""
+        if region_id:
+            rows = await _region_cloud_rows(session, region_id=region_id)
+        else:
+            rows = (
+                (
+                    await session.execute(
+                        text("""
                         WITH best_path AS (
                             SELECT DISTINCT ON (r.genre_id)
                                 r.genre_id,
@@ -2432,14 +3081,45 @@ async def get_genre_cloud(
                               OR g.wikipedia_title !~* '\\mmusic\\s+(of|in)\\M'
                           )
                         ORDER BY priority DESC, g.wikipedia_title
+                        """),
+                        {"root_genre_id": root_genre_id},
+                    )
+                )
+                .mappings()
+                .fetchall()
+            )
+        display_rows = (
+            (
+                await session.execute(
+                    text("""
+                        SELECT
+                            genre_id,
+                            x,
+                            y,
+                            text_width,
+                            text_height,
+                            box_width,
+                            box_height,
+                            box_pad_x,
+                            box_pad_y,
+                            priority,
+                            lod_score,
+                            min_visible_scale,
+                            show_scale,
+                            hide_scale,
+                            lod_rank,
+                            lod_tier,
+                            display_source
+                        FROM wg_genre_cloud_display_nodes
+                        WHERE layout_key = :layout_key
                     """),
-                    {"root_genre_id": root_genre_id},
+                    {"layout_key": layout_key},
                 )
             )
             .mappings()
             .fetchall()
         )
-        layout_rows = (
+        layout_rows = [] if display_rows else (
             (
                 await session.execute(
                     text("""
@@ -2449,6 +3129,8 @@ async def get_genre_cloud(
                             y,
                             width,
                             height,
+                            text_width,
+                            text_height,
                             box_width,
                             box_height,
                             box_pad_x,
@@ -2472,19 +3154,69 @@ async def get_genre_cloud(
             .mappings()
             .fetchall()
         )
+        semantic_edges = []
+        if selected_genre_id and selected_genre_id != _CLOUD_ROOT_ID:
+            semantic_edges = (
+                (
+                    await session.execute(
+                        text("""
+                            SELECT from_genre_id, to_genre_id, weight
+                            FROM wg_genre_semantic_edges
+                            WHERE layout_key = :layout_key
+                        """),
+                        {"layout_key": layout_key},
+                    )
+                )
+                .mappings()
+                .fetchall()
+            )
 
     row_dicts = [dict(row) for row in rows]
+    display_dicts = [dict(row) for row in display_rows]
     layout_dicts = [dict(row) for row in layout_rows]
-    root_row = next((row for row in row_dicts if row.get("id") == root_genre_id), None)
+    distance_map = _cloud_selected_distance_map(
+        (dict(row) for row in semantic_edges),
+        selected_genre_id=selected_genre_id,
+    )
+    center_id = root_genre_id or _CLOUD_ROOT_ID
+    if region_id:
+        center_row = min(
+            row_dicts,
+            key=lambda row: (
+                int(row["depth_from_music"])
+                if row.get("depth_from_music") is not None
+                else 999,
+                str(row.get("wikipedia_title") or "").lower(),
+            ),
+            default=None,
+        )
+        center_id = center_row.get("id") if center_row else _CLOUD_ROOT_ID
+    root_row = next((row for row in row_dicts if row.get("id") == center_id), None)
     laid_out = _layout_cloud_nodes(
         row_dicts,
-        center_id=root_genre_id or _CLOUD_ROOT_ID,
+        center_id=center_id,
         center_title=root_row.get("wikipedia_title") if root_row else "Music",
     )
     materialized_applied = 0
     radial_applied = 0
     layout_source = "fallback_radial"
-    if layout_dicts:
+    if display_dicts:
+        real_node_count = max(1, len([node for node in laid_out if node["id"] != _CLOUD_ROOT_ID]))
+        laid_out, materialized_applied, radial_applied = _apply_cloud_display_cache(
+            laid_out,
+            display_dicts,
+        )
+        if materialized_applied / real_node_count >= 0.8:
+            layout_source = "cloud_display_cache"
+        else:
+            laid_out = _layout_cloud_nodes(
+                row_dicts,
+                center_id=center_id,
+                center_title=root_row.get("wikipedia_title") if root_row else "Music",
+            )
+            materialized_applied = 0
+            radial_applied = 0
+    elif layout_dicts:
         real_node_count = max(1, len([node for node in laid_out if node["id"] != _CLOUD_ROOT_ID]))
         laid_out, materialized_applied, radial_applied = _apply_materialized_cloud_layout(
             laid_out,
@@ -2499,13 +3231,14 @@ async def get_genre_cloud(
         else:
             laid_out = _layout_cloud_nodes(
                 row_dicts,
-                center_id=root_genre_id or _CLOUD_ROOT_ID,
+                center_id=center_id,
                 center_title=root_row.get("wikipedia_title") if root_row else "Music",
             )
             materialized_applied = 0
             radial_applied = 0
+    laid_out = _apply_cloud_selected_distances(laid_out, distance_map)
     bounds = _cloud_bounds(laid_out)
-    radial_layout = layout_source == "radial_compacted"
+    radial_layout = layout_source in {"radial_compacted", "cloud_display_cache"}
     if atlas:
         visible_nodes = _viewport_cloud_nodes(
             laid_out,
@@ -2514,7 +3247,7 @@ async def get_genre_cloud(
             y_min=None,
             y_max=None,
             scale=scale,
-            selected_genre_id=selected_genre_id or root_genre_id,
+            selected_genre_id=selected_genre_id or root_genre_id or center_id,
             limit=limit,
         )
     else:
@@ -2527,7 +3260,7 @@ async def get_genre_cloud(
             scale=scale,
             view_tx=view_tx,
             view_ty=view_ty,
-            selected_genre_id=selected_genre_id or root_genre_id,
+            selected_genre_id=selected_genre_id or root_genre_id or center_id,
             limit=None if radial_layout and not atlas else limit,
         )
     nodes = [
@@ -2544,8 +3277,13 @@ async def get_genre_cloud(
             "bounds": bounds,
             "layout_key": layout_key,
             "layout_source": layout_source,
+            "region_id": region_id,
+            "center_genre_id": center_id if center_id != _CLOUD_ROOT_ID else None,
+            "display_cache_nodes": len(display_dicts),
             "materialized_nodes": materialized_applied,
             "radial_nodes": radial_applied,
+            "selected_genre_id": selected_genre_id,
+            "selected_distance_nodes": len(distance_map),
             "lod": {
                 "scale": scale,
                 "score_version": "stable-lod-v1",
@@ -2586,15 +3324,24 @@ async def get_genre_playlist(genre_id: str) -> GenrePlaylistResult:
 
         tracks = (
             await session.execute(
-                text("""
+                text(f"""
                     SELECT tracks.genre_id, tracks.ordinal, tracks.song_title, tracks.artist, tracks.youtube_url
                     FROM wg_genre_youtube_playlist_tracks tracks
                     LEFT JOIN wg_youtube_playback_error_stats errors
                       ON errors.genre_id = tracks.genre_id
                      AND errors.youtube_url = tracks.youtube_url
                     WHERE tracks.genre_id = :genre_id
-                      AND (tracks.is_embeddable IS DISTINCT FROM false)
-                    ORDER BY coalesce(errors.error_count, 0), tracks.ordinal, tracks.artist, tracks.song_title
+                      AND {_playable_playlist_track_condition("tracks")}
+                    ORDER BY
+                        CASE
+                            WHEN tracks.is_embeddable IS true THEN 0
+                            WHEN tracks.is_embeddable IS NULL THEN 1
+                            ELSE 2
+                        END,
+                        coalesce(errors.error_count, 0),
+                        tracks.ordinal,
+                        tracks.artist,
+                        tracks.song_title
                 """),
                 {"genre_id": genre_id},
             )
@@ -2691,7 +3438,9 @@ async def _root_country_map_items(session) -> list[MapRegionItemOut]:
         .fetchall()
     )
     return [
-        _map_item_from_region_row(row, map_key=WORLD_MAP_KEY, match_type="music_region", role="country")
+        _map_item_from_region_row(
+            row, map_key=WORLD_MAP_KEY, match_type="music_region", role="country"
+        )
         for row in rows
     ]
 
@@ -2766,7 +3515,9 @@ async def _region_child_map_items(
     return items
 
 
-async def _region_parent_map_items(session, *, region_id: str, map_key: str) -> list[MapRegionItemOut]:
+async def _region_parent_map_items(
+    session, *, region_id: str, map_key: str
+) -> list[MapRegionItemOut]:
     rows = (
         (
             await session.execute(
@@ -2799,7 +3550,9 @@ async def _region_parent_map_items(session, *, region_id: str, map_key: str) -> 
         .fetchall()
     )
     return [
-        _map_item_from_region_row(row, map_key=map_key, match_type="parent_region", role="parent_region")
+        _map_item_from_region_row(
+            row, map_key=map_key, match_type="parent_region", role="parent_region"
+        )
         for row in rows
     ]
 
@@ -2867,27 +3620,8 @@ async def _selected_region_context_highlights(
 
 
 async def _us_context_for_region(session, selected_region) -> tuple[str, list[MapRegionItemOut]]:
-    if selected_region["region_id"] == "region-united-states":
-        return US_MAP_KEY, await _region_child_map_items(
-            session,
-            parent_region_id="region-united-states",
-            map_key=US_MAP_KEY,
-        )
-
-    has_us_parent = bool(
-        await session.scalar(
-            text("""
-            SELECT 1
-            FROM wg_region_relationships rel
-            WHERE rel.from_region_id = :region_id
-              AND rel.to_region_id = 'region-united-states'
-              AND rel.status = 'accepted'
-            LIMIT 1
-        """),
-            {"region_id": selected_region["region_id"]},
-        )
-    )
-    if has_us_parent:
+    active_map = _region_map_key(selected_region["region_id"])
+    if active_map == US_MAP_KEY:
         return US_MAP_KEY, await _region_child_map_items(
             session,
             parent_region_id="region-united-states",
@@ -2906,11 +3640,14 @@ async def get_map_context(genre_id: str) -> MapContextOut:
                 await _root_country_map_items(session),
                 map_key=WORLD_MAP_KEY,
             )
+            selectable_regions = await _annotate_root_map_items_for_list(
+                session, selectable_regions
+            )
             return MapContextOut(
                 genre_id=None,
                 wikipedia_title="Music",
                 active_map=WORLD_MAP_KEY,
-                map_label="Music map",
+                map_label=None,
                 selectable_regions=selectable_regions,
                 context_highlights=[],
                 parent_regions=[],
@@ -2923,7 +3660,10 @@ async def get_map_context(genre_id: str) -> MapContextOut:
         selected_region = await _promoted_region_for_genre(session, genre_id)
         if selected_region:
             active_map, selectable_regions = await _us_context_for_region(session, selected_region)
-            if not selectable_regions and selected_region["region_kind"] not in ("country", "territory"):
+            if not selectable_regions and selected_region["region_kind"] not in (
+                "country",
+                "territory",
+            ):
                 selectable_regions = await _region_child_map_items(
                     session,
                     parent_region_id=selected_region["region_id"],
@@ -2978,8 +3718,7 @@ async def get_map_context(genre_id: str) -> MapContextOut:
             title=row["wikipedia_title"],
         )
         selectable_regions = [
-            _map_item_from_variant(item, map_key=WORLD_MAP_KEY)
-            for item in variants.items
+            _map_item_from_variant(item, map_key=WORLD_MAP_KEY) for item in variants.items
         ]
         pure_region_matches = await _pure_region_matches_for_genre(
             session,
@@ -3002,25 +3741,15 @@ async def get_map_context(genre_id: str) -> MapContextOut:
             selectable_regions,
             map_key=WORLD_MAP_KEY,
         )
-        selectable_keys = {item.region_id for item in selectable_regions if item.region_id}
-        context_highlights = [
-            item
-            for item in await _selected_region_context_highlights(
-                session,
-                genre_id=row["id"],
-                map_key=WORLD_MAP_KEY,
-            )
-            if item.region_id not in selectable_keys
-        ]
         return MapContextOut(
             genre_id=row["id"],
             wikipedia_title=row["wikipedia_title"],
             active_map=WORLD_MAP_KEY,
-            map_label=f"{_label_for_region_match(row['wikipedia_title'])} variations"
+            map_label=_label_for_region_match(row["wikipedia_title"])
             if selectable_regions
             else None,
             selectable_regions=selectable_regions,
-            context_highlights=context_highlights,
+            context_highlights=[],
             parent_regions=[],
         )
 
@@ -3056,7 +3785,7 @@ async def get_genre_edges(
             if relation
             else ""
         )
-        params: dict[str, object] = {"gid": genre_id}
+        params: dict[str, object] = {"gid": genre_id, "layout_key": layout_key_for_root(None)}
         if relation:
             params["relation"] = relation
             params["display_relations"] = list(DISPLAY_RELATIONS)
@@ -3073,10 +3802,19 @@ async def get_genre_edges(
                            e.relation, e.source, e.ordinal, e.evidence_relation,
                            to_g.monthly_views_p30 AS to_monthly_views_p30,
                            to_c.color_hex AS to_similarity_color,
-                           to_c.confidence AS to_color_confidence
+                           to_c.confidence AS to_color_confidence,
+                           to_layout.text_width AS to_text_width,
+                           to_layout.text_height AS to_text_height,
+                           to_layout.box_width AS to_box_width,
+                           to_layout.box_height AS to_box_height,
+                           to_layout.box_pad_x AS to_box_pad_x,
+                           to_layout.box_pad_y AS to_box_pad_y
                     FROM wg_edges e
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
+                    LEFT JOIN wg_genre_semantic_layouts to_layout
+                      ON to_layout.genre_id = e.to_genre_id
+                     AND to_layout.layout_key = :layout_key
                     WHERE e.from_genre_id = :gid {rel_filter}
                       AND e.is_ignored = false
                       AND (
@@ -3102,11 +3840,20 @@ async def get_genre_edges(
                            e.relation, e.source, e.ordinal, e.evidence_relation,
                            to_g.monthly_views_p30 AS to_monthly_views_p30,
                            to_c.color_hex AS to_similarity_color,
-                           to_c.confidence AS to_color_confidence
+                           to_c.confidence AS to_color_confidence,
+                           to_layout.text_width AS to_text_width,
+                           to_layout.text_height AS to_text_height,
+                           to_layout.box_width AS to_box_width,
+                           to_layout.box_height AS to_box_height,
+                           to_layout.box_pad_x AS to_box_pad_x,
+                           to_layout.box_pad_y AS to_box_pad_y
                     FROM wg_edges e
                     JOIN wg_genres g ON g.id = e.from_genre_id
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
+                    LEFT JOIN wg_genre_semantic_layouts to_layout
+                      ON to_layout.genre_id = e.to_genre_id
+                     AND to_layout.layout_key = :layout_key
                     WHERE e.to_genre_id = :gid {rel_filter}
                       AND e.is_ignored = false
                       AND g.deleted_at IS NULL
@@ -3148,8 +3895,6 @@ async def get_genre_reachable_parents(
             "relations": relation or [],
             "has_relation_filter": bool(relation),
             "related_relation": RELATED_RELATION,
-            "origin_parent_relation": ORIGIN_PARENT_RELATION,
-            "origin_parent_evidence_relations": list(ORIGIN_PARENT_EVIDENCE_RELATIONS),
         }
 
         rows = (
@@ -3209,11 +3954,6 @@ async def get_genre_reachable_parents(
                     OR (
                       parent_edge.relation = :related_relation
                       AND parent_edge.evidence_relation = r.parent_relation
-                    )
-                    OR (
-                      r.parent_relation = :origin_parent_relation
-                      AND parent_edge.relation = :related_relation
-                      AND parent_edge.evidence_relation = ANY(:origin_parent_evidence_relations)
                     )
                    )
                 WHERE r.genre_id = :gid

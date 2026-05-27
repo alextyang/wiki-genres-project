@@ -1,6 +1,11 @@
 import math
 
-from wiki_genres.api.routes.genres import _apply_materialized_cloud_layout, _cull_cloud_nodes
+from wiki_genres.api.routes.genres import (
+    _apply_cloud_selected_distances,
+    _apply_materialized_cloud_layout,
+    _cloud_selected_distance_map,
+    _cull_cloud_nodes,
+)
 from wiki_genres.loader.radial_cloud_compaction import (
     CENTER_LABEL_HEIGHT,
     CENTER_LABEL_WIDTH,
@@ -55,7 +60,9 @@ def test_radial_compaction_outputs_non_overlapping_rectangles() -> None:
     compact_nodes_radially(nodes, lanes=48, radius_step=12, angular_steps=3)
 
     rects = [_rect_for(0, 0, CENTER_LABEL_WIDTH, CENTER_LABEL_HEIGHT)]
-    rects.extend(_rect_for(node.radial_x, node.radial_y, node.width, node.height) for node in nodes)
+    rects.extend(
+        _rect_for(node.radial_x, node.radial_y, node.box_width, node.box_height) for node in nodes
+    )
     for index, rect in enumerate(rects):
         assert not any(_rects_overlap(rect, other) for other in rects[index + 1 :])
 
@@ -71,6 +78,8 @@ def test_cloud_layout_helper_uses_radial_coordinates_for_display() -> None:
             "radial_y": 34,
             "width": 20,
             "height": 10,
+            "text_width": 20,
+            "text_height": 10,
             "box_width": 30,
             "box_height": 18,
             "box_pad_x": 5,
@@ -186,3 +195,34 @@ def test_cloud_culling_hides_only_lower_priority_node_when_zoom_creates_overlap(
     )
 
     assert [node["id"] for node in visible] == ["a"]
+
+
+def test_cloud_selected_distance_map_walks_semantic_edges_undirected() -> None:
+    edges = [
+        {"from_genre_id": "selected", "to_genre_id": "direct", "weight": 0.9},
+        {"from_genre_id": "second", "to_genre_id": "direct", "weight": 0.4},
+        {"from_genre_id": "unrelated", "to_genre_id": "elsewhere", "weight": 1.0},
+    ]
+
+    distances = _cloud_selected_distance_map(edges, selected_genre_id="selected")
+
+    assert distances["selected"]["distance"] == 0
+    assert distances["direct"]["distance"] == 1
+    assert distances["second"]["distance"] == 2
+    assert "unrelated" not in distances
+    assert distances["direct"]["score"] > distances["second"]["score"]
+
+
+def test_apply_cloud_selected_distances_preserves_unrelated_nodes() -> None:
+    nodes = [{"id": "selected"}, {"id": "direct"}, {"id": "unrelated"}]
+    distances = {
+        "selected": {"distance": 0, "score": 1.0},
+        "direct": {"distance": 1, "score": 0.8},
+    }
+
+    applied = _apply_cloud_selected_distances(nodes, distances)
+
+    assert applied[0]["selected_distance"] == 0
+    assert applied[1]["selected_distance"] == 1
+    assert applied[1]["selected_focus_score"] == 0.8
+    assert "selected_distance" not in applied[2]

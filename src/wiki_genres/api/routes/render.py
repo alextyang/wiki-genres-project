@@ -11,7 +11,11 @@ from fastapi import APIRouter, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
-from wiki_genres.api.routes.genres import get_genre_cloud
+from wiki_genres.api.routes.genres import (
+    _cloud_anchor_rank,
+    _cloud_selected_relationship_tier,
+    get_genre_cloud,
+)
 from wiki_genres.api.routes.timeline import get_timeline
 
 router = APIRouter(prefix="/v1/render", tags=["render"])
@@ -927,16 +931,191 @@ def _filter_timeline_viewport(
 def _cloud_node_sort_key(
     node: dict[str, Any],
     selected_genre_id: str | None,
-) -> tuple[float, float, float, str]:
-    selected_rank = 0.0 if selected_genre_id and node.get("id") == selected_genre_id else 1.0
+) -> tuple[int, int, float, float, float, float, float, str]:
+    selected = selected_genre_id or "__music_root__"
     lod_rank = node.get("lod_rank")
+    lod_tier = node.get("lod_tier")
     lod_score = node.get("lod_score")
+    priority = node.get("priority")
     return (
-        selected_rank,
+        _cloud_anchor_rank(node, selected_genre_id),
+        _cloud_selected_relationship_tier(node, selected_genre_id),
+        0.0 if str(node.get("id")) == selected else 1.0,
         float(lod_rank) if isinstance(lod_rank, int | float) else 0.0,
+        float(lod_tier) if isinstance(lod_tier, int | float) else 5.0,
         -float(lod_score) if isinstance(lod_score, int | float) else 0.0,
+        -float(priority) if isinstance(priority, int | float) else 0.0,
         str(node.get("label") or node.get("wikipedia_title") or ""),
     )
+
+
+def _cloud_scale_range(start: float, stop: float, step: float) -> tuple[float, ...]:
+    values: list[float] = []
+    value = start
+    while value <= stop + 1e-9:
+        values.append(round(value, 4))
+        value += step
+    return tuple(values)
+
+
+_CLOUD_ATLAS_SCALES = tuple(dict.fromkeys((
+    *_cloud_scale_range(0.12, 0.48, 0.02),
+    *_cloud_scale_range(0.50, 0.90, 0.01),
+    *_cloud_scale_range(0.905, 0.98, 0.005),
+    *_cloud_scale_range(0.982, 0.998, 0.002),
+    1.00,
+)))
+_CLOUD_ATLAS_TILE_PX = 360.0
+
+
+def _cloud_box_width(node: dict[str, Any]) -> float:
+    value = node.get("box_width")
+    if value is not None:
+        return float(value)
+    return float(node.get("width") or 0.0)
+
+
+def _cloud_box_height(node: dict[str, Any]) -> float:
+    value = node.get("box_height")
+    if value is not None:
+        return float(value)
+    return float(node.get("height") or 0.0)
+
+
+def _cloud_scaled_rect(node: dict[str, Any], scale: float) -> tuple[float, float, float, float]:
+    x = float(node.get("x") or 0.0) * scale
+    y = float(node.get("y") or 0.0) * scale
+    half_width = _cloud_box_width(node) / 2.0
+    half_height = _cloud_box_height(node) / 2.0
+    return (
+        x - half_width,
+        x + half_width,
+        y - half_height,
+        y + half_height,
+    )
+
+
+def _cloud_layer_tiles(
+    nodes_by_id: dict[str, dict[str, Any]],
+    node_ids: list[str],
+    *,
+    scale: float,
+    tile_size: float = _CLOUD_ATLAS_TILE_PX,
+) -> list[dict[str, Any]]:
+    """Build render-ready layer tiles in layer-screen coordinates."""
+    tiles: dict[tuple[int, int], list[str]] = {}
+    for node_id in node_ids:
+        node = nodes_by_id.get(str(node_id))
+        if node is None:
+            continue
+        left, right, top, bottom = _cloud_scaled_rect(node, scale)
+        min_x = math.floor(left / tile_size)
+        max_x = math.floor(right / tile_size)
+        min_y = math.floor(top / tile_size)
+        max_y = math.floor(bottom / tile_size)
+        for tile_x in range(min_x, max_x + 1):
+            for tile_y in range(min_y, max_y + 1):
+                tiles.setdefault((tile_x, tile_y), []).append(str(node_id))
+    return [
+        {"x": tile_x, "y": tile_y, "node_ids": ids}
+        for (tile_x, tile_y), ids in sorted(tiles.items())
+    ]
+
+
+def _cloud_rects_overlap(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> bool:
+    return a[0] < b[1] and a[1] > b[0] and a[2] < b[3] and a[3] > b[2]
+
+
+class _CloudLayerSpatialIndex:
+    def __init__(self, *, cell_size: float = 96.0) -> None:
+        self.cell_size = cell_size
+        self.cells: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+
+    def _keys(self, rect: tuple[float, float, float, float]) -> tuple[range, range]:
+        return (
+            range(math.floor(rect[0] / self.cell_size), math.floor(rect[1] / self.cell_size) + 1),
+            range(math.floor(rect[2] / self.cell_size), math.floor(rect[3] / self.cell_size) + 1),
+        )
+
+    def collides(self, rect: tuple[float, float, float, float]) -> bool:
+        x_keys, y_keys = self._keys(rect)
+        tested: set[int] = set()
+        for key_x in x_keys:
+            for key_y in y_keys:
+                for existing in self.cells.get((key_x, key_y), ()):
+                    marker = id(existing)
+                    if marker in tested:
+                        continue
+                    tested.add(marker)
+                    if _cloud_rects_overlap(rect, existing):
+                        return True
+        return False
+
+    def add(self, rect: tuple[float, float, float, float]) -> None:
+        x_keys, y_keys = self._keys(rect)
+        for key_x in x_keys:
+            for key_y in y_keys:
+                self.cells.setdefault((key_x, key_y), []).append(rect)
+
+
+def _cloud_scale_layers(
+    nodes: list[dict[str, Any]],
+    *,
+    selected_genre_id: str | None,
+) -> list[dict[str, Any]]:
+    """Build monotonic, collision-valid raw-scale atlas layers."""
+    nodes_by_id = {str(node["id"]): node for node in nodes if node.get("id") is not None}
+    previous_ids: set[str] = set()
+    layers: list[dict[str, Any]] = []
+    for scale in _CLOUD_ATLAS_SCALES:
+        if scale >= 1.0:
+            layer_ids = [str(node["id"]) for node in nodes if node.get("id") is not None]
+            previous_ids = set(layer_ids)
+            layers.append({
+                "scale": scale,
+                "node_ids": layer_ids,
+                "tile_size": _CLOUD_ATLAS_TILE_PX,
+                "tiles": _cloud_layer_tiles(nodes_by_id, layer_ids, scale=scale),
+            })
+            continue
+
+        occupied = _CloudLayerSpatialIndex()
+        layer_ids: list[str] = []
+        layer_id_set: set[str] = set()
+        previous_nodes = [node for node in nodes if str(node.get("id")) in previous_ids]
+        for node in previous_nodes:
+            node_id = str(node.get("id"))
+            rect = _cloud_scaled_rect(node, scale)
+            # Lower-scale layers are subsets, so this should not collide. Keep the
+            # guard to prevent malformed historical layouts from poisoning the layer.
+            if occupied.collides(rect):
+                continue
+            occupied.add(rect)
+            layer_ids.append(node_id)
+            layer_id_set.add(node_id)
+
+        for node in nodes:
+            node_id = str(node.get("id"))
+            if node_id in layer_id_set:
+                continue
+            rect = _cloud_scaled_rect(node, scale)
+            if occupied.collides(rect):
+                continue
+            occupied.add(rect)
+            layer_ids.append(node_id)
+            layer_id_set.add(node_id)
+
+        previous_ids = layer_id_set
+        layers.append({
+            "scale": scale,
+            "node_ids": layer_ids,
+            "tile_size": _CLOUD_ATLAS_TILE_PX,
+            "tiles": _cloud_layer_tiles(nodes_by_id, layer_ids, scale=scale),
+        })
+    return layers
 
 
 def _cloud_snapshots(
@@ -945,78 +1124,121 @@ def _cloud_snapshots(
     selected_genre_id: str | None,
     chunk_size: int,
 ) -> list[dict[str, Any]]:
+    return list(_iter_cloud_snapshots(data, selected_genre_id=selected_genre_id, chunk_size=chunk_size))
+
+
+def _iter_cloud_snapshots(
+    data: dict[str, Any],
+    *,
+    selected_genre_id: str | None,
+    chunk_size: int,
+) -> Iterable[dict[str, Any]]:
     nodes = sorted(
         list(data.get("nodes") or []),
         key=lambda node: _cloud_node_sort_key(node, selected_genre_id),
     )
     stats = dict(data.get("stats") or {})
-    layers: dict[int, list[dict[str, Any]]] = {}
-    for node in nodes:
-        tier = node.get("lod_tier")
-        layer = int(tier) if isinstance(tier, int | float) else 5
-        layers.setdefault(layer, []).append(node)
-    layer_stats = [
-        {"lod_tier": tier, "nodes": len(layer_nodes)}
-        for tier, layer_nodes in sorted(layers.items())
-    ]
-    stats["layers"] = layer_stats
-    snapshots: list[dict[str, Any]] = []
-    sent_ids: set[str] = set()
-    base_ids = {
-        str(node.get("id"))
-        for node in nodes
-        if (
-            node.get("id") is not None
-            and (
-                int(node.get("lod_tier") or 0) <= 0
-                or node.get("id") == selected_genre_id
-                or str(node.get("id")) == "__music_root__"
-            )
-        )
+    emitted = False
+    for start in range(0, len(nodes), chunk_size):
+        batch = nodes[start : start + chunk_size]
+        emitted = True
+        yield {
+            **data,
+            "nodes": batch,
+            "stats": {
+                **stats,
+                "stream_nodes": min(start + len(batch), len(nodes)),
+                "layer_nodes": len(batch),
+            },
+                "stream": {
+                    "atlas": True,
+                    "atlas_version": "cloud-render-atlas-v2",
+                    "kind": "catalog",
+                    "layer": "catalog",
+                    "complete": False,
+            },
+        }
+
+    scale_layers = _cloud_scale_layers(nodes, selected_genre_id=selected_genre_id)
+    layer_stats = {
+        **stats,
+        "scale_layers": [
+            {"scale": layer["scale"], "nodes": len(layer["node_ids"])}
+            for layer in scale_layers
+        ],
     }
 
-    def append_layer(layer_nodes: list[dict[str, Any]], *, layer_key: str, lod_tier: int, complete: bool) -> None:
-        if not layer_nodes:
-            return
-        for start in range(0, len(layer_nodes), chunk_size):
-            batch = layer_nodes[start : start + chunk_size]
-            sent_ids.update(str(node["id"]) for node in batch if node.get("id") is not None)
+    def scale_layer_snapshots(layer: dict[str, Any], previous_ids: set[str]) -> tuple[set[str], list[dict[str, Any]]]:
+        node_ids = layer["node_ids"]
+        layer_id_set = set(node_ids)
+        add_node_ids = [node_id for node_id in node_ids if node_id not in previous_ids]
+        remove_node_ids = sorted(previous_ids - layer_id_set)
+        scale = float(layer["scale"])
+        delta_ids = add_node_ids or []
+        snapshots: list[dict[str, Any]] = []
+        for start in range(0, max(1, len(delta_ids)), chunk_size):
+            batch_ids = delta_ids[start : start + chunk_size]
             snapshots.append({
                 **data,
-                "nodes": batch,
+                "nodes": [],
                 "stats": {
-                    **stats,
-                    "stream_nodes": len(sent_ids),
-                    "layer_nodes": len(batch),
+                    **layer_stats,
+                    "stream_nodes": len(nodes),
+                    "layer_nodes": len(batch_ids),
                 },
                 "stream": {
                     "atlas": True,
-                    "layer": layer_key,
-                    "lod_tier": lod_tier,
-                    "complete": complete and start + chunk_size >= len(layer_nodes),
+                    "atlas_version": "cloud-render-atlas-v2",
+                    "kind": "scale_layer",
+                    "layer": f"scale:{scale:g}",
+                    "scale": scale,
+                    "tile_size": layer.get("tile_size", _CLOUD_ATLAS_TILE_PX),
+                    "tiles": layer.get("tiles", []) if start == 0 else [],
+                    "delta": True,
+                    "base": not previous_ids,
+                    "add_node_ids": batch_ids,
+                    "remove_node_ids": remove_node_ids if start == 0 else [],
+                    "visible_node_ids": batch_ids if not previous_ids else [],
+                    "total_visible_nodes": len(node_ids),
+                    "complete": False,
                 },
             })
+        return layer_id_set, snapshots
 
-    base_nodes = [node for node in nodes if str(node.get("id")) in base_ids]
-    append_layer(base_nodes, layer_key="base", lod_tier=0, complete=False)
-    for tier, layer_nodes in sorted(layers.items()):
-        remaining = [node for node in layer_nodes if str(node.get("id")) not in sent_ids]
-        append_layer(remaining, layer_key=f"tier:{tier}", lod_tier=tier, complete=False)
+    previous_layer_ids: set[str] = set()
+    for layer in scale_layers:
+        previous_layer_ids, layer_snapshots = scale_layer_snapshots(layer, previous_layer_ids)
+        for snapshot in layer_snapshots:
+            emitted = True
+            yield snapshot
 
-    if snapshots:
-        snapshots[-1]["stream"]["complete"] = True
-        return snapshots
-    return [{
+    if not emitted:
+        yield {
+            **data,
+            "nodes": [],
+            "stats": layer_stats,
+            "stream": {
+                "atlas": True,
+                "atlas_version": "cloud-render-atlas-v2",
+                "layer": "empty",
+                "lod_tier": 0,
+                "complete": True,
+            },
+        }
+        return
+
+    yield {
         **data,
         "nodes": [],
-        "stats": stats,
+        "stats": layer_stats,
         "stream": {
             "atlas": True,
-            "layer": "empty",
-            "lod_tier": 0,
+            "atlas_version": "cloud-render-atlas-v2",
+            "kind": "done",
+            "layer": "complete",
             "complete": True,
         },
-    }]
+    }
 
 
 async def _stream_snapshots(
@@ -1046,6 +1268,7 @@ async def stream_cloud_render(
     view_tx: float = Query(0.0),
     view_ty: float = Query(0.0),
     root_genre_id: str | None = Query(None),
+    region_id: str | None = Query(None),
     selected_genre_id: str | None = Query(None),
     chunk_size: int = Query(120, ge=25, le=500),
 ) -> StreamingResponse:
@@ -1062,13 +1285,22 @@ async def stream_cloud_render(
             view_tx=view_tx,
             view_ty=view_ty,
             root_genre_id=root_genre_id,
+            region_id=region_id,
             selected_genre_id=selected_genre_id,
             atlas=True,
         )
         data = jsonable_encoder(result)
-        snapshots = _cloud_snapshots(data, selected_genre_id=selected_genre_id, chunk_size=chunk_size)
-        async for packet in _stream_snapshots(mode="cloud", snapshots=snapshots):
-            yield packet
+        count = 0
+        for snapshot in _iter_cloud_snapshots(data, selected_genre_id=selected_genre_id, chunk_size=chunk_size):
+            yield _line({
+                "type": "snapshot",
+                "mode": "cloud",
+                "index": count,
+                "complete": bool(snapshot.get("stream", {}).get("complete")),
+                "data": snapshot,
+            })
+            count += 1
+        yield _line({"type": "complete", "mode": "cloud", "snapshots": count})
 
     return StreamingResponse(
         generate(),

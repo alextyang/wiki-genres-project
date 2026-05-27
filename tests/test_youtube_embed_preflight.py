@@ -8,7 +8,9 @@ from wiki_genres.loader.youtube_embed_preflight import (
     PreflightResult,
     _decision_for_http,
     _is_embed_playable,
+    _is_youtubei_player_decisive,
     _nullable_bool,
+    _parse_innertube_api_key,
     _parse_player_response,
     extract_video_id,
 )
@@ -32,16 +34,43 @@ def test_parse_player_response_handles_nested_json() -> None:
     assert parsed["videoDetails"]["title"] == "A } tricky title"
 
 
+def test_parse_innertube_api_key_from_embed_config() -> None:
+    assert _parse_innertube_api_key('"INNERTUBE_API_KEY":"abc123","OTHER":true') == "abc123"
+    assert _parse_innertube_api_key("{}") == ""
+
+
 def test_embed_playable_rejects_non_ok_and_embed_blocks() -> None:
     assert _is_embed_playable({"playabilityStatus": {"status": "OK"}}) == (True, "")
-    assert _is_embed_playable({"playabilityStatus": {"status": "ERROR", "reason": "Unavailable"}}) == (
+    assert _is_embed_playable(
+        {"playabilityStatus": {"status": "ERROR", "reason": "Unavailable"}}
+    ) == (
         False,
         "Unavailable",
     )
-    assert _is_embed_playable({"playabilityStatus": {"status": "OK", "playableInEmbed": False}}) == (
+    assert _is_embed_playable(
+        {"playabilityStatus": {"status": "OK", "playableInEmbed": False}}
+    ) == (
         False,
         "playableInEmbed=false",
     )
+
+
+def test_youtubei_probe_rejects_only_decisive_embed_blocks() -> None:
+    assert _is_youtubei_player_decisive({"playabilityStatus": {"status": "OK"}}) == (None, "")
+    assert _is_youtubei_player_decisive(
+        {"playabilityStatus": {"status": "OK", "playableInEmbed": False}}
+    ) == (False, "youtubei playableInEmbed=false")
+    assert _is_youtubei_player_decisive(
+        {"playabilityStatus": {"status": "UNPLAYABLE", "reason": "Video unavailable"}}
+    ) == (False, "youtubei UNPLAYABLE: Video unavailable")
+    assert _is_youtubei_player_decisive(
+        {
+            "playabilityStatus": {
+                "status": "LOGIN_REQUIRED",
+                "reason": "Sign in to confirm you’re not a bot",
+            }
+        }
+    ) == (None, "youtubei LOGIN_REQUIRED: Sign in to confirm you’re not a bot")
 
 
 def test_transient_preflight_result_stays_unknown() -> None:

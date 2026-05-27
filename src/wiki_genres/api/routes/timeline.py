@@ -18,6 +18,7 @@ from wiki_genres.api.models import (
 )
 from wiki_genres.db import session_scope
 from wiki_genres.loader.timeline_year_hints import YearHint, extract_year_hints
+from wiki_genres.loader.semantic_cloud_layout import GENERAL_LAYOUT_KEY
 
 router = APIRouter(prefix="/v1/timeline", tags=["timeline"])
 
@@ -96,6 +97,12 @@ class TimelineGraphNode:
     selected_direction: str | None = None
     selected_connection_count: int | None = None
     selected_focus_score: float | None = None
+    text_width: float | None = None
+    text_height: float | None = None
+    box_width: float | None = None
+    box_height: float | None = None
+    box_pad_x: float | None = None
+    box_pad_y: float | None = None
 
 
 @dataclass(frozen=True)
@@ -151,10 +158,19 @@ async def _get_complete_timeline(
                             h.source_field,
                             h.evidence,
                             h.reason,
-                            h.score
+                            h.score,
+                            layout.text_width,
+                            layout.text_height,
+                            layout.box_width,
+                            layout.box_height,
+                            layout.box_pad_x,
+                            layout.box_pad_y
                         FROM wg_timeline_year_hints h
                         JOIN wg_genres g ON g.id = h.genre_id
                         LEFT JOIN wg_genre_colors c ON c.genre_id = g.id
+                        LEFT JOIN wg_genre_semantic_layouts layout
+                          ON layout.genre_id = g.id
+                         AND layout.layout_key = :layout_key
                         WHERE h.has_hint = true
                           AND h.confidence = ANY(:allowed_confidences)
                           AND g.deleted_at IS NULL
@@ -172,6 +188,7 @@ async def _get_complete_timeline(
                             if rank >= minimum
                         ],
                         "max_nodes": max_nodes,
+                        "layout_key": GENERAL_LAYOUT_KEY,
                     },
                 )
             )
@@ -193,6 +210,12 @@ async def _get_complete_timeline(
             similarity_color=row["similarity_color"],
             root_affinity=affinity,
             semantic_root=_semantic_root(affinity),
+            text_width=row.get("text_width"),
+            text_height=row.get("text_height"),
+            box_width=row.get("box_width"),
+            box_height=row.get("box_height"),
+            box_pad_x=row.get("box_pad_x"),
+            box_pad_y=row.get("box_pad_y"),
         )
         nodes_by_id[node.id] = node
         hints_by_id[node.id] = YearHint(
@@ -843,6 +866,12 @@ async def _load_nodes(node_ids: set[str]) -> dict[str, TimelineGraphNode]:
                             g.wikipedia_title,
                             g.summary,
                             g.monthly_views_p30,
+                            layout.text_width,
+                            layout.text_height,
+                            layout.box_width,
+                            layout.box_height,
+                            layout.box_pad_x,
+                            layout.box_pad_y,
                             COALESCE(
                                 array_agg(DISTINCT o.value)
                                     FILTER (WHERE o.value IS NOT NULL),
@@ -856,12 +885,25 @@ async def _load_nodes(node_ids: set[str]) -> dict[str, TimelineGraphNode]:
                         FROM wg_genres g
                         LEFT JOIN wg_origins o ON o.genre_id = g.id
                         LEFT JOIN wg_categories c ON c.genre_id = g.id
+                        LEFT JOIN wg_genre_semantic_layouts layout
+                          ON layout.genre_id = g.id
+                         AND layout.layout_key = :layout_key
                         WHERE g.id = ANY(:node_ids)
                           AND g.deleted_at IS NULL
                           AND g.is_non_genre = false
-                        GROUP BY g.id, g.wikipedia_title, g.summary, g.monthly_views_p30
+                        GROUP BY
+                            g.id,
+                            g.wikipedia_title,
+                            g.summary,
+                            g.monthly_views_p30,
+                            layout.text_width,
+                            layout.text_height,
+                            layout.box_width,
+                            layout.box_height,
+                            layout.box_pad_x,
+                            layout.box_pad_y
                     """),
-                    {"node_ids": list(node_ids)},
+                    {"node_ids": list(node_ids), "layout_key": GENERAL_LAYOUT_KEY},
                 )
             )
             .mappings()
@@ -876,6 +918,12 @@ async def _load_nodes(node_ids: set[str]) -> dict[str, TimelineGraphNode]:
             monthly_views_p30=row["monthly_views_p30"],
             origins=list(row["origins"] or []),
             categories=list(row["categories"] or []),
+            text_width=row.get("text_width"),
+            text_height=row.get("text_height"),
+            box_width=row.get("box_width"),
+            box_height=row.get("box_height"),
+            box_pad_x=row.get("box_pad_x"),
+            box_pad_y=row.get("box_pad_y"),
         )
         for row in rows
     }
@@ -1288,7 +1336,7 @@ def _packed_group_layout(group: list[TimelineGraphNode]) -> TimelineGroupLayout:
         rows = 5
         columns = math.ceil(count / rows)
     max_label_width = max(
-        (_estimated_node_width(node.title) for node in group),
+        (_estimated_node_width(node) for node in group),
         default=NODE_COL_MIN_WIDTH,
     )
     col_width = min(NODE_COL_MAX_WIDTH, max(NODE_COL_MIN_WIDTH, max_label_width + 24))
@@ -1301,8 +1349,10 @@ def _packed_group_layout(group: list[TimelineGraphNode]) -> TimelineGroupLayout:
     )
 
 
-def _estimated_node_width(title: str) -> float:
-    label = _display_label(title)
+def _estimated_node_width(node: TimelineGraphNode) -> float:
+    label = _display_label(node.title)
+    if node.text_width is not None:
+        return min(NODE_COL_MAX_WIDTH - 24, max(88, float(node.text_width) * (15 / 13) + 28))
     return min(NODE_COL_MAX_WIDTH - 24, max(88, len(label) * 7.6 + 34))
 
 
@@ -1380,6 +1430,12 @@ def _node_out(node: TimelineGraphNode, hint: YearHint | None) -> TimelineNodeOut
         selected_direction=node.selected_direction,
         selected_connection_count=node.selected_connection_count,
         selected_focus_score=round(node.selected_focus_score, 6) if node.selected_focus_score is not None else None,
+        text_width=node.text_width,
+        text_height=node.text_height,
+        box_width=node.box_width,
+        box_height=node.box_height,
+        box_pad_x=node.box_pad_x,
+        box_pad_y=node.box_pad_y,
         hint=_hint_out(hint) if hint else None,
     )
 

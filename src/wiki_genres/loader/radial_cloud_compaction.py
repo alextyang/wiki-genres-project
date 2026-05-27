@@ -16,17 +16,20 @@ from typing import Any
 import structlog
 from sqlalchemy import text
 
+from wiki_genres.cloud_text_metrics import CLOUD_LABEL_PAD_X, CLOUD_LABEL_PAD_Y, measure_cloud_label
 from wiki_genres.db import get_engine
 from wiki_genres.db_migrations import apply_migrations
+from wiki_genres.loader.cloud_display_cache import refresh_cloud_display_cache
 from wiki_genres.loader.semantic_cloud_layout import GENERAL_LAYOUT_KEY, layout_key_for_root
 
 logger = structlog.get_logger(__name__)
 
 COMPACTION_VERSION = "radial-constrained-rect-v1"
-CENTER_LABEL_WIDTH = 37.7
-CENTER_LABEL_HEIGHT = 16.25
-LABEL_PAD_X = 5.0
-LABEL_PAD_Y = 4.0
+_CENTER_METRICS = measure_cloud_label("Music")
+CENTER_LABEL_WIDTH = _CENTER_METRICS.box_width
+CENTER_LABEL_HEIGHT = _CENTER_METRICS.box_height
+LABEL_PAD_X = CLOUD_LABEL_PAD_X
+LABEL_PAD_Y = CLOUD_LABEL_PAD_Y
 
 
 @dataclass
@@ -44,6 +47,7 @@ class CompactNode:
     lod_rank: int
     lod_score: float
     priority: float
+    is_center: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     radial_x: float = 0.0
     radial_y: float = 0.0
@@ -88,12 +92,7 @@ def _rects_overlap(
     left: tuple[float, float, float, float],
     right: tuple[float, float, float, float],
 ) -> bool:
-    return (
-        left[0] < right[1]
-        and left[1] > right[0]
-        and left[2] < right[3]
-        and left[3] > right[2]
-    )
+    return left[0] < right[1] and left[1] > right[0] and left[2] < right[3] and left[3] > right[2]
 
 
 class SpatialIndex:
@@ -120,8 +119,7 @@ class SpatialIndex:
         for key_x in x_keys:
             for key_y in y_keys:
                 if any(
-                    _rects_overlap(rect, other)
-                    for _, other in self.cells.get((key_x, key_y), ())
+                    _rects_overlap(rect, other) for _, other in self.cells.get((key_x, key_y), ())
                 ):
                     return True
         return False
@@ -250,17 +248,26 @@ def compact_nodes_radially(
     angle_offsets = _candidate_angle_offsets(lane_width, steps=angular_steps)
     max_seen_radius = max(node.radius for node in nodes)
     spatial = SpatialIndex()
-    spatial.add(
-        "__music_root__",
-        _rect_for(
-            0.0,
-            0.0,
-            CENTER_LABEL_WIDTH + LABEL_PAD_X * 2,
-            CENTER_LABEL_HEIGHT + LABEL_PAD_Y * 2,
-        ),
-    )
+    center_nodes = [node for node in nodes if node.is_center]
+    if center_nodes:
+        for node in center_nodes:
+            node.radial_x = 0.0
+            node.radial_y = 0.0
+            node.radial_radius = 0.0
+            node.angle_delta = 0.0
+            spatial.add(node.genre_id, _rect_for(0.0, 0.0, node.box_width, node.box_height))
+    else:
+        spatial.add(
+            "__music_root__",
+            _rect_for(
+                0.0,
+                0.0,
+                CENTER_LABEL_WIDTH + LABEL_PAD_X * 2,
+                CENTER_LABEL_HEIGHT + LABEL_PAD_Y * 2,
+            ),
+        )
     ordered = sorted(
-        nodes,
+        (node for node in nodes if not node.is_center),
         key=lambda node: (
             node.radius,
             node.angle,
@@ -307,7 +314,9 @@ def compact_nodes_radially(
         node.angle_delta = abs(_angle_delta(packed_angle, original_angle))
         if node.radial_radius > node.radius + 1.0:
             outward_count += 1
-        spatial.add(node.genre_id, _rect_for(node.radial_x, node.radial_y, node.box_width, node.box_height))
+        spatial.add(
+            node.genre_id, _rect_for(node.radial_x, node.radial_y, node.box_width, node.box_height)
+        )
 
     original_bounds = _bounds(nodes)
     radial_bounds = _bounds(nodes, radial=True)
@@ -315,10 +324,9 @@ def compact_nodes_radially(
     radial_area = _bounds_area(radial_bounds)
     original_radius_avg = sum(node.radius for node in nodes) / len(nodes)
     radial_radius_avg = sum(node.radial_radius for node in nodes) / len(nodes)
-    displacement_avg = (
-        sum(math.hypot(node.radial_x - node.x, node.radial_y - node.y) for node in nodes)
-        / len(nodes)
-    )
+    displacement_avg = sum(
+        math.hypot(node.radial_x - node.x, node.radial_y - node.y) for node in nodes
+    ) / len(nodes)
 
     stats.updated_nodes = len(nodes)
     stats.metrics = {
@@ -375,11 +383,14 @@ async def _fetch_layout_nodes(conn: Any, *, layout_key: str) -> list[CompactNode
                         layout.y,
                         layout.width,
                         layout.height,
+                        layout.text_width,
+                        layout.text_height,
                         layout.box_width,
                         layout.box_height,
                         layout.box_pad_x,
                         layout.box_pad_y,
                         layout.priority,
+                        layout.is_center,
                         layout.lod_score,
                         layout.lod_rank,
                         layout.metadata
@@ -402,11 +413,16 @@ async def _fetch_layout_nodes(conn: Any, *, layout_key: str) -> list[CompactNode
             y=float(row["y"]),
             width=float(row["width"]),
             height=float(row["height"]),
-            box_width=float(row["box_width"] or (float(row["width"]) + LABEL_PAD_X * 2)),
-            box_height=float(row["box_height"] or (float(row["height"]) + LABEL_PAD_Y * 2)),
+            box_width=float(
+                row["box_width"] or (float(row["text_width"] or row["width"]) + LABEL_PAD_X * 2)
+            ),
+            box_height=float(
+                row["box_height"] or (float(row["text_height"] or row["height"]) + LABEL_PAD_Y * 2)
+            ),
             box_pad_x=float(row["box_pad_x"] or LABEL_PAD_X),
             box_pad_y=float(row["box_pad_y"] or LABEL_PAD_Y),
             priority=float(row["priority"]),
+            is_center=bool(row["is_center"]),
             lod_score=float(row["lod_score"] or 0.0),
             lod_rank=int(row["lod_rank"] or 0),
             metadata=_coerce_metadata(row["metadata"]),
@@ -418,6 +434,7 @@ async def _fetch_layout_nodes(conn: Any, *, layout_key: str) -> list[CompactNode
 async def compact_semantic_cloud_layout_radially(
     *,
     root_genre_id: str | None = None,
+    region_id: str | None = None,
     dry_run: bool = False,
     sample_size: int = 12,
     lanes: int = 96,
@@ -428,7 +445,7 @@ async def compact_semantic_cloud_layout_radially(
     """Compute and optionally store radial compacted coordinates for one layout."""
     await apply_migrations()
     engine = get_engine()
-    layout_key = layout_key_for_root(root_genre_id)
+    layout_key = layout_key_for_root(root_genre_id, region_id=region_id)
     async with engine.connect() as conn:
         nodes = await _fetch_layout_nodes(conn, layout_key=layout_key)
 
@@ -460,38 +477,40 @@ async def compact_semantic_cloud_layout_radially(
         sort_keys=True,
     )
     async with engine.begin() as conn:
-        await conn.execute(
-            text("""
-                UPDATE wg_genre_semantic_layouts
-                SET
-                    radial_x = :radial_x,
-                    radial_y = :radial_y,
-                    box_width = :box_width,
-                    box_height = :box_height,
-                    box_pad_x = :box_pad_x,
-                    box_pad_y = :box_pad_y,
-                    radial_compaction_version = :version,
-                    radial_compaction_quality = CAST(:quality AS jsonb),
-                    radial_compacted_at = now()
-                WHERE layout_key = :layout_key
-                  AND genre_id = :genre_id
-            """),
-            [
-                {
-                    "layout_key": layout_key,
-                    "genre_id": node.genre_id,
-                    "radial_x": node.radial_x,
-                    "radial_y": node.radial_y,
-                    "box_width": node.box_width,
-                    "box_height": node.box_height,
-                    "box_pad_x": node.box_pad_x,
-                    "box_pad_y": node.box_pad_y,
-                    "version": COMPACTION_VERSION,
-                    "quality": quality_json,
-                }
-                for node in nodes
-            ],
-        )
+        if nodes:
+            await conn.execute(
+                text("""
+                    UPDATE wg_genre_semantic_layouts
+                    SET
+                        radial_x = :radial_x,
+                        radial_y = :radial_y,
+                        box_width = :box_width,
+                        box_height = :box_height,
+                        box_pad_x = :box_pad_x,
+                        box_pad_y = :box_pad_y,
+                        radial_compaction_version = :version,
+                        radial_compaction_quality = CAST(:quality AS jsonb),
+                        radial_compacted_at = now()
+                    WHERE layout_key = :layout_key
+                      AND genre_id = :genre_id
+                """),
+                [
+                    {
+                        "layout_key": layout_key,
+                        "genre_id": node.genre_id,
+                        "radial_x": node.radial_x,
+                        "radial_y": node.radial_y,
+                        "box_width": node.box_width,
+                        "box_height": node.box_height,
+                        "box_pad_x": node.box_pad_x,
+                        "box_pad_y": node.box_pad_y,
+                        "version": COMPACTION_VERSION,
+                        "quality": quality_json,
+                    }
+                    for node in nodes
+                ],
+            )
+        await refresh_cloud_display_cache(conn, layout_key=layout_key)
 
     logger.info(
         "radial_cloud_compaction_complete",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -59,6 +61,25 @@ app.include_router(feedback_router)
 app.include_router(admin_router)
 app.include_router(timeline_router)
 app.include_router(render_router)
+
+
+def _load_local_dev_extensions() -> None:
+    extensions_dir = Path.cwd() / ".tmp" / "local-dev"
+    if not extensions_dir.exists():
+        return
+    for path in sorted(extensions_dir.glob("*.py")):
+        spec = importlib.util.spec_from_file_location(f"wiki_genres_local_dev_{path.stem}", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        register = getattr(module, "register", None)
+        if callable(register):
+            register(app=app, limiter=limiter, root=extensions_dir)
+
+
+_load_local_dev_extensions()
 
 # Static explorer UI — mounted AFTER API routers so it never shadows /v1/* or /healthz
 _static_dir = Path(__file__).parent / "static"

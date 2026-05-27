@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 import structlog
 from sqlalchemy import text
 
+from wiki_genres.cloud_text_metrics import measure_cloud_label
 from wiki_genres.db import get_engine
 from wiki_genres.db_migrations import apply_migrations
+from wiki_genres.loader.cloud_display_cache import refresh_cloud_display_cache
 from wiki_genres.loader.cycle_guard import DEFAULT_ROOT_TITLES
 
 logger = structlog.get_logger(__name__)
@@ -27,51 +29,61 @@ VECTOR_VERSION = "weighted-local-tfidf-v1"
 EDGE_VERSION = "semantic-graph-playlist-v1"
 GENERAL_LAYOUT_KEY = "general_music_v1"
 MUSIC_ROOT_ID = "__music_root__"
+MUSIC_REGION_TITLE_RE = re.compile(r"\bmusic\s+(?:of|in)\b", re.IGNORECASE)
 FONT_SIZE = 13.0
 BROAD_ROOT_TITLE_ORDER = (
-    "Rock music",
-    "Heavy metal music",
-    "Experimental music",
-    "Electronic music",
-    "Pop music",
-    "Hip-hop",
-    "Hip hop music",
-    "Rhythm and blues",
-    "Blues",
-    "Jazz",
-    "Classical music",
-    "Soundtrack",
-    "Religious music",
-    "Folk music",
-    "Country music",
-    "World music",
-    "Latin music",
-    "Reggae",
-) + tuple(title for title in DEFAULT_ROOT_TITLES if title not in {
-    "Rock music",
-    "Heavy metal music",
-    "Experimental music",
-    "Electronic music",
-    "Pop music",
-    "Hip-hop",
-    "Hip hop music",
-    "Rhythm and blues",
-    "Blues",
-    "Jazz",
-    "Classical music",
-    "Soundtrack",
-    "Religious music",
-    "Folk music",
-    "Country music",
-    "World music",
-    "Latin music",
-    "Reggae",
-}) + (
-    "Ancient music",
-    "Early music",
-    "Medieval music",
-    "Renaissance music",
-    "Baroque music",
+    (
+        "Rock music",
+        "Heavy metal music",
+        "Experimental music",
+        "Electronic music",
+        "Pop music",
+        "Hip-hop",
+        "Hip hop music",
+        "Rhythm and blues",
+        "Blues",
+        "Jazz",
+        "Classical music",
+        "Soundtrack",
+        "Religious music",
+        "Folk music",
+        "Country music",
+        "World music",
+        "Latin music",
+        "Reggae",
+    )
+    + tuple(
+        title
+        for title in DEFAULT_ROOT_TITLES
+        if title
+        not in {
+            "Rock music",
+            "Heavy metal music",
+            "Experimental music",
+            "Electronic music",
+            "Pop music",
+            "Hip-hop",
+            "Hip hop music",
+            "Rhythm and blues",
+            "Blues",
+            "Jazz",
+            "Classical music",
+            "Soundtrack",
+            "Religious music",
+            "Folk music",
+            "Country music",
+            "World music",
+            "Latin music",
+            "Reggae",
+        }
+    )
+    + (
+        "Ancient music",
+        "Early music",
+        "Medieval music",
+        "Renaissance music",
+        "Baroque music",
+    )
 )
 
 TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
@@ -188,11 +200,35 @@ class SemanticGenre:
 
     @property
     def width(self) -> float:
-        return max(22.0, len(self.label) * FONT_SIZE * 0.58)
+        return self.text_width
 
     @property
     def height(self) -> float:
-        return FONT_SIZE * 1.25
+        return self.text_height
+
+    @property
+    def text_width(self) -> float:
+        return measure_cloud_label(self.label).text_width
+
+    @property
+    def text_height(self) -> float:
+        return measure_cloud_label(self.label).text_height
+
+    @property
+    def box_width(self) -> float:
+        return measure_cloud_label(self.label).box_width
+
+    @property
+    def box_height(self) -> float:
+        return measure_cloud_label(self.label).box_height
+
+    @property
+    def box_pad_x(self) -> float:
+        return measure_cloud_label(self.label).box_pad_x
+
+    @property
+    def box_pad_y(self) -> float:
+        return measure_cloud_label(self.label).box_pad_y
 
 
 @dataclass(frozen=True)
@@ -221,7 +257,13 @@ class SemanticCloudLayoutStats:
     quality_sample: list[dict] = field(default_factory=list)
 
 
-def layout_key_for_root(root_genre_id: str | None) -> str:
+def layout_key_for_region(region_id: str) -> str:
+    return f"country:{region_id}:v1"
+
+
+def layout_key_for_root(root_genre_id: str | None, *, region_id: str | None = None) -> str:
+    if region_id:
+        return layout_key_for_region(region_id)
     return f"region:{root_genre_id}:v1" if root_genre_id else GENERAL_LAYOUT_KEY
 
 
@@ -638,8 +680,8 @@ def _pack_labels(genres: list[SemanticGenre], *, iterations: int = 38) -> None:
                     candidates.extend(grid.get((gx, gy), ()))
 
             for other in candidates:
-                min_x = (genre.width + other.width) / 2 + 12.0
-                min_y = (genre.height + other.height) / 2 + 8.0
+                min_x = (genre.box_width + other.box_width) / 2
+                min_y = (genre.box_height + other.box_height) / 2
                 dx = genre.x - other.x
                 dy = genre.y - other.y
                 if abs(dx) >= min_x or abs(dy) >= min_y:
@@ -1072,6 +1114,234 @@ async def _fetch_genres(conn: object, *, root_genre_id: str | None) -> list[Sema
         .mappings()
         .fetchall()
     )
+    center_genre_id = next(
+        (
+            row["id"]
+            for row in rows
+            if int(row["depth_from_music"]) == 0
+        ),
+        None,
+    )
+    rows = [
+        row
+        for row in rows
+        if row["id"] == center_genre_id
+        or not MUSIC_REGION_TITLE_RE.search(row["wikipedia_title"] or "")
+    ]
+    return [
+        SemanticGenre(
+            genre_id=row["id"],
+            title=row["wikipedia_title"],
+            summary=row["summary"],
+            monthly_views_p30=row["monthly_views_p30"],
+            depth_from_music=row["depth_from_music"],
+            root_genre_id=row["root_genre_id"],
+            root_title=row["root_title"],
+            path_genre_ids=tuple(row["path_genre_ids"] or ()),
+            has_playlist=bool(row["has_playlist"]),
+            child_connection_count=row["child_connection_count"],
+            parent_connection_count=row["parent_connection_count"],
+        )
+        for row in rows
+    ]
+
+
+async def _fetch_region_genres(conn: object, *, region_id: str) -> list[SemanticGenre]:
+    rows = (
+        (
+            await conn.execute(  # type: ignore[attr-defined]
+                text("""
+                    WITH RECURSIVE region_tree AS (
+                        SELECT
+                            region.id AS region_id,
+                            region.canonical_name,
+                            region.kind,
+                            promoted.genre_id AS promoted_genre_id,
+                            promoted.wikipedia_title AS promoted_title,
+                            0 AS region_depth
+                        FROM wg_regions region
+                        JOIN wg_region_promoted_genres promoted ON promoted.region_id = region.id
+                        WHERE region.id = :region_id
+
+                        UNION ALL
+
+                        SELECT
+                            child.id AS region_id,
+                            child.canonical_name,
+                            child.kind,
+                            promoted.genre_id AS promoted_genre_id,
+                            promoted.wikipedia_title AS promoted_title,
+                            parent.region_depth + 1 AS region_depth
+                        FROM region_tree parent
+                        JOIN wg_region_relationships rel ON rel.to_region_id = parent.region_id
+                        JOIN wg_regions child ON child.id = rel.from_region_id
+                        JOIN wg_region_promoted_genres promoted ON promoted.region_id = child.id
+                        WHERE rel.status = 'accepted'
+                          AND parent.region_depth < 4
+                          AND coalesce(child.raw_payload #>> '{region_production_review,status}', '') NOT IN (
+                              'collapsed',
+                              'rejected',
+                              'demoted_source',
+                              'hidden_from_ui'
+                          )
+                    ),
+                    center AS (
+                        SELECT promoted_genre_id, promoted_title
+                        FROM region_tree
+                        WHERE region_id = :region_id
+                        LIMIT 1
+                    ),
+                    related_genres AS (
+                        SELECT DISTINCT ON (genre_id)
+                            promoted_genre_id AS genre_id,
+                            promoted_genre_id AS root_genre_id,
+                            promoted_title AS root_title,
+                            ARRAY[(SELECT promoted_genre_id FROM center), promoted_genre_id]::text[] AS path_genre_ids,
+                            region_depth,
+                            0 AS relation_rank
+                        FROM region_tree
+                        WHERE region_id = :region_id
+                           OR promoted_title !~* '\\mmusic\\s+(of|in)\\M'
+
+                        UNION
+
+                        SELECT DISTINCT ON (edge.to_genre_id)
+                            edge.to_genre_id AS genre_id,
+                            coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)) AS root_genre_id,
+                            coalesce(region_tree.promoted_title, (SELECT promoted_title FROM center)) AS root_title,
+                            ARRAY[
+                                (SELECT promoted_genre_id FROM center),
+                                coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)),
+                                edge.to_genre_id
+                            ]::text[] AS path_genre_ids,
+                            region_tree.region_depth + 1 AS region_depth,
+                            1 AS relation_rank
+                        FROM region_tree
+                        JOIN wg_edges edge ON edge.from_genre_id = region_tree.promoted_genre_id
+                        JOIN wg_genres child ON child.id = edge.to_genre_id
+                        WHERE region_tree.region_id <> :region_id
+                          AND region_tree.promoted_title ~* '\\mmusic\\s+(of|in)\\M'
+                          AND edge.is_ignored = false
+                          AND edge.to_genre_id IS NOT NULL
+                          AND child.deleted_at IS NULL
+                          AND child.is_non_genre = false
+
+                        UNION
+
+                        SELECT DISTINCT ON (rel.genre_id)
+                            rel.genre_id,
+                            coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)) AS root_genre_id,
+                            coalesce(region_tree.promoted_title, (SELECT promoted_title FROM center)) AS root_title,
+                            CASE
+                                WHEN region_tree.promoted_genre_id = rel.genre_id THEN
+                                    ARRAY[(SELECT promoted_genre_id FROM center), rel.genre_id]::text[]
+                                ELSE
+                                    ARRAY[
+                                        (SELECT promoted_genre_id FROM center),
+                                        coalesce(region_tree.promoted_genre_id, (SELECT promoted_genre_id FROM center)),
+                                        rel.genre_id
+                                    ]::text[]
+                            END AS path_genre_ids,
+                            region_tree.region_depth + 1 AS region_depth,
+                            1 AS relation_rank
+                        FROM region_tree
+                        JOIN wg_region_genre_relationships rel ON rel.region_id = region_tree.region_id
+                        WHERE rel.status = 'accepted'
+                          AND rel.relation NOT IN ('regional_style_mention', 'influence_or_context')
+
+                        UNION
+
+                        SELECT DISTINCT ON (affinity.genre_id)
+                            affinity.genre_id,
+                            (SELECT promoted_genre_id FROM center) AS root_genre_id,
+                            (SELECT promoted_title FROM center) AS root_title,
+                            ARRAY[
+                                (SELECT promoted_genre_id FROM center),
+                                affinity.genre_id
+                            ]::text[] AS path_genre_ids,
+                            2 AS region_depth,
+                            2 AS relation_rank
+                        FROM wg_genre_country_affinities affinity
+                        WHERE affinity.region_id = :region_id
+                          AND affinity.review_status <> 'rejected'
+                          AND affinity.score >= 0.55
+                          AND affinity.confidence >= 0.50
+                    ),
+                    playable AS (
+                        SELECT genre_id, true AS has_playlist
+                        FROM wg_genre_youtube_playlist_tracks
+                        WHERE is_embeddable IS DISTINCT FROM false
+                        GROUP BY genre_id
+                    ),
+                    child_counts AS (
+                        SELECT
+                            e.from_genre_id AS genre_id,
+                            COUNT(DISTINCT e.to_genre_id) AS child_connection_count
+                        FROM wg_edges e
+                        JOIN wg_genres child_g ON child_g.id = e.to_genre_id
+                        WHERE e.to_genre_id IS NOT NULL
+                          AND e.is_ignored = false
+                          AND child_g.deleted_at IS NULL
+                          AND child_g.is_non_genre = false
+                        GROUP BY e.from_genre_id
+                    ),
+                    parent_counts AS (
+                        SELECT
+                            e.to_genre_id AS genre_id,
+                            COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
+                        FROM wg_edges e
+                        JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
+                        WHERE e.to_genre_id IS NOT NULL
+                          AND e.is_ignored = false
+                          AND parent_g.deleted_at IS NULL
+                          AND parent_g.is_non_genre = false
+                        GROUP BY e.to_genre_id
+                    ),
+                    best_path AS (
+                        SELECT DISTINCT ON (genre_id)
+                            genre_id,
+                            root_genre_id,
+                            root_title,
+                            path_genre_ids,
+                            region_depth,
+                            relation_rank
+                        FROM related_genres
+                        ORDER BY genre_id, relation_rank, region_depth, root_title
+                    )
+                    SELECT
+                        g.id,
+                        g.wikipedia_title,
+                        g.summary,
+                        g.monthly_views_p30,
+                        CASE
+                            WHEN g.id = (SELECT promoted_genre_id FROM center) THEN 0
+                            ELSE greatest(1, best_path.region_depth + 1)
+                        END AS depth_from_music,
+                        best_path.root_genre_id,
+                        best_path.root_title,
+                        best_path.path_genre_ids,
+                        COALESCE(p.has_playlist, false) AS has_playlist,
+                        COALESCE(cc.child_connection_count, 0) AS child_connection_count,
+                        COALESCE(pc.parent_connection_count, 0) AS parent_connection_count
+                    FROM best_path
+                    JOIN wg_genres g ON g.id = best_path.genre_id
+                    LEFT JOIN playable p ON p.genre_id = g.id
+                    LEFT JOIN child_counts cc ON cc.genre_id = g.id
+                    LEFT JOIN parent_counts pc ON pc.genre_id = g.id
+                    WHERE g.deleted_at IS NULL
+                      AND g.is_non_genre = false
+                      AND (
+                          g.id = (SELECT promoted_genre_id FROM center)
+                          OR g.wikipedia_title !~* '\\mmusic\\s+(of|in)\\M'
+                      )
+                    ORDER BY depth_from_music, best_path.root_title, g.wikipedia_title
+                """),
+                {"region_id": region_id},
+            )
+        )
+        .mappings()
+        .fetchall()
+    )
     return [
         SemanticGenre(
             genre_id=row["id"],
@@ -1229,6 +1499,7 @@ def _apply_grouped_values(
 async def build_semantic_cloud_layout(
     *,
     root_genre_id: str | None = None,
+    region_id: str | None = None,
     dry_run: bool = False,
     sample_size: int = 20,
     iterations: int = 90,
@@ -1236,11 +1507,15 @@ async def build_semantic_cloud_layout(
     """Rebuild one semantic cloud layout scope."""
     await apply_migrations()
     engine = get_engine()
-    layout_key = layout_key_for_root(root_genre_id)
+    layout_key = layout_key_for_root(root_genre_id, region_id=region_id)
     stats = SemanticCloudLayoutStats(layout_key=layout_key, dry_run=dry_run)
 
     async with engine.connect() as conn:
-        genres = await _fetch_genres(conn, root_genre_id=root_genre_id)
+        genres = (
+            await _fetch_region_genres(conn, region_id=region_id)
+            if region_id
+            else await _fetch_genres(conn, root_genre_id=root_genre_id)
+        )
         genre_ids = [genre.genre_id for genre in genres]
         stats.total_genres = len(genres)
 
@@ -1273,6 +1548,15 @@ async def build_semantic_cloud_layout(
     stats.materialized_edges = len(merged_edges)
 
     center_genre_id = root_genre_id if root_genre_id else None
+    if region_id and genres:
+        center_genre_id = min(
+            genres,
+            key=lambda genre: (
+                genre.depth_from_music,
+                genre.root_title.lower(),
+                genre.title.lower(),
+            ),
+        ).genre_id
     _layout(genres, merged_edges, center_genre_id=center_genre_id, iterations=iterations)
     quality_metrics, quality_sample = _layout_quality(
         genres,
@@ -1378,6 +1662,12 @@ async def build_semantic_cloud_layout(
                         y,
                         width,
                         height,
+                        text_width,
+                        text_height,
+                        box_width,
+                        box_height,
+                        box_pad_x,
+                        box_pad_y,
                         priority,
                         is_center,
                         lod_score,
@@ -1397,6 +1687,12 @@ async def build_semantic_cloud_layout(
                         :y,
                         :width,
                         :height,
+                        :text_width,
+                        :text_height,
+                        :box_width,
+                        :box_height,
+                        :box_pad_x,
+                        :box_pad_y,
                         :priority,
                         :is_center,
                         :lod_score,
@@ -1418,6 +1714,12 @@ async def build_semantic_cloud_layout(
                         "y": genre.y,
                         "width": genre.width,
                         "height": genre.height,
+                        "text_width": genre.text_width,
+                        "text_height": genre.text_height,
+                        "box_width": genre.box_width,
+                        "box_height": genre.box_height,
+                        "box_pad_x": genre.box_pad_x,
+                        "box_pad_y": genre.box_pad_y,
                         "priority": genre.priority,
                         "is_center": genre.genre_id == center_genre_id,
                         "lod_score": genre.lod_score,
@@ -1513,6 +1815,7 @@ async def build_semantic_cloud_layout(
                 "sample": json.dumps(stats.quality_sample, sort_keys=True),
             },
         )
+        await refresh_cloud_display_cache(conn, layout_key=layout_key)
 
     logger.info(
         "semantic_cloud_layout_complete",

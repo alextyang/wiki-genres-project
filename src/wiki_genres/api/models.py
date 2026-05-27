@@ -24,6 +24,12 @@ class EdgeOut(BaseModel):
     to_monthly_views_p30: int | None = None
     to_similarity_color: str | None = None
     to_color_confidence: float | None = None
+    to_text_width: float | None = None
+    to_text_height: float | None = None
+    to_box_width: float | None = None
+    to_box_height: float | None = None
+    to_box_pad_x: float | None = None
+    to_box_pad_y: float | None = None
 
 
 class AliasOut(BaseModel):
@@ -232,6 +238,12 @@ class TimelineNodeOut(BaseModel):
     selected_direction: str | None = None
     selected_connection_count: int | None = None
     selected_focus_score: float | None = None
+    text_width: float | None = None
+    text_height: float | None = None
+    box_width: float | None = None
+    box_height: float | None = None
+    box_pad_x: float | None = None
+    box_pad_y: float | None = None
     hint: TimelineYearHintOut | None = None
 
 
@@ -262,8 +274,12 @@ class GenreCloudNodeOut(BaseModel):
     y: float = 0
     width: float = 0
     height: float = 0
+    text_width: float | None = None
+    text_height: float | None = None
     box_width: float | None = None
     box_height: float | None = None
+    box_pad_x: float | None = None
+    box_pad_y: float | None = None
     depth_from_music: int | None = None
     semantic_root_id: str | None = None
     semantic_root_title: str | None = None
@@ -283,6 +299,8 @@ class GenreCloudNodeOut(BaseModel):
     hide_scale: float = 1.85
     lod_rank: int = 0
     lod_tier: int = 5
+    selected_distance: int | None = None
+    selected_focus_score: float | None = None
 
 
 class GenreCloudResult(BaseModel):
@@ -308,6 +326,12 @@ class GenreListItem(BaseModel):
     monthly_views_p30: int | None = None
     similarity_color: str | None = None
     color_confidence: float | None = None
+    text_width: float | None = None
+    text_height: float | None = None
+    box_width: float | None = None
+    box_height: float | None = None
+    box_pad_x: float | None = None
+    box_pad_y: float | None = None
 
 
 class GenreDetail(GenreListItem):
