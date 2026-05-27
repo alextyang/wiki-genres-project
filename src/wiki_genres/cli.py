@@ -2213,6 +2213,45 @@ def migrate(
         typer.echo("No pending migrations.")
 
 
+@app.command("import-reviewed-genre-relationships")
+def import_reviewed_genre_relationships(
+    csv_path: Path = typer.Argument(
+        help="Normalized GPT relationship-review CSV to import.",
+    ),
+    review_run_id: str = typer.Option(
+        "relationship_review_20260527",
+        "--review-run-id",
+        help="Stable identifier for this reviewed relationship run.",
+    ),
+    replace: bool = typer.Option(
+        True,
+        "--replace/--append",
+        help="Delete existing rows for this review run before importing.",
+    ),
+    log_level: str = typer.Option("INFO", "--log-level"),
+) -> None:
+    """Import reviewed genre relationships into the canonical new schema."""
+    configure_logging(level=log_level)
+    from wiki_genres.loader.genre_relationship_import import (
+        import_reviewed_genre_relationships as run_import,
+    )
+
+    stats = _run(
+        run_import(
+            csv_path,
+            review_run_id=review_run_id,
+            replace_review_run=replace,
+        )
+    )
+    typer.echo(f"rows read:                 {stats.rows_read}")
+    typer.echo(f"relationships inserted:   {stats.relationships_inserted}")
+    typer.echo(f"missing targets inserted: {stats.missing_targets_inserted}")
+    typer.echo(f"self relationships skipped:{stats.skipped_self_relationships}")
+    typer.echo(f"missing sources skipped:  {stats.skipped_missing_source_genres}")
+    typer.echo(f"old relationships deleted:{stats.deleted_existing_relationships}")
+    typer.echo(f"old missing deleted:      {stats.deleted_existing_missing_targets}")
+
+
 @app.command()
 def stats(
     log_level: str = typer.Option("INFO", "--log-level"),
@@ -2237,7 +2276,7 @@ def stats(
             edges = await conn.scalar(
                 text("""
                 select count(*)
-                from wg_edges e
+                from wg_relationship_detail_edges e
                 join wg_genres from_g on from_g.id = e.from_genre_id
                 left join wg_genres to_g on to_g.id = e.to_genre_id
                 where from_g.is_non_genre = false
@@ -2252,7 +2291,7 @@ def stats(
             unresolved = await conn.scalar(
                 text("""
                     select count(*)
-                    from wg_edges e
+                    from wg_relationship_detail_edges e
                     join wg_genres g on g.id = e.from_genre_id
                     where e.to_genre_id is null
                       and e.is_ignored = false

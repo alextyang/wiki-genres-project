@@ -478,7 +478,7 @@ async def index_music_reachability(
                     e.ordinal,
                     from_g.wikipedia_title AS from_title,
                     to_g.wikipedia_title AS to_title
-                FROM wg_edges e
+                FROM wg_relationship_traversal_edges e
                 JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                 JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                 WHERE e.to_genre_id IS NOT NULL

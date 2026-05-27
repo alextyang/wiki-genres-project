@@ -148,7 +148,7 @@ async def stats() -> StatsResult:
             edges = await session.scalar(
                 text("""
                 SELECT count(*)
-                FROM wg_edges e
+                FROM wg_relationship_detail_edges e
                 JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                 LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                 WHERE from_g.deleted_at IS NULL
@@ -163,7 +163,7 @@ async def stats() -> StatsResult:
             edges_resolved = await session.scalar(
                 text("""
                     SELECT count(*)
-                    FROM wg_edges e
+                    FROM wg_relationship_detail_edges e
                     JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                     JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     WHERE from_g.deleted_at IS NULL

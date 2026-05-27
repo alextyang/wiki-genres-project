@@ -22,12 +22,32 @@ from wiki_genres.loader.semantic_cloud_layout import GENERAL_LAYOUT_KEY
 
 router = APIRouter(prefix="/v1/timeline", tags=["timeline"])
 
-DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+LEGACY_DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+REVIEW_DISPLAY_RELATIONS = (
+    "broader_genres",
+    "subgenres",
+    "derived_genres",
+    "fusion_components",
+    "fusion_descendants",
+    "regional_variations",
+)
+DISPLAY_RELATIONS = (*REVIEW_DISPLAY_RELATIONS, *LEGACY_DISPLAY_RELATIONS)
 RELATED_RELATION = "related_genre"
 ORIGIN_PARENT_RELATION = "origin_parent"
 ORIGIN_PARENT_EVIDENCE_RELATIONS = ("stylistic_origin_of",)
 CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
-RELATION_RANK = {"subgenre": 0, "derivative": 1, "fusion_genre": 2, ORIGIN_PARENT_RELATION: 3}
+RELATION_RANK = {
+    "broader_genres": 0,
+    "subgenres": 1,
+    "subgenre": 1,
+    "derived_genres": 2,
+    "derivative": 2,
+    "fusion_components": 3,
+    "fusion_descendants": 3,
+    "fusion_genre": 3,
+    "regional_variations": 4,
+    ORIGIN_PARENT_RELATION: 5,
+}
 DOWNWARD_CONNECTION_WEIGHT = 1.0
 UPWARD_CONNECTION_WEIGHT = 0.35
 LEFT_PAD = 120
@@ -619,7 +639,7 @@ async def get_timeline(
                             e.ordinal,
                             to_g.wikipedia_title AS to_title,
                             to_g.monthly_views_p30 AS to_monthly_views_p30
-                        FROM wg_edges e
+                        FROM wg_relationship_traversal_edges e
                         JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                         JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                         WHERE e.to_genre_id IS NOT NULL
@@ -951,7 +971,7 @@ async def _load_edges_for_nodes(node_ids: set[str]) -> list[TimelineGraphEdge]:
                             END AS relation,
                             e.source,
                             e.ordinal
-                        FROM wg_edges e
+                        FROM wg_relationship_traversal_edges e
                         WHERE e.from_genre_id = ANY(:node_ids)
                           AND e.to_genre_id = ANY(:node_ids)
                           AND e.to_genre_id IS NOT NULL

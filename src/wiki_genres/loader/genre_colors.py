@@ -48,13 +48,21 @@ ROOT_COLOR_BY_TITLE = {
 }
 
 RELATION_WEIGHT = {
+    "broader_genres": 1.0,
+    "subgenres": 1.0,
     "subgenre": 1.0,
+    "source_genres": 0.42,
+    "derived_genres": 0.76,
     "derivative": 0.76,
+    "fusion_components": 0.68,
+    "fusion_descendants": 0.68,
     "fusion_genre": 0.68,
+    "regional_variations": 0.72,
     "regional_scene": 0.58,
 }
 
 SOURCE_WEIGHT = {
+    "gpt_review": 1.18,
     "manual_curation": 1.1,
     "infobox": 1.0,
     "wikidata": 0.9,
@@ -62,9 +70,16 @@ SOURCE_WEIGHT = {
 }
 
 REVERSE_RELATION_WEIGHT = {
+    "broader_genres": 0.34,
+    "subgenres": 0.34,
     "subgenre": 0.34,
+    "source_genres": 0.20,
+    "derived_genres": 0.28,
     "derivative": 0.28,
+    "fusion_components": 0.26,
+    "fusion_descendants": 0.26,
     "fusion_genre": 0.26,
+    "regional_variations": 0.82,
     "regional_scene": 0.82,
 }
 
@@ -504,7 +519,7 @@ async def index_genre_colors(
                        e.relation,
                        e.evidence_relation,
                        e.source
-                FROM wg_edges e
+                FROM wg_relationship_traversal_edges e
                 JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                 JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                 WHERE e.to_genre_id IS NOT NULL

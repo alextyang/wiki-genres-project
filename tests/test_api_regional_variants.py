@@ -79,8 +79,18 @@ def test_region_parent_relations_include_subclass_edges() -> None:
 
 
 def test_map_variant_relations_are_production_display_only() -> None:
-    assert set(MAP_VARIANT_RELATIONS) == {"subgenre", "derivative", "fusion_genre"}
-    assert set(MAP_VARIANT_EVIDENCE_RELATIONS) == {"subgenre", "derivative", "fusion_genre"}
+    assert set(MAP_VARIANT_RELATIONS) == {
+        "regional_variations",
+        "subgenre",
+        "derivative",
+        "fusion_genre",
+    }
+    assert set(MAP_VARIANT_EVIDENCE_RELATIONS) == {
+        "regional_variations",
+        "subgenre",
+        "derivative",
+        "fusion_genre",
+    }
     assert REGIONAL_SCENE_RELATION not in MAP_VARIANT_RELATIONS
     assert REGIONAL_SCENE_EVIDENCE_RELATION not in MAP_VARIANT_EVIDENCE_RELATIONS
 

@@ -42,9 +42,18 @@ from wiki_genres.loader.semantic_cloud_layout import layout_key_for_root
 
 router = APIRouter(prefix="/v1/genres", tags=["genres"])
 
-DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
-MAP_VARIANT_RELATIONS = DISPLAY_RELATIONS
-MAP_VARIANT_EVIDENCE_RELATIONS = DISPLAY_RELATIONS
+LEGACY_DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+REVIEW_DISPLAY_RELATIONS = (
+    "broader_genres",
+    "subgenres",
+    "derived_genres",
+    "fusion_components",
+    "fusion_descendants",
+    "regional_variations",
+)
+DISPLAY_RELATIONS = (*REVIEW_DISPLAY_RELATIONS, *LEGACY_DISPLAY_RELATIONS)
+MAP_VARIANT_RELATIONS = ("regional_variations", *LEGACY_DISPLAY_RELATIONS)
+MAP_VARIANT_EVIDENCE_RELATIONS = MAP_VARIANT_RELATIONS
 RELATED_RELATION = "related_genre"
 MUSIC_ROOT_ID = "__music_root__"
 REGIONAL_SCENE_RELATION = "regional_scene"
@@ -969,7 +978,7 @@ async def _build_genre_detail(session, row) -> GenreDetail:
                    to_layout.box_height AS to_box_height,
                    to_layout.box_pad_x AS to_box_pad_x,
                    to_layout.box_pad_y AS to_box_pad_y
-            FROM wg_edges e
+            FROM wg_relationship_detail_edges e
             LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
             LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
             LEFT JOIN wg_genre_semantic_layouts to_layout
@@ -1005,7 +1014,7 @@ async def _build_genre_detail(session, row) -> GenreDetail:
                    to_layout.box_height AS to_box_height,
                    to_layout.box_pad_x AS to_box_pad_x,
                    to_layout.box_pad_y AS to_box_pad_y
-            FROM wg_edges e
+            FROM wg_relationship_detail_edges e
             JOIN wg_genres g ON g.id = e.from_genre_id
             LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
             LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
@@ -2120,7 +2129,7 @@ async def _direct_regional_child_rows_for_map(session, *, genre_id: str):
                    c.confidence AS color_confidence,
                    e.relation,
                    e.evidence_relation
-            FROM wg_edges e
+            FROM wg_relationship_traversal_edges e
             JOIN wg_genres child_g ON child_g.id = e.to_genre_id
             LEFT JOIN wg_genre_colors c ON c.genre_id = child_g.id
             WHERE e.from_genre_id = :genre_id
@@ -2483,7 +2492,7 @@ async def _regional_variants_for_title(
                     text("""
                 WITH selected_children AS (
                     SELECT DISTINCT e.to_genre_id AS child_id
-                    FROM wg_edges e
+                    FROM wg_relationship_traversal_edges e
                     JOIN wg_genres child_g ON child_g.id = e.to_genre_id
                     WHERE e.from_genre_id = :genre_id
                       AND e.to_genre_id IS NOT NULL
@@ -2509,7 +2518,7 @@ async def _regional_variants_for_title(
                            c.color_hex AS similarity_color,
                            c.confidence AS color_confidence
                     FROM selected_children sc
-                    JOIN wg_edges re ON re.to_genre_id = sc.child_id
+                    JOIN wg_relationship_traversal_edges re ON re.to_genre_id = sc.child_id
                     JOIN wg_genres region_g ON region_g.id = re.from_genre_id
                     LEFT JOIN wg_region_promoted_genres promoted_region
                       ON promoted_region.genre_id = region_g.id
@@ -2538,7 +2547,7 @@ async def _regional_variants_for_title(
                            c.color_hex AS similarity_color,
                            c.confidence AS color_confidence
                     FROM selected_children sc
-                    JOIN wg_edges re ON re.from_genre_id = sc.child_id
+                    JOIN wg_relationship_traversal_edges re ON re.from_genre_id = sc.child_id
                     JOIN wg_genres region_g ON region_g.id = re.to_genre_id
                     LEFT JOIN wg_region_promoted_genres promoted_region
                       ON promoted_region.genre_id = region_g.id
@@ -2825,7 +2834,7 @@ async def _region_cloud_rows(session, *, region_id: str):
                             region_tree.region_depth + 1 AS region_depth,
                             1 AS relation_rank
                         FROM region_tree
-                        JOIN wg_edges edge ON edge.from_genre_id = region_tree.promoted_genre_id
+                        JOIN wg_relationship_traversal_edges edge ON edge.from_genre_id = region_tree.promoted_genre_id
                         JOIN wg_genres child ON child.id = edge.to_genre_id
                         WHERE region_tree.region_id <> :region_id
                           AND region_tree.promoted_title ~* '\\mmusic\\s+(of|in)\\M'
@@ -2879,7 +2888,7 @@ async def _region_cloud_rows(session, *, region_id: str):
                     ),
                     child_counts AS (
                         SELECT e.from_genre_id AS genre_id, COUNT(DISTINCT e.to_genre_id) AS child_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_traversal_edges e
                         JOIN wg_genres child_g ON child_g.id = e.to_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND child_g.deleted_at IS NULL
@@ -2888,7 +2897,7 @@ async def _region_cloud_rows(session, *, region_id: str):
                     ),
                     parent_counts AS (
                         SELECT e.to_genre_id AS genre_id, COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_traversal_edges e
                         JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND parent_g.deleted_at IS NULL
@@ -3020,7 +3029,7 @@ async def get_genre_cloud(
                         ),
                         child_counts AS (
                             SELECT e.from_genre_id AS genre_id, COUNT(DISTINCT e.to_genre_id) AS child_connection_count
-                            FROM wg_edges e
+                            FROM wg_relationship_traversal_edges e
                             JOIN wg_genres child_g ON child_g.id = e.to_genre_id
                             WHERE e.to_genre_id IS NOT NULL
                               AND child_g.deleted_at IS NULL
@@ -3029,7 +3038,7 @@ async def get_genre_cloud(
                         ),
                         parent_counts AS (
                             SELECT e.to_genre_id AS genre_id, COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
-                            FROM wg_edges e
+                            FROM wg_relationship_traversal_edges e
                             JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
                             WHERE e.to_genre_id IS NOT NULL
                               AND parent_g.deleted_at IS NULL
@@ -3809,7 +3818,7 @@ async def get_genre_edges(
                            to_layout.box_height AS to_box_height,
                            to_layout.box_pad_x AS to_box_pad_x,
                            to_layout.box_pad_y AS to_box_pad_y
-                    FROM wg_edges e
+                    FROM wg_relationship_detail_edges e
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
                     LEFT JOIN wg_genre_semantic_layouts to_layout
@@ -3847,7 +3856,7 @@ async def get_genre_edges(
                            to_layout.box_height AS to_box_height,
                            to_layout.box_pad_x AS to_box_pad_x,
                            to_layout.box_pad_y AS to_box_pad_y
-                    FROM wg_edges e
+                    FROM wg_relationship_detail_edges e
                     JOIN wg_genres g ON g.id = e.from_genre_id
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
@@ -3944,7 +3953,7 @@ async def get_genre_reachable_parents(
                       AND parsed_year_start IS NOT NULL
                     GROUP BY genre_id
                 ) parent_origin ON parent_origin.genre_id = r.parent_genre_id
-                LEFT JOIN wg_edges parent_edge
+                LEFT JOIN wg_relationship_traversal_edges parent_edge
                     ON parent_edge.from_genre_id = r.parent_genre_id
                    AND parent_edge.to_genre_id = r.genre_id
                    AND parent_edge.source = r.parent_source
@@ -4035,7 +4044,7 @@ async def get_genre_neighbors(
                         e.source,
                         0                   AS depth,
                         ARRAY[e.from_genre_id, e.to_genre_id] AS visited
-                    FROM wg_edges e
+                    FROM wg_relationship_neighbor_edges e
                     WHERE e.from_genre_id = :start
                       AND e.to_genre_id IS NOT NULL
                       AND e.is_ignored = false
@@ -4054,7 +4063,7 @@ async def get_genre_neighbors(
                         e.source,
                         bfs.depth + 1,
                         bfs.visited || e.to_genre_id
-                    FROM wg_edges e
+                    FROM wg_relationship_neighbor_edges e
                     JOIN bfs ON bfs.genre_id = e.from_genre_id
                     WHERE e.to_genre_id IS NOT NULL
                       AND e.is_ignored = false

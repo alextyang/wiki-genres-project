@@ -142,13 +142,22 @@ MAINTENANCE_TEXT_RE = re.compile(
 )
 
 RELATION_WEIGHT = {
+    "broader_genres": 1.04,
+    "subgenres": 1.0,
     "subgenre": 1.0,
+    "source_genres": 0.56,
+    "derived_genres": 0.82,
     "derivative": 0.82,
+    "fusion_components": 0.76,
+    "fusion_descendants": 0.76,
     "fusion_genre": 0.76,
+    "regional_variations": 0.42,
     "regional_scene": 0.24,
+    "sibling_or_adjacent_genres": 0.18,
 }
 
 SOURCE_WEIGHT = {
+    "gpt_review": 1.2,
     "manual_curation": 1.15,
     "infobox": 1.0,
     "wikidata": 0.9,
@@ -1063,7 +1072,7 @@ async def _fetch_genres(conn: object, *, root_genre_id: str | None) -> list[Sema
                         SELECT
                             e.from_genre_id AS genre_id,
                             COUNT(DISTINCT e.to_genre_id) AS child_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_neighbor_edges e
                         JOIN wg_genres child_g ON child_g.id = e.to_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND e.is_ignored = false
@@ -1075,7 +1084,7 @@ async def _fetch_genres(conn: object, *, root_genre_id: str | None) -> list[Sema
                         SELECT
                             e.to_genre_id AS genre_id,
                             COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_neighbor_edges e
                         JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND e.is_ignored = false
@@ -1277,7 +1286,7 @@ async def _fetch_region_genres(conn: object, *, region_id: str) -> list[Semantic
                         SELECT
                             e.from_genre_id AS genre_id,
                             COUNT(DISTINCT e.to_genre_id) AS child_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_neighbor_edges e
                         JOIN wg_genres child_g ON child_g.id = e.to_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND e.is_ignored = false
@@ -1289,7 +1298,7 @@ async def _fetch_region_genres(conn: object, *, region_id: str) -> list[Semantic
                         SELECT
                             e.to_genre_id AS genre_id,
                             COUNT(DISTINCT e.from_genre_id) AS parent_connection_count
-                        FROM wg_edges e
+                        FROM wg_relationship_neighbor_edges e
                         JOIN wg_genres parent_g ON parent_g.id = e.from_genre_id
                         WHERE e.to_genre_id IS NOT NULL
                           AND e.is_ignored = false
@@ -1451,7 +1460,7 @@ async def _fetch_raw_graph_edges(conn: object, genre_ids: list[str]) -> list[dic
                         e.relation,
                         e.evidence_relation,
                         e.source
-                    FROM wg_edges e
+                    FROM wg_relationship_neighbor_edges e
                     JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                     JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     WHERE e.from_genre_id = ANY(:genre_ids)

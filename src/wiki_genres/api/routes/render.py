@@ -33,10 +33,16 @@ _TIMELINE_PLACEMENT_MAX_SCREEN_OFFSET = 180
 _TIMELINE_EXTRA_EDGE_MAX = 8
 _TIMELINE_NON_CORE_SIDE_EDGE_LIMIT = 1
 _RELATION_RANK = {
+    "broader_genres": 0,
+    "subgenres": 1,
     "subgenre": 0,
+    "derived_genres": 2,
     "derivative": 1,
+    "fusion_components": 3,
+    "fusion_descendants": 3,
     "fusion_genre": 2,
-    "origin_parent": 3,
+    "regional_variations": 4,
+    "origin_parent": 5,
 }
 
 
@@ -164,7 +170,13 @@ def _build_timeline_visibility(
         if not from_id or not to_id:
             continue
         relation = edge.get("relation")
-        relation_boost = -0.04 if relation == "subgenre" else 0.02 if relation == "derivative" else 0.06
+        relation_boost = (
+            -0.04
+            if relation in {"broader_genres", "subgenres", "subgenre"}
+            else 0.02
+            if relation in {"derived_genres", "derivative"}
+            else 0.06
+        )
         edge_ranks[_edge_key(edge)] = max(node_ranks.get(from_id, 1.0), node_ranks.get(to_id, 1.0)) + relation_boost
         edges_by_node.setdefault(from_id, []).append(edge)
         edges_by_node.setdefault(to_id, []).append(edge)

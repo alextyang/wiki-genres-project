@@ -21,7 +21,16 @@ from wiki_genres.db_migrations import apply_migrations
 
 logger = structlog.get_logger(__name__)
 
-DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+LEGACY_DISPLAY_RELATIONS = ("subgenre", "derivative", "fusion_genre")
+REVIEW_DISPLAY_RELATIONS = (
+    "broader_genres",
+    "subgenres",
+    "derived_genres",
+    "fusion_components",
+    "fusion_descendants",
+    "regional_variations",
+)
+DISPLAY_RELATIONS = (*REVIEW_DISPLAY_RELATIONS, *LEGACY_DISPLAY_RELATIONS)
 RELATED_RELATION = "related_genre"
 CYCLE_IGNORE_REASON = "cycle_guard: reachable display cycle"
 SUMMARY_EVIDENCE_RELATION = "summary_subgenre_of"
@@ -142,6 +151,7 @@ def find_cycle_edges(
     *,
     check_adjacency: dict[str, list[TraversalEdge]] | None = None,
     sample_size: int = 25,
+    ignored_edges_out: list[TraversalEdge] | None = None,
 ) -> tuple[list[EdgeKey], list[IgnoredCycle], int]:
     """Return edges that would close a cycle during root-outward traversal."""
     check_adjacency = check_adjacency or traversal_adjacency
@@ -166,6 +176,8 @@ def find_cycle_edges(
             return
         ignored_seen.add(edge.key)
         ignored_keys.append(edge.key)
+        if ignored_edges_out is not None:
+            ignored_edges_out.append(edge)
         if len(samples) < sample_size:
             samples.append(
                 IgnoredCycle(
@@ -363,6 +375,18 @@ async def flag_circular_relationships(
                 {"reason": CYCLE_IGNORE_REASON},
             )
             stats.cleared_existing = int(result.rowcount or 0)
+            result = await conn.execute(
+                text("""
+                    UPDATE wg_genre_relationships
+                    SET is_ignored = false,
+                        ignored_reason = NULL,
+                        ignored_at = NULL
+                    WHERE is_ignored = true
+                      AND ignored_reason = :reason
+                """),
+                {"reason": CYCLE_IGNORE_REASON},
+            )
+            stats.cleared_existing += int(result.rowcount or 0)
 
         roots, missing = await _resolve_root_ids(conn, root_titles)
         hidden_roots = await _resolve_music_country_root_ids(
@@ -388,7 +412,7 @@ async def flag_circular_relationships(
                     e.ordinal,
                     from_g.wikipedia_title AS from_title,
                     to_g.wikipedia_title AS to_title
-                FROM wg_edges e
+                FROM wg_relationship_traversal_edges e
                 JOIN wg_genres from_g ON from_g.id = e.from_genre_id
                 JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                 WHERE e.to_genre_id IS NOT NULL
@@ -436,12 +460,14 @@ async def flag_circular_relationships(
             title_by_id[edge.key.from_genre_id] = edge.from_title
             title_by_id[edge.to_genre_id] = edge.to_title
 
+        ignored_edges: list[TraversalEdge] = []
         ignored_keys, samples, nodes_visited = find_cycle_edges(
             roots,
             _build_adjacency(traversal_edges),
             title_by_id,
             check_adjacency=_build_adjacency(edges),
             sample_size=sample_size,
+            ignored_edges_out=ignored_edges,
         )
         stats.ignored = len(ignored_keys)
         stats.sample = samples
@@ -474,6 +500,39 @@ async def flag_circular_relationships(
                     "relation": key.relation,
                     "source": key.source,
                     "ordinal": key.ordinal,
+                },
+            )
+        for edge in ignored_edges:
+            await conn.execute(
+                text("""
+                    UPDATE wg_genre_relationships
+                    SET is_ignored = true,
+                        ignored_reason = :reason,
+                        ignored_at = now()
+                    WHERE relationship_type = :relation
+                      AND source = :source
+                      AND ordinal = :ordinal
+                      AND status = 'active'
+                      AND (
+                        (
+                          relationship_type in ('broader_genres', 'fusion_components', 'source_genres')
+                          AND to_genre_id = :from_id
+                          AND from_genre_id = :to_id
+                        )
+                        OR (
+                          relationship_type not in ('broader_genres', 'fusion_components', 'source_genres')
+                          AND from_genre_id = :from_id
+                          AND to_genre_id = :to_id
+                        )
+                      )
+                """),
+                {
+                    "reason": CYCLE_IGNORE_REASON,
+                    "from_id": edge.key.from_genre_id,
+                    "to_id": edge.to_genre_id,
+                    "relation": edge.key.relation,
+                    "source": edge.key.source,
+                    "ordinal": edge.key.ordinal,
                 },
             )
 
