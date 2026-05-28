@@ -53,7 +53,7 @@ async def _record_youtube_playback_error(
         exists = await session.scalar(
             text("""
                 SELECT 1
-                FROM wg_genre_youtube_playlist_tracks
+                FROM wg_genre_approved_client_playlist_tracks
                 WHERE genre_id = :genre_id
                   AND youtube_url = :youtube_url
             """),

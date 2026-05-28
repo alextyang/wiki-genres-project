@@ -1064,8 +1064,7 @@ async def _fetch_genres(conn: object, *, root_genre_id: str | None) -> list[Sema
                     ),
                     playable AS (
                         SELECT genre_id, true AS has_playlist
-                        FROM wg_genre_youtube_playlist_tracks
-                        WHERE is_embeddable IS DISTINCT FROM false
+                        FROM wg_genre_approved_client_playlist_tracks
                         GROUP BY genre_id
                     ),
                     child_counts AS (
@@ -1279,8 +1278,7 @@ async def _fetch_region_genres(conn: object, *, region_id: str) -> list[Semantic
                     ),
                     playable AS (
                         SELECT genre_id, true AS has_playlist
-                        FROM wg_genre_youtube_playlist_tracks
-                        WHERE is_embeddable IS DISTINCT FROM false
+                        FROM wg_genre_approved_client_playlist_tracks
                         GROUP BY genre_id
                     ),
                     child_counts AS (
@@ -1429,9 +1427,8 @@ async def _fetch_playlist_terms(conn: object, genre_ids: list[str]) -> dict[str,
             await conn.execute(  # type: ignore[attr-defined]
                 text("""
                     SELECT genre_id, song_title, artist
-                    FROM wg_genre_youtube_playlist_tracks
+                    FROM wg_genre_approved_client_playlist_tracks
                     WHERE genre_id = ANY(:genre_ids)
-                      AND is_embeddable IS DISTINCT FROM false
                     ORDER BY genre_id, ordinal
                 """),
                 {"genre_ids": genre_ids},

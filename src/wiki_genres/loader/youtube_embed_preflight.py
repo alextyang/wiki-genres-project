@@ -446,7 +446,7 @@ async def _preflight_youtube_urls(
 
 
 async def save_preflight_results(results: Iterable[PreflightResult]) -> None:
-    """Persist URL-level results and copy them onto matching stored tracks."""
+    """Persist URL-level preflight results."""
     result_list = list(results)
     if not result_list:
         return
@@ -480,26 +480,6 @@ async def save_preflight_results(results: Iterable[PreflightResult]) -> None:
                     "oembed_author": result.oembed_author,
                 },
             )
-            await session.execute(
-                text(
-                    """
-                    update wg_genre_youtube_playlist_tracks
-                    set
-                        is_embeddable = :is_embeddable,
-                        embed_checked_at = :checked_at,
-                        embed_http_status = :http_status,
-                        embed_error = :error
-                    where youtube_url = :youtube_url
-                    """
-                ),
-                {
-                    "youtube_url": result.youtube_url,
-                    "is_embeddable": result.is_embeddable,
-                    "checked_at": result.checked_at,
-                    "http_status": result.http_status,
-                    "error": result.error,
-                },
-            )
 
 
 async def preflight_youtube_embeds(
@@ -512,8 +492,7 @@ async def preflight_youtube_embeds(
 ) -> PreflightStats:
     """Preflight YouTube playlist track URLs and persist results.
 
-    Results are cached per-URL in `wg_youtube_embed_preflight_cache` and also
-    copied onto each `wg_genre_youtube_playlist_tracks` row for quick filtering.
+    Results are cached per-URL in `wg_youtube_embed_preflight_cache`.
     """
     await apply_migrations()
     ttl = timedelta(days=max(1, int(ttl_days)))
@@ -521,16 +500,18 @@ async def preflight_youtube_embeds(
 
     async with session_scope() as session:
         sql = """
-            select distinct youtube_url
-            from wg_genre_youtube_playlist_tracks
+            select distinct tracks.youtube_url
+            from wg_genre_approved_client_playlist_tracks tracks
+            left join wg_youtube_embed_preflight_cache cache
+              on cache.youtube_url = tracks.youtube_url
             where 1=1
         """
         params: dict[str, Any] = {"cutoff": cutoff, "limit_urls": limit_urls}
         if genre_id is not None:
-            sql += " and genre_id = :genre_id"
+            sql += " and tracks.genre_id = :genre_id"
             params["genre_id"] = genre_id
         if not force:
-            sql += " and (is_embeddable is null or embed_checked_at is null or embed_checked_at < :cutoff)"
+            sql += " and (cache.checked_at is null or cache.checked_at < :cutoff)"
         if limit_urls is not None:
             sql += " limit :limit_urls"
 
@@ -594,27 +575,23 @@ async def playlist_embed_shortfalls(*, target_count: int = 35) -> list[EmbedShor
                     SELECT
                         g.id AS genre_id,
                         g.wikipedia_title AS title,
+                        count(*) AS usable_count,
                         count(*) FILTER (
-                            WHERE t.is_embeddable IS DISTINCT FROM false
-                        ) AS usable_count,
-                        count(*) FILTER (
-                            WHERE t.is_embeddable = false
+                            WHERE cache.is_embeddable = false
                         ) AS blocked_count,
                         count(*) FILTER (
-                            WHERE t.embed_checked_at IS NOT NULL
+                            WHERE cache.checked_at IS NOT NULL
                         ) AS checked_count
-                    FROM wg_genre_youtube_playlist_tracks t
+                    FROM wg_genre_approved_client_playlist_tracks t
                     JOIN wg_genres g ON g.id = t.genre_id
+                    LEFT JOIN wg_youtube_embed_preflight_cache cache
+                      ON cache.youtube_url = t.youtube_url
                     WHERE g.deleted_at IS NULL
                       AND g.is_non_genre = false
                     GROUP BY g.id, g.wikipedia_title
-                    HAVING count(*) FILTER (
-                        WHERE t.is_embeddable IS DISTINCT FROM false
-                    ) < :target_count
+                    HAVING count(*) < :target_count
                     ORDER BY
-                        (:target_count - count(*) FILTER (
-                            WHERE t.is_embeddable IS DISTINCT FROM false
-                        )) DESC,
+                        (:target_count - count(*)) DESC,
                         usable_count,
                         g.wikipedia_title
                 """),

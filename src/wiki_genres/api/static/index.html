@@ -23,7 +23,7 @@
     rel="stylesheet"
     href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0"
   />
-  <link rel="stylesheet" href="styles.css?v=531" />
+  <link rel="stylesheet" href="styles.css?v=542" />
 </head>
 <body class="app-booting">
   <div id="boot-loading" aria-live="polite" aria-hidden="true">
@@ -332,15 +332,19 @@
 
     <footer id="footer">
       <span id="footer-depth"></span>
+      <span id="footer-zoom-value">Zoom x1.00</span>
       <span id="footer-zoom" class="zoom-progress-track" tabindex="0">
         <span id="footer-zoom-fill" class="zoom-progress-fill"></span>
-        <span id="footer-zoom-label" class="zoom-progress-label"></span>
+      </span>
+      <span id="footer-reset" role="button" tabindex="0" aria-label="Recenter view">
+        <span class="footer-reset-label">Recenter</span>
+        <span class="material-symbols-rounded footer-reset-icon" aria-hidden="true">my_location</span>
       </span>
       <span id="footer-hint"></span>
     </footer>
 
   </div>
 
-  <script type="module" src="app.js?v=578"></script>
+  <script type="module" src="app.js?v=607"></script>
 </body>
 </html>

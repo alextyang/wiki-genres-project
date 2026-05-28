@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import asyncio
 import json
 import math
+import subprocess
 from collections.abc import AsyncIterator, Iterable
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query
@@ -978,6 +982,34 @@ _CLOUD_ATLAS_SCALES = tuple(dict.fromkeys((
     1.00,
 )))
 _CLOUD_ATLAS_TILE_PX = 360.0
+_CLOUD_BACKGROUND_FIELD_WIDTH = 420
+_CLOUD_BACKGROUND_OPTIONS = {
+    "graph_neighbor_limit": 32,
+    "large_contributor_limit": 24,
+    "medium_contributor_limit": 10,
+    "hue_bucket_count": 18,
+    "self_weight": 1.0,
+    "graph_weight": 0.6,
+    "large_field_weight": 0.64,
+    "medium_field_weight": 0.36,
+    "spatial_sigma_large_ratio": 0.105,
+    "spatial_sigma_medium_ratio": 0.036,
+    "density_low": 0.32,
+    "density_high": 4.2,
+    "dark_base_alpha": 0.14,
+    "dark_target_lightness": 0.34,
+    "dark_chroma_scale": 0.44,
+    "dark_chroma_max": 0.09,
+    "noise_scale": 0.006,
+    "warp_strength": 3.0,
+    "noise_seed": 1337,
+}
+_CLOUD_BACKGROUND_SCRIPT = Path(__file__).resolve().parent.parent / "static" / "cloud_background_packet.mjs"
+_CLOUD_STATIC_BACKGROUND_DIR = (
+    Path(__file__).resolve().parent.parent / "static" / "generated" / "cloud-backgrounds"
+)
+_CLOUD_BACKGROUND_PACKET_CACHE: dict[str, dict[str, Any]] = {}
+_CLOUD_BACKGROUND_PACKET_CACHE_LIMIT = 12
 
 
 def _cloud_box_width(node: dict[str, Any]) -> float:
@@ -1128,6 +1160,702 @@ def _cloud_scale_layers(
             "tiles": _cloud_layer_tiles(nodes_by_id, layer_ids, scale=scale),
         })
     return layers
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _parse_color_to_rgb(color: object) -> tuple[int, int, int] | None:
+    if not isinstance(color, str):
+        return None
+    text_value = color.strip()
+    if text_value.startswith("#"):
+        hex_value = text_value[1:]
+        try:
+            if len(hex_value) == 3:
+                return tuple(int(ch * 2, 16) for ch in hex_value)  # type: ignore[return-value]
+            if len(hex_value) == 6:
+                return (
+                    int(hex_value[0:2], 16),
+                    int(hex_value[2:4], 16),
+                    int(hex_value[4:6], 16),
+                )
+        except ValueError:
+            return None
+    if text_value.lower().startswith("rgb(") and text_value.endswith(")"):
+        try:
+            parts = [float(part.strip()) for part in text_value[4:-1].split(",")[:3]]
+        except ValueError:
+            return None
+        if len(parts) == 3:
+            return tuple(int(_clamp_float(round(part), 0, 255)) for part in parts)  # type: ignore[return-value]
+    return None
+
+
+def _srgb_to_linear(value: int) -> float:
+    c = _clamp_float(value / 255.0, 0.0, 1.0)
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(value: float) -> float:
+    c = _clamp_float(value, 0.0, 1.0)
+    return c * 12.92 if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def _rgb_to_oklab(rgb: tuple[int, int, int]) -> dict[str, float]:
+    r = _srgb_to_linear(rgb[0])
+    g = _srgb_to_linear(rgb[1])
+    b = _srgb_to_linear(rgb[2])
+    l = math.copysign(abs(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3), 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    m = math.copysign(abs(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3), 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    s = math.copysign(abs(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3), 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    return {
+        "L": 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        "a": 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        "b": 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    }
+
+
+def _oklab_to_rgb(oklab: dict[str, float]) -> tuple[int, int, int]:
+    l = oklab["L"] + 0.3963377774 * oklab["a"] + 0.2158037573 * oklab["b"]
+    m = oklab["L"] - 0.1055613458 * oklab["a"] - 0.0638541728 * oklab["b"]
+    s = oklab["L"] - 0.0894841775 * oklab["a"] - 1.2914855480 * oklab["b"]
+    l3 = l * l * l
+    m3 = m * m * m
+    s3 = s * s * s
+    return (
+        round(_linear_to_srgb(4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3) * 255),
+        round(_linear_to_srgb(-1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3) * 255),
+        round(_linear_to_srgb(-0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3) * 255),
+    )
+
+
+def _oklab_to_oklch(oklab: dict[str, float]) -> dict[str, float]:
+    return {
+        "L": oklab["L"],
+        "C": math.hypot(oklab["a"], oklab["b"]),
+        "h": math.atan2(oklab["b"], oklab["a"]),
+    }
+
+
+def _oklch_to_oklab(oklch: dict[str, float]) -> dict[str, float]:
+    return {
+        "L": oklch["L"],
+        "a": oklch["C"] * math.cos(oklch["h"]),
+        "b": oklch["C"] * math.sin(oklch["h"]),
+    }
+
+
+def _add_oklab(accum: dict[str, float], color: dict[str, float], weight: float) -> None:
+    accum["L"] += color["L"] * weight
+    accum["a"] += color["a"] * weight
+    accum["b"] += color["b"] * weight
+
+
+def _scale_oklab(color: dict[str, float], weight: float) -> dict[str, float]:
+    return {"L": color["L"] * weight, "a": color["a"] * weight, "b": color["b"] * weight}
+
+
+def _cloud_background_node_color(node: dict[str, Any]) -> object:
+    return node.get("similarity_color") or node.get("color")
+
+
+def _cloud_background_nodes(nodes: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for node in nodes:
+        if not node or node.get("id") == "__music_root__":
+            continue
+        try:
+            x = float(node.get("x"))
+            y = float(node.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
+        if _parse_color_to_rgb(_cloud_background_node_color(node)) is None:
+            continue
+        result.append({**node, "x": x, "y": y})
+    return result
+
+
+def _cloud_background_bounds(data: dict[str, Any], nodes: list[dict[str, Any]]) -> dict[str, float] | None:
+    raw_bounds = (data.get("stats") or {}).get("bounds")
+    if raw_bounds:
+        min_x = raw_bounds.get("minX", raw_bounds.get("min_x"))
+        max_x = raw_bounds.get("maxX", raw_bounds.get("max_x"))
+        min_y = raw_bounds.get("minY", raw_bounds.get("min_y"))
+        max_y = raw_bounds.get("maxY", raw_bounds.get("max_y"))
+    elif nodes:
+        min_x = min(float(node["x"]) - _cloud_box_width(node) / 2 for node in nodes)
+        max_x = max(float(node["x"]) + _cloud_box_width(node) / 2 for node in nodes)
+        min_y = min(float(node["y"]) - _cloud_box_height(node) / 2 for node in nodes)
+        max_y = max(float(node["y"]) + _cloud_box_height(node) / 2 for node in nodes)
+    else:
+        return None
+    try:
+        min_x_f = float(min_x)
+        max_x_f = float(max_x)
+        min_y_f = float(min_y)
+        max_y_f = float(max_y)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (min_x_f, max_x_f, min_y_f, max_y_f)):
+        return None
+    if min_x_f == max_x_f or min_y_f == max_y_f:
+        return None
+    pad = max(max_x_f - min_x_f, max_y_f - min_y_f) * 0.08
+    return {
+        "min_x": min_x_f - pad,
+        "max_x": max_x_f + pad,
+        "min_y": min_y_f - pad,
+        "max_y": max_y_f + pad,
+    }
+
+
+def _cloud_background_signature(nodes: list[dict[str, Any]], bounds: dict[str, float], theme: str, width: int, height: int) -> str:
+    hash_value = 2166136261
+
+    def write(value: object) -> None:
+        nonlocal hash_value
+        for char in str(value if value is not None else ""):
+            hash_value ^= ord(char)
+            hash_value = (hash_value * 16777619) & 0xFFFFFFFF
+
+    write(theme)
+    write(width)
+    write(height)
+    for key in ("min_x", "max_x", "min_y", "max_y"):
+        write(round(bounds[key]))
+    write(len(nodes))
+    for node in nodes:
+        write(node.get("id"))
+        write(round(float(node["x"]) * 10))
+        write(round(float(node["y"]) * 10))
+        write(_cloud_background_node_color(node))
+        write(round(float(node.get("monthly_views_p30") or node.get("popularity") or 1)))
+        write(round(float(node.get("color_confidence") if node.get("color_confidence") is not None else node.get("colorConfidence") or 1) * 1000))
+    return f"{len(nodes)}:{hash_value & 0xFFFFFFFF}"
+
+
+def _compute_graph_smoothed_colors(nodes: list[dict[str, Any]], options: dict[str, float]) -> dict[str, dict[str, float]]:
+    raw_colors: dict[str, dict[str, float]] = {}
+    for node in nodes:
+        rgb = _parse_color_to_rgb(_cloud_background_node_color(node))
+        if rgb is not None:
+            raw_colors[str(node["id"])] = _rgb_to_oklab(rgb)
+    result: dict[str, dict[str, float]] = {}
+    node_by_id = {str(node.get("id")): node for node in nodes}
+    for node in nodes:
+        node_id = str(node.get("id"))
+        self_color = raw_colors.get(node_id)
+        if self_color is None:
+            continue
+        accum = _scale_oklab(self_color, options["self_weight"])
+        total = options["self_weight"]
+        neighbors = node.get("neighbors") if isinstance(node.get("neighbors"), list) else []
+        sorted_neighbors = sorted(
+            neighbors,
+            key=lambda edge: (
+                float(edge.get("similarity"))
+                if isinstance(edge, dict) and isinstance(edge.get("similarity"), int | float)
+                else -float(edge.get("distance") or math.inf)
+                if isinstance(edge, dict)
+                else -math.inf
+            ),
+            reverse=True,
+        )[: int(options["graph_neighbor_limit"])]
+        for edge in sorted_neighbors:
+            if not isinstance(edge, dict):
+                continue
+            other = node_by_id.get(str(edge.get("id")))
+            color = raw_colors.get(str(other.get("id"))) if other else None
+            if color is None:
+                continue
+            edge_weight = 0.0
+            if isinstance(edge.get("similarity"), int | float):
+                edge_weight = options["graph_weight"] * _clamp_float(float(edge["similarity"]), 0.0, 1.0)
+            elif isinstance(edge.get("distance"), int | float):
+                distance = float(edge["distance"])
+                edge_weight = options["graph_weight"] * math.exp(-(distance * distance) / 2)
+            if edge_weight <= 0:
+                continue
+            _add_oklab(accum, color, edge_weight)
+            total += edge_weight
+        result[node_id] = _scale_oklab(accum, 1 / total)
+    return result
+
+
+def _build_background_buckets(nodes: list[dict[str, Any]], cell_size: float) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for node in nodes:
+        key = (math.floor(float(node["x"]) / cell_size), math.floor(float(node["y"]) / cell_size))
+        buckets.setdefault(key, []).append(node)
+    return buckets
+
+
+def _nearby_background_nodes(
+    buckets: dict[tuple[int, int], list[dict[str, Any]]],
+    cell_size: float,
+    x: float,
+    y: float,
+    radius: float,
+) -> Iterable[dict[str, Any]]:
+    min_x = math.floor((x - radius) / cell_size)
+    max_x = math.floor((x + radius) / cell_size)
+    min_y = math.floor((y - radius) / cell_size)
+    max_y = math.floor((y + radius) / cell_size)
+    for bucket_x in range(min_x, max_x + 1):
+        for bucket_y in range(min_y, max_y + 1):
+            yield from buckets.get((bucket_x, bucket_y), ())
+
+
+def _predominant_contributor_color(
+    contributors: list[dict[str, Any]],
+    limit: int,
+    bucket_count: int,
+) -> dict[str, Any]:
+    top = sorted(
+        [contributor for contributor in contributors if contributor["weight"] > 0 and contributor["color"]],
+        key=lambda contributor: contributor["weight"],
+        reverse=True,
+    )[:limit]
+    if not top:
+        return {"color": None, "dominant": None, "hue_bucket": None, "dominance": 0.0}
+    buckets: dict[object, dict[str, Any]] = {}
+    total_weight = 0.0
+    for contributor in top:
+        oklch = _oklab_to_oklch(contributor["color"])
+        hue = ((oklch["h"] % (math.pi * 2)) + math.pi * 2) % (math.pi * 2)
+        bucket: object = "neutral" if oklch["C"] < 0.012 else math.floor((hue / (math.pi * 2)) * bucket_count)
+        entry = buckets.setdefault(bucket, {"weight": 0.0, "contributors": []})
+        entry["weight"] += contributor["weight"]
+        entry["contributors"].append(contributor)
+        total_weight += contributor["weight"]
+    winner_key, winner = max(buckets.items(), key=lambda item: item[1]["weight"])
+    selected = winner["contributors"] if winner.get("contributors") else top[:1]
+    accum = {"L": 0.0, "a": 0.0, "b": 0.0}
+    color_weight = 0.0
+    for contributor in selected:
+        _add_oklab(accum, contributor["color"], contributor["weight"])
+        color_weight += contributor["weight"]
+    return {
+        "color": _scale_oklab(accum, 1 / color_weight) if color_weight > 0 else top[0]["color"],
+        "dominant": top[0]["color"],
+        "hue_bucket": winner_key,
+        "dominance": (winner["weight"] if winner else top[0]["weight"]) / total_weight if total_weight > 0 else 1.0,
+    }
+
+
+def _compute_spatial_field(
+    nodes: list[dict[str, Any]],
+    smoothed_colors: dict[str, dict[str, float]],
+    width: int,
+    height: int,
+    bounds: dict[str, float],
+    sigma: float,
+    contributor_limit: int,
+    hue_bucket_count: int,
+) -> list[dict[str, Any]]:
+    cells: list[dict[str, Any]] = []
+    radius = sigma * 3
+    cell_size = max(64.0, radius / 2)
+    buckets = _build_background_buckets(nodes, cell_size)
+    world_width = bounds["max_x"] - bounds["min_x"]
+    world_height = bounds["max_y"] - bounds["min_y"]
+    for grid_y in range(height):
+        y = bounds["min_y"] + ((grid_y + 0.5) / height) * world_height
+        for grid_x in range(width):
+            x = bounds["min_x"] + ((grid_x + 0.5) / width) * world_width
+            contributors: list[dict[str, Any]] = []
+            density = 0.0
+            for node in _nearby_background_nodes(buckets, cell_size, x, y, radius):
+                dx = x - float(node["x"])
+                dy = y - float(node["y"])
+                distance_2 = dx * dx + dy * dy
+                if distance_2 > radius * radius:
+                    continue
+                spatial_weight = math.exp(-distance_2 / (2 * sigma * sigma))
+                popularity_value = node.get("popularity") or node.get("monthly_views_p30") or 1
+                try:
+                    popularity = float(popularity_value)
+                except (TypeError, ValueError):
+                    popularity = 1.0
+                popularity_weight = _clamp_float(math.sqrt(math.log10(max(0.0, popularity) + 10)), 0.65, 2.1)
+                raw_confidence = node.get("colorConfidence") if node.get("colorConfidence") is not None else node.get("color_confidence")
+                try:
+                    confidence = float(raw_confidence)
+                except (TypeError, ValueError):
+                    confidence = 1.0
+                confidence_weight = 0.42 if raw_confidence is None else _clamp_float(confidence, 0.25, 1.5)
+                local_weight = spatial_weight ** 1.18
+                weight = local_weight * popularity_weight * confidence_weight
+                color = smoothed_colors.get(str(node.get("id")))
+                if color is None:
+                    continue
+                contributors.append({"color": color, "weight": weight})
+                density += local_weight
+            predominant = _predominant_contributor_color(contributors, contributor_limit, hue_bucket_count)
+            cells.append({
+                "color": predominant["color"],
+                "dominant": predominant["dominant"],
+                "hue_bucket": predominant["hue_bucket"],
+                "dominance": predominant["dominance"],
+                "density": density,
+            })
+    return cells
+
+
+def _blend_spatial_fields(
+    large_cells: list[dict[str, Any]],
+    medium_cells: list[dict[str, Any]],
+    large_weight: float,
+    medium_weight: float,
+) -> list[dict[str, Any]]:
+    total_blend_weight = max(0.001, large_weight + medium_weight)
+    lw = large_weight / total_blend_weight
+    mw = medium_weight / total_blend_weight
+    cells: list[dict[str, Any]] = []
+    for large, medium in zip(large_cells, medium_cells, strict=False):
+        local_color = medium.get("color") or large.get("color")
+        broad_color = large.get("color") or local_color
+        color = None
+        if local_color:
+            color = {
+                "L": local_color["L"] + ((broad_color["L"] - local_color["L"]) * lw if broad_color else 0),
+                "a": local_color["a"] + ((broad_color["a"] - local_color["a"]) * lw * 0.9 if broad_color else 0),
+                "b": local_color["b"] + ((broad_color["b"] - local_color["b"]) * lw * 0.9 if broad_color else 0),
+            }
+        cells.append({
+            "color": color,
+            "hue_bucket": medium.get("hue_bucket", large.get("hue_bucket")),
+            "dominance": medium.get("dominance", large.get("dominance", 0.0)),
+            "density": (large.get("density") or 0.0) * lw + (medium.get("density") or 0.0) * mw,
+        })
+    return cells
+
+
+def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+    t = _clamp_float((value - edge0) / max(0.0001, edge1 - edge0), 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def _hue_bucket_blend_weight(left: object, right: object, bucket_count: int) -> float:
+    if left is None or right is None:
+        return 0.72
+    if left == "neutral" or right == "neutral":
+        return 1.0 if left == right else 0.56
+    try:
+        left_index = float(left)
+        right_index = float(right)
+    except (TypeError, ValueError):
+        return 0.72
+    delta = abs(left_index - right_index)
+    ring_delta = min(delta, bucket_count - delta)
+    if ring_delta <= 1:
+        return 1.0
+    if ring_delta <= 3:
+        return 0.86
+    if ring_delta <= 6:
+        return 0.64
+    return 0.48
+
+
+def _percentile(sorted_values: list[float], ratio: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = int(_clamp_float(round((len(sorted_values) - 1) * ratio), 0, len(sorted_values) - 1))
+    return sorted_values[index]
+
+
+def _mute_background_color(oklab: dict[str, float], options: dict[str, float]) -> dict[str, float]:
+    oklch = _oklab_to_oklch(oklab)
+    oklch["L"] = oklch["L"] + (options["dark_target_lightness"] - oklch["L"]) * 0.45
+    oklch["C"] = min(oklch["C"] * options["dark_chroma_scale"], options["dark_chroma_max"])
+    return _oklch_to_oklab(oklch)
+
+
+def _hash_noise_2d(ix: int, iy: int, seed: int) -> float:
+    value = ((ix * 374761393) & 0xFFFFFFFF) ^ ((iy * 668265263) & 0xFFFFFFFF) ^ ((seed * 1442695041) & 0xFFFFFFFF)
+    value = ((value ^ (value >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((value ^ (value >> 16)) & 0xFFFFFFFF) / 4294967295
+
+
+def _value_noise_2d(x: float, y: float, seed: int) -> float:
+    x0 = math.floor(x)
+    y0 = math.floor(y)
+    tx = x - x0
+    ty = y - y0
+    sx = tx * tx * (3 - 2 * tx)
+    sy = ty * ty * (3 - 2 * ty)
+    n00 = _hash_noise_2d(x0, y0, seed)
+    n10 = _hash_noise_2d(x0 + 1, y0, seed)
+    n01 = _hash_noise_2d(x0, y0 + 1, seed)
+    n11 = _hash_noise_2d(x0 + 1, y0 + 1, seed)
+    nx0 = n00 + (n10 - n00) * sx
+    nx1 = n01 + (n11 - n01) * sx
+    return (nx0 + (nx1 - nx0) * sy) * 2 - 1
+
+
+def _sample_background_field(
+    cells: list[dict[str, Any]],
+    width: int,
+    height: int,
+    x: float,
+    y: float,
+    options: dict[str, float],
+) -> dict[str, Any]:
+    clamped_x = _clamp_float(x, 0, width - 1)
+    clamped_y = _clamp_float(y, 0, height - 1)
+    x0 = math.floor(clamped_x)
+    y0 = math.floor(clamped_y)
+    x1 = min(width - 1, x0 + 1)
+    y1 = min(height - 1, y0 + 1)
+    tx = clamped_x - x0
+    ty = clamped_y - y0
+    samples = [
+        {"cell": cells[y0 * width + x0], "weight": (1 - tx) * (1 - ty)},
+        {"cell": cells[y0 * width + x1], "weight": tx * (1 - ty)},
+        {"cell": cells[y1 * width + x0], "weight": (1 - tx) * ty},
+        {"cell": cells[y1 * width + x1], "weight": tx * ty},
+    ]
+    anchor = None
+    best_color_score = 0.0
+    density = 0.0
+    for sample in samples:
+        cell = sample["cell"]
+        weight = sample["weight"]
+        density += (cell.get("density") or 0.0) * weight
+        if not cell.get("color") or weight <= 0:
+            continue
+        color_score = weight * (cell.get("density") or 0.0) * (0.35 + (cell.get("dominance") or 0.0))
+        if color_score > best_color_score:
+            best_color_score = color_score
+            anchor = cell
+    color = {"L": 0.0, "a": 0.0, "b": 0.0}
+    color_weight = 0.0
+    for sample in samples:
+        cell = sample["cell"]
+        weight = sample["weight"]
+        if not cell.get("color") or weight <= 0 or not anchor:
+            continue
+        hue_weight = _hue_bucket_blend_weight(cell.get("hue_bucket"), anchor.get("hue_bucket"), int(options["hue_bucket_count"]))
+        final_weight = weight * hue_weight * (0.45 + (cell.get("dominance") or 0.0))
+        _add_oklab(color, cell["color"], final_weight)
+        color_weight += final_weight
+    return {
+        "color": _scale_oklab(color, 1 / color_weight) if color_weight > 0 else (anchor or {}).get("color"),
+        "density": density,
+    }
+
+
+def _cloud_background_packet(
+    data: dict[str, Any],
+    *,
+    viewport_width: float | None = None,
+    viewport_height: float | None = None,
+) -> dict[str, Any] | None:
+    nodes = _cloud_background_nodes(data.get("nodes") or [])
+    if len(nodes) < 3:
+        return None
+    bounds = _cloud_background_bounds(data, nodes)
+    if bounds is None:
+        return None
+    options = dict(_CLOUD_BACKGROUND_OPTIONS)
+    field_width = max(32, round(_CLOUD_BACKGROUND_FIELD_WIDTH))
+    world_width = max(1.0, bounds["max_x"] - bounds["min_x"])
+    if viewport_width and viewport_height and viewport_width > 0 and viewport_height > 0:
+        field_aspect = _clamp_float(viewport_height / viewport_width, 0.2, 5.0)
+    else:
+        field_aspect = 0.62
+    field_height = max(24, round(field_width * field_aspect))
+    spatial_sigma_large = world_width * options["spatial_sigma_large_ratio"]
+    spatial_sigma_medium = world_width * options["spatial_sigma_medium_ratio"]
+    smoothed_colors = _compute_graph_smoothed_colors(nodes, options)
+    large_cells = _compute_spatial_field(
+        nodes,
+        smoothed_colors,
+        field_width,
+        field_height,
+        bounds,
+        spatial_sigma_large,
+        int(options["large_contributor_limit"]),
+        int(options["hue_bucket_count"]),
+    )
+    medium_cells = _compute_spatial_field(
+        nodes,
+        smoothed_colors,
+        field_width,
+        field_height,
+        bounds,
+        spatial_sigma_medium,
+        int(options["medium_contributor_limit"]),
+        int(options["hue_bucket_count"]),
+    )
+    cells = _blend_spatial_fields(
+        large_cells,
+        medium_cells,
+        options["large_field_weight"],
+        options["medium_field_weight"],
+    )
+    density_values = sorted(cell["density"] for cell in cells if cell.get("density", 0) > 0)
+    density_low = max(options["density_low"], _percentile(density_values, 0.42)) if density_values else options["density_low"]
+    density_high = max(density_low + 0.001, _percentile(density_values, 0.90)) if density_values else options["density_high"]
+    pixels = bytearray(field_width * field_height * 4)
+    for grid_y in range(field_height):
+        for grid_x in range(field_width):
+            noise_x = _value_noise_2d(grid_x * options["noise_scale"], grid_y * options["noise_scale"], int(options["noise_seed"]))
+            noise_y = _value_noise_2d(grid_x * options["noise_scale"], grid_y * options["noise_scale"], int(options["noise_seed"]) + 1)
+            sample = _sample_background_field(
+                cells,
+                field_width,
+                field_height,
+                grid_x + noise_x * options["warp_strength"],
+                grid_y + noise_y * options["warp_strength"],
+                options,
+            )
+            offset = (grid_y * field_width + grid_x) * 4
+            if not sample.get("color"):
+                continue
+            density_norm = _smoothstep(density_low, density_high, sample["density"]) ** 1.35
+            alpha = _clamp_float(options["dark_base_alpha"] * density_norm, 0.0, 0.16)
+            if alpha <= 0.002:
+                continue
+            muted = _mute_background_color(sample["color"], options)
+            rgb = _oklab_to_rgb(muted)
+            pixels[offset] = int(_clamp_float(rgb[0], 0, 255))
+            pixels[offset + 1] = int(_clamp_float(rgb[1], 0, 255))
+            pixels[offset + 2] = int(_clamp_float(rgb[2], 0, 255))
+            pixels[offset + 3] = round(alpha * 255)
+    return {
+        "version": "cloud-background-v1",
+        "encoding": "rgba-base64",
+        "postprocess": {"blurPx": 7, "overlayAlpha": 0.12},
+        "width": field_width,
+        "height": field_height,
+        "bounds": bounds,
+        "density": {"densityLow": density_low, "densityHigh": density_high},
+        "signature": _cloud_background_signature(nodes, bounds, "dark", field_width, field_height),
+        "rgba": base64.b64encode(pixels).decode("ascii"),
+    }
+
+
+def _cloud_static_slug(value: str) -> str:
+    slug = "".join(char if char.isalnum() else "-" for char in value.lower())
+    return "-".join(part for part in slug.split("-") if part) or "untitled"
+
+
+def _cloud_static_background_candidates(
+    *,
+    region_id: str,
+    viewport_width: float | None,
+    viewport_height: float | None,
+) -> list[Path]:
+    if not _CLOUD_STATIC_BACKGROUND_DIR.exists():
+        return []
+    width = round(viewport_width or 0)
+    height = round(viewport_height or 0)
+    if region_id:
+        region_slug = _cloud_static_slug(region_id)
+        exact = list(_CLOUD_STATIC_BACKGROUND_DIR.glob(f"*__{region_slug}__{width}x{height}.json"))
+        if exact:
+            return sorted(exact)
+        return sorted(_CLOUD_STATIC_BACKGROUND_DIR.glob(f"*__{region_slug}__*.json"))
+    exact_music = _CLOUD_STATIC_BACKGROUND_DIR / f"music__{width}x{height}.json"
+    if exact_music.exists():
+        return [exact_music]
+    return sorted(_CLOUD_STATIC_BACKGROUND_DIR.glob("music__*.json"))
+
+
+def _cloud_static_background_packet(
+    *,
+    context_signature: str,
+    viewport_width: float | None,
+    viewport_height: float | None,
+) -> dict[str, Any] | None:
+    if not context_signature:
+        return None
+    parts = context_signature.split("|")
+    if len(parts) < 5:
+        return None
+    root_genre_id, region_id = parts[0], parts[1]
+    if root_genre_id and not region_id:
+        return None
+    for path in _cloud_static_background_candidates(
+        region_id=region_id,
+        viewport_width=viewport_width,
+        viewport_height=viewport_height,
+    ):
+        try:
+            packet = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(packet, dict) or packet.get("encoding") != "rgba-base64":
+            continue
+        return {
+            **packet,
+            "context_signature": context_signature,
+            "static_source": {
+                "path": str(path),
+                "requested_width": round(viewport_width or 0),
+                "requested_height": round(viewport_height or 0),
+            },
+        }
+    return None
+
+
+def _cloud_background_packet_from_node(
+    data: dict[str, Any],
+    *,
+    viewport_width: float | None = None,
+    viewport_height: float | None = None,
+    context_signature: str | None = None,
+    timeout_seconds: float = 20,
+) -> dict[str, Any] | None:
+    if not _CLOUD_BACKGROUND_SCRIPT.exists():
+        return None
+    if context_signature and context_signature in _CLOUD_BACKGROUND_PACKET_CACHE:
+        return _CLOUD_BACKGROUND_PACKET_CACHE[context_signature]
+    if context_signature:
+        static_packet = _cloud_static_background_packet(
+            context_signature=context_signature,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
+        if static_packet:
+            _CLOUD_BACKGROUND_PACKET_CACHE[context_signature] = static_packet
+            return static_packet
+    payload = json.dumps(
+        {
+            "data": data,
+            "viewport_width": viewport_width,
+            "viewport_height": viewport_height,
+        },
+        separators=(",", ":"),
+    )
+    try:
+        result = subprocess.run(
+            ["node", str(_CLOUD_BACKGROUND_SCRIPT)],
+            input=payload,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        packet = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(packet, dict):
+        return None
+    if context_signature:
+        packet["context_signature"] = context_signature
+        _CLOUD_BACKGROUND_PACKET_CACHE[context_signature] = packet
+        while len(_CLOUD_BACKGROUND_PACKET_CACHE) > _CLOUD_BACKGROUND_PACKET_CACHE_LIMIT:
+            _CLOUD_BACKGROUND_PACKET_CACHE.pop(next(iter(_CLOUD_BACKGROUND_PACKET_CACHE)))
+    return packet
 
 
 def _cloud_snapshots(
@@ -1282,9 +2010,19 @@ async def stream_cloud_render(
     root_genre_id: str | None = Query(None),
     region_id: str | None = Query(None),
     selected_genre_id: str | None = Query(None),
+    width: float | None = Query(None, ge=1),
+    height: float | None = Query(None, ge=1),
     chunk_size: int = Query(120, ge=25, le=500),
 ) -> StreamingResponse:
     """Stream progressively denser cloud snapshots for the current viewport."""
+    background_context_signature = "|".join((
+        root_genre_id or "",
+        region_id or "",
+        str(round(width or 0)),
+        str(round(height or 0)),
+        "background",
+    ))
+
     async def generate() -> AsyncIterator[str]:
         yield _line({"type": "start", "mode": "cloud"})
         result = await get_genre_cloud(
@@ -1310,6 +2048,39 @@ async def stream_cloud_render(
                 "index": count,
                 "complete": bool(snapshot.get("stream", {}).get("complete")),
                 "data": snapshot,
+            })
+            count += 1
+        background_task = asyncio.create_task(
+            asyncio.to_thread(
+                _cloud_background_packet_from_node,
+                data,
+                viewport_width=width,
+                viewport_height=height,
+                context_signature=background_context_signature,
+            )
+        )
+        while not background_task.done():
+            yield _line({"type": "progress", "mode": "cloud", "phase": "background"})
+            await asyncio.sleep(2.0)
+        background = await background_task
+        if background is not None:
+            yield _line({
+                "type": "snapshot",
+                "mode": "cloud",
+                "index": count,
+                "complete": False,
+                "data": {
+                    **data,
+                    "nodes": [],
+                    "background": background,
+                    "stream": {
+                        "atlas": True,
+                        "atlas_version": "cloud-render-atlas-v2",
+                        "kind": "background",
+                        "layer": "background",
+                        "complete": False,
+                    },
+                },
             })
             count += 1
         yield _line({"type": "complete", "mode": "cloud", "snapshots": count})

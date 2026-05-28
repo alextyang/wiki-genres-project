@@ -63,7 +63,6 @@ REGION_PARENT_RELATIONS = (
     REGIONAL_SCENE_RELATION,
     "subclass_of",
 )
-PLAYABLE_PLAYLIST_TRACK_CONDITION = "is_embeddable IS DISTINCT FROM false"
 MUSIC_REGION_TITLE_RE = re.compile(r"\bmusic\s+(?:of|in)\b", re.IGNORECASE)
 
 WORLD_MAP_KEY = "world"
@@ -71,12 +70,6 @@ US_MAP_KEY = "us"
 SPECIAL_REGION_MAPS = {
     "region-united-states": US_MAP_KEY,
 }
-
-
-def _playable_playlist_track_condition(alias: str | None = None) -> str:
-    if alias:
-        return f"{alias}.{PLAYABLE_PLAYLIST_TRACK_CONDITION}"
-    return PLAYABLE_PLAYLIST_TRACK_CONDITION
 
 
 WORLD_FEATURE_ALIASES = {
@@ -1091,19 +1084,9 @@ async def _build_genre_detail(session, row) -> GenreDetail:
             await session.execute(
                 text(f"""
                     SELECT tracks.genre_id, tracks.ordinal, tracks.song_title, tracks.artist, tracks.youtube_url
-                    FROM wg_genre_youtube_playlist_tracks tracks
-                    LEFT JOIN wg_youtube_playback_error_stats errors
-                      ON errors.genre_id = tracks.genre_id
-                     AND errors.youtube_url = tracks.youtube_url
+                    FROM wg_genre_approved_client_playlist_tracks tracks
                     WHERE tracks.genre_id = :gid
-                      AND {_playable_playlist_track_condition("tracks")}
                     ORDER BY
-                        CASE
-                            WHEN tracks.is_embeddable IS true THEN 0
-                            WHEN tracks.is_embeddable IS NULL THEN 1
-                            ELSE 2
-                        END,
-                        coalesce(errors.error_count, 0),
                         tracks.ordinal,
                         tracks.artist,
                         tracks.song_title
@@ -2882,8 +2865,7 @@ async def _region_cloud_rows(session, *, region_id: str):
                     ),
                     playable AS (
                         SELECT genre_id, true AS has_playlist
-                        FROM wg_genre_youtube_playlist_tracks
-                        WHERE is_embeddable IS DISTINCT FROM false
+                        FROM wg_genre_approved_client_playlist_tracks
                         GROUP BY genre_id
                     ),
                     child_counts AS (
@@ -3023,8 +3005,7 @@ async def get_genre_cloud(
                         ),
                         playable AS (
                             SELECT genre_id, true AS has_playlist
-                            FROM wg_genre_youtube_playlist_tracks
-                            WHERE is_embeddable IS DISTINCT FROM false
+                            FROM wg_genre_approved_client_playlist_tracks
                             GROUP BY genre_id
                         ),
                         child_counts AS (
@@ -3335,19 +3316,9 @@ async def get_genre_playlist(genre_id: str) -> GenrePlaylistResult:
             await session.execute(
                 text(f"""
                     SELECT tracks.genre_id, tracks.ordinal, tracks.song_title, tracks.artist, tracks.youtube_url
-                    FROM wg_genre_youtube_playlist_tracks tracks
-                    LEFT JOIN wg_youtube_playback_error_stats errors
-                      ON errors.genre_id = tracks.genre_id
-                     AND errors.youtube_url = tracks.youtube_url
+                    FROM wg_genre_approved_client_playlist_tracks tracks
                     WHERE tracks.genre_id = :genre_id
-                      AND {_playable_playlist_track_condition("tracks")}
                     ORDER BY
-                        CASE
-                            WHEN tracks.is_embeddable IS true THEN 0
-                            WHEN tracks.is_embeddable IS NULL THEN 1
-                            ELSE 2
-                        END,
-                        coalesce(errors.error_count, 0),
                         tracks.ordinal,
                         tracks.artist,
                         tracks.song_title
@@ -3773,8 +3744,19 @@ async def get_genre_edges(
     genre_id: str,
     relation: str | None = Query(None, description="Filter by relation type."),
     direction: str = Query("out", pattern="^(out|in|both)$"),
+    projection: str = Query(
+        "detail",
+        pattern="^(detail|traversal|neighbor)$",
+        description="Relationship projection: stored detail, parent-to-child traversal, or undirected neighbor expansion.",
+    ),
 ) -> list[EdgeOut]:
     """Filtered edge list for a genre."""
+    edge_view = {
+        "detail": "wg_relationship_detail_edges",
+        "traversal": "wg_relationship_traversal_edges",
+        "neighbor": "wg_relationship_neighbor_edges",
+    }[projection]
+
     async with session_scope() as session:
         row = await _get_genre_row(session, genre_id)
         if row is None:
@@ -3818,7 +3800,7 @@ async def get_genre_edges(
                            to_layout.box_height AS to_box_height,
                            to_layout.box_pad_x AS to_box_pad_x,
                            to_layout.box_pad_y AS to_box_pad_y
-                    FROM wg_relationship_detail_edges e
+                    FROM {edge_view} e
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id
                     LEFT JOIN wg_genre_semantic_layouts to_layout
@@ -3856,7 +3838,7 @@ async def get_genre_edges(
                            to_layout.box_height AS to_box_height,
                            to_layout.box_pad_x AS to_box_pad_x,
                            to_layout.box_pad_y AS to_box_pad_y
-                    FROM wg_relationship_detail_edges e
+                    FROM {edge_view} e
                     JOIN wg_genres g ON g.id = e.from_genre_id
                     LEFT JOIN wg_genres to_g ON to_g.id = e.to_genre_id
                     LEFT JOIN wg_genre_colors to_c ON to_c.genre_id = e.to_genre_id

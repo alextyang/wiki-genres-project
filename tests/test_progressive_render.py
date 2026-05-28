@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from wiki_genres.api.routes.render import _cloud_snapshots, _filter_timeline_viewport, _timeline_snapshots
+from wiki_genres.api.routes.render import (
+    _cloud_background_packet,
+    _cloud_snapshots,
+    _filter_timeline_viewport,
+    _timeline_snapshots,
+)
 
 
 def test_cloud_snapshots_are_layered_and_prioritized() -> None:
@@ -145,6 +150,27 @@ def test_cloud_snapshots_keep_anchors_before_selected_relationship_tiers() -> No
         for node_id in tile["node_ids"]
     }
     assert first_layer_tile_ids == set(first_scale_snapshot["stream"]["add_node_ids"])
+
+
+def test_cloud_background_packet_contains_server_rgba_field() -> None:
+    data = {
+        "nodes": [
+            {"id": "a", "label": "A", "x": 0, "y": 0, "box_width": 40, "box_height": 20, "similarity_color": "#ff3355"},
+            {"id": "b", "label": "B", "x": 500, "y": 80, "box_width": 40, "box_height": 20, "similarity_color": "#33dd99"},
+            {"id": "c", "label": "C", "x": -350, "y": 240, "box_width": 40, "box_height": 20, "similarity_color": "#5588ff"},
+        ],
+        "stats": {"bounds": {"min_x": -400, "max_x": 540, "min_y": -30, "max_y": 280}},
+    }
+
+    packet = _cloud_background_packet(data)
+
+    assert packet is not None
+    assert packet["version"] == "cloud-background-v1"
+    assert packet["encoding"] == "rgba-base64"
+    assert packet["width"] == 420
+    assert packet["height"] >= 24
+    assert len(packet["rgba"]) > packet["width"] * packet["height"]
+    assert packet["bounds"]["min_x"] < -400
 
 
 def test_timeline_snapshots_include_only_edges_with_streamed_endpoints() -> None:

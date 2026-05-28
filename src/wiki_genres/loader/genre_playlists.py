@@ -14,6 +14,10 @@ from wiki_genres.db_migrations import apply_migrations
 
 PLAYLIST_CSV_FIELDS = ("genre_id", "song_title", "artist", "youtube_url", "ordinal")
 DEFAULT_PLAYLIST_DISCOVERY_GROUP = "manual"
+REMOVED_LEGACY_PLAYLIST_TABLE_MESSAGE = (
+    "The legacy flat playlist table was removed after archiving to the warehouse. "
+    "Import approved playlists through the normalized playlist warehouse pipeline."
+)
 
 
 @dataclass(frozen=True)
@@ -59,82 +63,7 @@ async def add_playlist_track(
     playlist_discovery_group: str = DEFAULT_PLAYLIST_DISCOVERY_GROUP,
 ) -> PlaylistTrack:
     """Add or replace one curated playlist track for a genre."""
-    await apply_migrations()
-    title = _require_text(song_title, "song title")
-    artist_name = _optional_text(artist)
-    url = validate_youtube_url(youtube_url)
-    group = _optional_text(playlist_discovery_group) or DEFAULT_PLAYLIST_DISCOVERY_GROUP
-
-    async with session_scope() as session:
-        genre_exists = await session.scalar(
-            text("""
-                SELECT 1
-                FROM wg_genres
-                WHERE id = :genre_id
-                  AND deleted_at IS NULL
-                  AND is_non_genre = false
-            """),
-            {"genre_id": genre_id},
-        )
-        if not genre_exists:
-            raise ValueError(f"Active genre not found: {genre_id}")
-
-        if ordinal is None:
-            next_ordinal = await session.scalar(
-                text("""
-                    SELECT coalesce(max(ordinal), -1) + 1
-                    FROM wg_genre_youtube_playlist_tracks
-                    WHERE genre_id = :genre_id
-                """),
-                {"genre_id": genre_id},
-            )
-            ordinal = int(next_ordinal or 0)
-        if ordinal < 0:
-            raise ValueError("ordinal must be non-negative")
-
-        await session.execute(
-            text("""
-                INSERT INTO wg_genre_youtube_playlist_tracks (
-                    genre_id,
-                    ordinal,
-                    song_title,
-                    artist,
-                    youtube_url,
-                    playlist_discovery_group
-                )
-                VALUES (
-                    :genre_id,
-                    :ordinal,
-                    :song_title,
-                    :artist,
-                    :youtube_url,
-                    :playlist_discovery_group
-                )
-                ON CONFLICT (genre_id, ordinal)
-                DO UPDATE SET
-                    song_title = excluded.song_title,
-                    artist = excluded.artist,
-                    youtube_url = excluded.youtube_url,
-                    playlist_discovery_group = excluded.playlist_discovery_group
-            """),
-            {
-                "genre_id": genre_id,
-                "ordinal": ordinal,
-                "song_title": title,
-                "artist": artist_name,
-                "youtube_url": url,
-                "playlist_discovery_group": group,
-            },
-        )
-
-    return PlaylistTrack(
-        genre_id=genre_id,
-        ordinal=ordinal,
-        song_title=title,
-        artist=artist_name,
-        youtube_url=url,
-        playlist_discovery_group=group,
-    )
+    raise RuntimeError(REMOVED_LEGACY_PLAYLIST_TABLE_MESSAGE)
 
 
 async def list_playlist_tracks(genre_id: str) -> list[PlaylistTrack]:
@@ -144,8 +73,8 @@ async def list_playlist_tracks(genre_id: str) -> list[PlaylistTrack]:
         rows = (
             await session.execute(
                 text("""
-                    SELECT genre_id, ordinal, song_title, artist, youtube_url, playlist_discovery_group
-                    FROM wg_genre_youtube_playlist_tracks
+                    SELECT genre_id, ordinal, song_title, artist, youtube_url
+                    FROM wg_genre_approved_client_playlist_tracks
                     WHERE genre_id = :genre_id
                     ORDER BY ordinal, artist, song_title
                 """),
@@ -160,7 +89,7 @@ async def list_playlist_tracks(genre_id: str) -> list[PlaylistTrack]:
                 song_title=str(row["song_title"]),
                 artist=str(row["artist"]),
                 youtube_url=str(row["youtube_url"]),
-                playlist_discovery_group=str(row["playlist_discovery_group"]),
+                playlist_discovery_group="approved",
             )
             for row in rows
         ]
@@ -168,82 +97,7 @@ async def list_playlist_tracks(genre_id: str) -> list[PlaylistTrack]:
 
 async def import_playlist_csv(path: Path, *, replace_genres: bool = False) -> PlaylistImportStats:
     """Import curated playlist rows from a local CSV file."""
-    await apply_migrations()
-    rows = _read_playlist_csv(path)
-    if not rows:
-        return PlaylistImportStats(rows_read=0, rows_written=0, genres_touched=0)
-
-    genres = {row.genre_id for row in rows}
-
-    async with session_scope() as session:
-        existing_genres = set(
-            (
-                await session.execute(
-                    text("""
-                        SELECT id
-                        FROM wg_genres
-                        WHERE id = ANY(:genre_ids)
-                          AND deleted_at IS NULL
-                          AND is_non_genre = false
-                    """),
-                    {"genre_ids": sorted(genres)},
-                )
-            ).scalars()
-        )
-        missing = sorted(genres - existing_genres)
-        if missing:
-            raise ValueError(f"Active genre not found: {', '.join(missing)}")
-
-        if replace_genres:
-            await session.execute(
-                text("""
-                    DELETE FROM wg_genre_youtube_playlist_tracks
-                    WHERE genre_id = ANY(:genre_ids)
-                """),
-                {"genre_ids": sorted(genres)},
-            )
-
-        for row in rows:
-            await session.execute(
-                text("""
-                    INSERT INTO wg_genre_youtube_playlist_tracks (
-                        genre_id,
-                        ordinal,
-                        song_title,
-                        artist,
-                        youtube_url,
-                        playlist_discovery_group
-                    )
-                    VALUES (
-                        :genre_id,
-                        :ordinal,
-                        :song_title,
-                        :artist,
-                        :youtube_url,
-                        :playlist_discovery_group
-                    )
-                    ON CONFLICT (genre_id, ordinal)
-                    DO UPDATE SET
-                        song_title = excluded.song_title,
-                        artist = excluded.artist,
-                        youtube_url = excluded.youtube_url,
-                        playlist_discovery_group = excluded.playlist_discovery_group
-                """),
-                {
-                    "genre_id": row.genre_id,
-                    "ordinal": row.ordinal,
-                    "song_title": row.song_title,
-                    "artist": row.artist,
-                    "youtube_url": row.youtube_url,
-                    "playlist_discovery_group": row.playlist_discovery_group,
-                },
-            )
-
-    return PlaylistImportStats(
-        rows_read=len(rows),
-        rows_written=len(rows),
-        genres_touched=len(genres),
-    )
+    raise RuntimeError(REMOVED_LEGACY_PLAYLIST_TABLE_MESSAGE)
 
 
 def _read_playlist_csv(path: Path) -> list[PlaylistTrack]:

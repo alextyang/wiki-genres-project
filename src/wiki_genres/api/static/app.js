@@ -38,10 +38,28 @@ const ROOT_TITLES = [
   "Latin music",
 ];
 
-const CHILD_RELATIONS = new Set(["subgenre", "derivative", "fusion_genre"]);
+const CHILD_RELATIONS = new Set([
+  "broader_genres",
+  "subgenres",
+  "source_genres",
+  "derived_genres",
+  "fusion_components",
+  "fusion_descendants",
+  "regional_variations",
+  "subgenre",
+  "derivative",
+  "fusion_genre",
+]);
 const RELATED_CHILD_RELATION = "related_genre";
 const ORIGIN_PARENT_RELATION = "origin_parent";
 const RELATION_RANK = new Map([
+  ["broader_genres", 0],
+  ["subgenres", 1],
+  ["derived_genres", 2],
+  ["fusion_descendants", 3],
+  ["regional_variations", 4],
+  ["source_genres", 5],
+  ["fusion_components", 6],
   ["subgenre", 0],
   ["derivative", 1],
   ["fusion_genre", 2],
@@ -130,6 +148,7 @@ const YOUTUBE_PLAYBACK_STORAGE_KEY = "wiki-genres:youtube-playback:v1";
 const YOUTUBE_AUTOPLAY_STORAGE_KEY = "wiki-genres:youtube-should-autoplay:v1";
 const YOUTUBE_LEGACY_AUTOPLAY_PAUSED_KEY = "wiki-genres:youtube-autoplay-paused:v1";
 const YOUTUBE_LEGACY_VOLUME_STORAGE_KEY = "wiki-genres:youtube-volume:v1";
+const YOUTUBE_VOLUME_PANEL_CLOSE_DELAY_MS = 280;
 const WORLD_ATLAS_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-50m.json";
 const US_ATLAS_URL = "https://cdn.jsdelivr.net/npm/us-atlas@3.0.1/states-10m.json";
 const MAP_VIEWBOX_DEFAULT = { x: 0, y: 0, w: 320, h: 174 };
@@ -388,9 +407,10 @@ const mapHighlightLayer = document.getElementById("map-highlight-layer");
 const mapHitLayer = document.getElementById("map-hit-layer");
 const mapPoints = document.getElementById("map-points");
 const footerDepth = document.getElementById("footer-depth");
+const footerZoomValue = document.getElementById("footer-zoom-value");
 const footerZoom = document.getElementById("footer-zoom");
 let footerZoomFill = document.getElementById("footer-zoom-fill");
-let footerZoomLabel = document.getElementById("footer-zoom-label");
+const footerReset = document.getElementById("footer-reset");
 const footerHint = document.getElementById("footer-hint");
 let footerZoomDragging = false;
 
@@ -477,7 +497,6 @@ let detailCardIdleTimer = 0;
 let detailCardHoverSwapActive = false;
 let detailCardContentSwapTimer = 0;
 let detailCardContentSwapToken = 0;
-let detailCardHeightResetTimer = 0;
 let detailCardTransitionClone = null;
 let detailCardTransitionCleanupTimer = 0;
 let hoverCardToken = 0;
@@ -529,6 +548,8 @@ let cloudHoveredNodeId = null;
 let cloudHoverCardDelayTimer = 0;
 let pendingCloudHoverCardKey = null;
 let cloudInitialRenderPending = false;
+let cloudInitialBackgroundContext = "";
+let cloudInitialBackgroundSettled = true;
 let cloudSelectedMarker = null;
 let cloudSelectedMarkerFrame = 0;
 let cloudClickEnabled = true;
@@ -710,7 +731,7 @@ const GRAPH_MAX_VIEW_SCALE = 1.0;
 const GRAPH_AUTO_MIN_VIEW_SCALE = 0.4;
 const GRAPH_AUTO_MAX_VIEW_SCALE = 0.7;
 const CLOUD_MAX_VIEW_SCALE = 1.1;
-const UI_HOVER_SELECTOR = "#nav-controls, #map-card, #right-panel, #timeline-panel, #mobile-panel-tabs, #detail-restore-button, #footer-zoom, #youtube-context-menu, .youtube-volume-panel, #feedback-modal";
+const UI_HOVER_SELECTOR = "#nav-controls, #map-card, #right-panel, #timeline-panel, #mobile-panel-tabs, #detail-restore-button, #footer-zoom, #footer-reset, #youtube-context-menu, .youtube-volume-panel, #feedback-modal";
 const UI_HOVER_RESTORE_HOLD_MS = 950;
 const DETAIL_CARD_RADIO_IDLE_MS = 45000;
 const DETAIL_HOVER_SWAP_DELAY_MS = 300;
@@ -721,8 +742,6 @@ const GRAPH_LABEL_Y = 0;
 const TIMELINE_LABEL_Y = 0;
 const UI_TOOLTIP_DELAY_MS = 360;
 const UI_TOOLTIP_GAP_PX = 8;
-const DETAIL_CARD_HEIGHT_STABILIZE_MS = 140;
-const DETAIL_CARD_HEIGHT_ANIMATION_MS = 190;
 const MAP_DEFERRED_UPDATE_DELAY_MS = 90;
 const MANUAL_UI_DIM_DRAG_DISTANCE_PX = 18;
 const MANUAL_UI_DIM_DRAG_TIME_MS = 220;
@@ -758,6 +777,7 @@ const CLOUD_SELECTED_LABEL_FADE_IN_MS = 220;
 const CLOUD_SELECTED_LABEL_FADE_OUT_MS = 170;
 const CLOUD_RELATIONSHIP_ALPHA_FADE_MS = 320;
 const CLOUD_RELATIONSHIP_ALPHA_FLOOR = 0.0275;
+const CLOUD_PENDING_RELATIONSHIP_DIM_MULTIPLIER = 0.58;
 const CLOUD_RELATIONSHIP_ALPHA_DISTANCE_STEPS = 4;
 const CLOUD_CATALOG_PREVIEW_NODE_LIMIT = 180;
 const CLOUD_LAYER_READY_EPSILON = 0.026;
@@ -799,7 +819,7 @@ function vw() { return svg.clientWidth || window.innerWidth; }
 function vh() { return svg.clientHeight || window.innerHeight; }
 function isCompact() { return vw() < 900; }
 function defaultScale() { return isCompact() ? 0.84 : 1; }
-function reservedRight() { return isCompact() ? 0 : 340; }
+function reservedRight() { return isCompact() ? 0 : 290; }
 function reservedBottom() { return isCompact() ? Math.min(280, Math.max(190, vh() * 0.34)) : 64; }
 function edgeBaseLength() { return isCompact() ? 155 : R; }
 function focusX() { return (vw() - reservedRight()) / 2; }
@@ -827,21 +847,11 @@ function ensureFooterZoomFill() {
     footerZoomFill = document.createElement("span");
     footerZoomFill.id = "footer-zoom-fill";
     footerZoomFill.className = "zoom-progress-fill";
-    footerZoomLabel = document.createElement("span");
-    footerZoomLabel.id = "footer-zoom-label";
-    footerZoomLabel.className = "zoom-progress-label";
     footerZoom.appendChild(footerZoomFill);
-    footerZoom.appendChild(footerZoomLabel);
     return footerZoomFill;
   }
-  if (!footerZoomLabel || footerZoomLabel.parentElement !== footerZoom) {
-    footerZoomLabel = document.createElement("span");
-    footerZoomLabel.id = "footer-zoom-label";
-    footerZoomLabel.className = "zoom-progress-label";
-    footerZoom.appendChild(footerZoomLabel);
-  }
   for (const child of Array.from(footerZoom.childNodes)) {
-    if (child !== footerZoomFill && child !== footerZoomLabel) child.remove();
+    if (child !== footerZoomFill) child.remove();
   }
   return footerZoomFill;
 }
@@ -853,7 +863,7 @@ function updateFooterZoom() {
   const progress = clamp((viewScale - minScale) / Math.max(0.0001, maxScale - minScale), 0, 1);
   footerZoom.style.setProperty("--zoom-progress", progress.toFixed(4));
   if (fill) fill.style.transform = `scaleX(${progress.toFixed(4)})`;
-  if (footerZoomLabel) footerZoomLabel.textContent = `Zoom ${Math.round(progress * 100)}%`;
+  if (footerZoomValue) footerZoomValue.textContent = `Zoom x${viewScale.toFixed(2)}`;
   footerZoom.setAttribute("role", "progressbar");
   footerZoom.setAttribute("aria-valuemin", "0");
   footerZoom.setAttribute("aria-valuemax", "100");
@@ -898,6 +908,43 @@ function setZoomFromFooterClientX(clientX) {
   const progress = footerZoomProgressFromClientX(clientX);
   if (progress == null) return;
   setZoomFromFooterProgress(progress);
+}
+
+function resetCameraToModeDefault() {
+  followMode = false;
+  stopPanInertia();
+  if (panAnimTimer) {
+    clearInterval(panAnimTimer);
+    panAnimTimer = null;
+  }
+  if (cloudMode) {
+    if (!cloudData) return;
+    markGraphMoving(420);
+    fitCloudView(cloudData, {
+      selectedGenreId: cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY
+        ? cloudSelectedGenreId
+        : null,
+    });
+    scheduleGraphStill(360);
+    return;
+  }
+  if (timelineMode) {
+    if (!timelineData) return;
+    markGraphMoving(420);
+    renderTimeline(timelineData, { preserveView: false, noFade: true });
+    scheduleGraphStill(360);
+    return;
+  }
+  const target = selectedCenterTargetPoint();
+  if (!target) return;
+  const targetScale = clampViewScale(graphAutoViewScale(defaultScale()));
+  tweenPanTo(
+    focusX() - target.x * targetScale,
+    focusY() - target.y * targetScale,
+    520,
+    null,
+    targetScale
+  );
 }
 
 function currentZoomProgress() {
@@ -1033,8 +1080,24 @@ function setCloudInitialLoading(isLoading) {
   }
 }
 
+function cloudInitialBackgroundReady() {
+  if (!cloudInitialBackgroundContext) return true;
+  if (cloudBackgroundCache?.contextSignature === cloudInitialBackgroundContext) return true;
+  return cloudInitialBackgroundSettled;
+}
+
+function cloudInitialSceneReady() {
+  return Boolean(
+    cloudMode &&
+    cloudScene &&
+    cloudActiveLayerCaughtUp(cloudScene) &&
+    cloudInitialBackgroundReady()
+  );
+}
+
 function finishCloudInitialLoadingAfterPaint() {
   if (!cloudInitialRenderPending) return;
+  if (!cloudInitialSceneReady()) return;
   requestAnimationFrame(() => {
     scheduleCloudCanvasRender();
     requestAnimationFrame(() => {
@@ -1076,15 +1139,49 @@ function updateLastPointerPosition(clientX, clientY) {
 function liveUiHoverRoot() {
   if (pointerDragActive()) return null;
   if (!Number.isFinite(lastPointerClientX) || !Number.isFinite(lastPointerClientY)) return null;
-  const hovered = document.elementFromPoint(lastPointerClientX, lastPointerClientY);
-  const root = hovered?.closest?.(UI_HOVER_SELECTOR) || null;
-  if (!root?.isConnected || root.hidden || root.getClientRects().length === 0) return null;
-  return root;
+  return uiHoverRootAtPoint(lastPointerClientX, lastPointerClientY);
+}
+
+function isVisibleUiHoverRoot(root) {
+  if (!root?.isConnected || root.hidden || root.getClientRects().length === 0) return false;
+  const style = window.getComputedStyle(root);
+  return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+}
+
+function uiHoverRootAtPoint(clientX, clientY) {
+  if (pointerDragActive()) return null;
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+  const roots = document.querySelectorAll(UI_HOVER_SELECTOR);
+  for (const root of roots) {
+    if (!isVisibleUiHoverRoot(root)) continue;
+    for (const rect of root.getClientRects()) {
+      if (
+        clientX >= rect.left &&
+        clientX <= rect.right &&
+        clientY >= rect.top &&
+        clientY <= rect.bottom
+      ) {
+        return root;
+      }
+    }
+  }
+  return null;
 }
 
 function isUiHoverTarget(target) {
   if (pointerDragActive()) return false;
   return target instanceof Element && Boolean(target.closest(UI_HOVER_SELECTOR));
+}
+
+function updateUiHoverFromPoint(clientX = lastPointerClientX, clientY = lastPointerClientY) {
+  const root = uiHoverRootAtPoint(clientX, clientY);
+  uiHovering = Boolean(root);
+  uiHoverRoots.clear();
+  if (root) {
+    uiHoverRoots.add(root);
+    triggerUiHoverRestoreHold();
+  }
+  return root;
 }
 
 function uiHoverActive() {
@@ -1122,9 +1219,10 @@ function manualUiDimActive() {
 }
 
 function updateManualUiDimClass() {
-  document.body.classList.toggle("ui-hover-restoring", uiHoverRestoring());
+  const hoverRestoring = uiHoverRestoring();
+  document.body.classList.toggle("ui-hover-restoring", hoverRestoring);
   const active = manualUiDimActive();
-  document.body.classList.toggle("ui-manual-moving", active);
+  document.body.classList.toggle("ui-manual-moving", active && !hoverRestoring);
   if (!active) {
     setDetailCardHoverSwapActive(false);
   }
@@ -1728,7 +1826,19 @@ function displayLabel(label) {
 }
 
 function relationSummary(relations) {
-  const counts = { subgenre: 0, derivative: 0, fusion_genre: 0, unresolved: 0 };
+  const counts = {
+    subgenre: 0,
+    derivative: 0,
+    fusion_genre: 0,
+    broader_genres: 0,
+    subgenres: 0,
+    source_genres: 0,
+    derived_genres: 0,
+    fusion_components: 0,
+    fusion_descendants: 0,
+    regional_variations: 0,
+    unresolved: 0,
+  };
   for (const child of relations) {
     const primary = child.relations?.[0] || child.relation;
     if (primary in counts) counts[primary] += 1;
@@ -1737,9 +1847,14 @@ function relationSummary(relations) {
   const parts = [];
   const total = relations.length;
   parts.push(`${total} ${total === 1 ? "child" : "children"}`);
-  if (counts.subgenre) parts.push(`${counts.subgenre} subgenre`);
-  if (counts.derivative) parts.push(`${counts.derivative} derivative`);
-  if (counts.fusion_genre) parts.push(`${counts.fusion_genre} fusion`);
+  const subgenreCount = counts.subgenre + counts.subgenres + counts.broader_genres;
+  const derivativeCount = counts.derivative + counts.derived_genres;
+  const fusionCount = counts.fusion_genre + counts.fusion_components + counts.fusion_descendants;
+  if (subgenreCount) parts.push(`${subgenreCount} subgenre`);
+  if (derivativeCount) parts.push(`${derivativeCount} derivative`);
+  if (fusionCount) parts.push(`${fusionCount} fusion`);
+  if (counts.source_genres) parts.push(`${counts.source_genres} origin`);
+  if (counts.regional_variations) parts.push(`${counts.regional_variations} regional`);
   if (counts.unresolved) parts.push(`${counts.unresolved} unresolved`);
   return parts.join(" · ");
 }
@@ -1759,10 +1874,17 @@ function relationLabel(relation) {
   const labels = {
     music_root: "Root genre from",
     subgenre: "Subgenre of",
+    subgenres: "Subgenre of",
+    broader_genres: "Subgenre of",
     derivative: "Derived from",
+    derived_genres: "Derived from",
     fusion_genre: "Fusion genre of",
+    fusion_components: "Fusion genre of",
+    fusion_descendants: "Fusion genre of",
+    source_genres: "Rooted in",
     origin_parent: "Stylistic origin of",
     regional_variant: "Regional variation of",
+    regional_variations: "Regional variation of",
   };
   return labels[relation] || "Related to";
 }
@@ -1815,16 +1937,15 @@ function cloudRelationLine(node) {
   const genreId = node.genreId || node.id;
   const contextId = cloudContextGenreId();
   if (!genreId || !contextId) return "";
+  if (genreId === contextId) return "Selected genre";
   const cloudNode = cloudNodeById.get(genreId) || cloudScene?.nodesById?.get(genreId) || null;
-  const rawDistance = genreId === contextId
-    ? 0
-    : Number.isFinite(Number(cloudNode?.selected_distance))
-      ? Number(cloudNode.selected_distance)
-      : Number.isFinite(Number(node.selected_distance))
-        ? Number(node.selected_distance)
-        : null;
+  const rawDistance = Number.isFinite(Number(cloudNode?.selected_distance))
+    ? Number(cloudNode.selected_distance)
+    : Number.isFinite(Number(node.selected_distance))
+      ? Number(node.selected_distance)
+      : null;
   if (rawDistance == null) return "";
-  const steps = Math.max(0, Math.round(rawDistance));
+  const steps = Math.max(1, Math.round(rawDistance));
   return `${steps} ${steps === 1 ? "step" : "steps"} from ${cloudContextLabel(contextId)}`;
 }
 
@@ -2145,7 +2266,10 @@ function closeYoutubeVolumePanel(event = null) {
   ) {
     return;
   }
-  setYoutubeVolumePanelOpen(false);
+  youtubeVolumePanelCloseTimer = window.setTimeout(() => {
+    youtubeVolumePanelCloseTimer = 0;
+    setYoutubeVolumePanelOpen(false);
+  }, prefersReducedMotion() ? 0 : YOUTUBE_VOLUME_PANEL_CLOSE_DELAY_MS);
 }
 
 function persistYoutubePlayback() {
@@ -3498,7 +3622,7 @@ function isRegionalMusicTitle(title) {
 }
 
 async function loadGenreChildren(genreId, parentNode = null) {
-  const rawEdges = await fetchJson(`/v1/genres/${encodeURIComponent(genreId)}/edges?direction=out`);
+  const rawEdges = await fetchJson(`/v1/genres/${encodeURIComponent(genreId)}/edges?direction=out&projection=traversal`);
   const grouped = new Map();
   const parentIsPromotedRegion = Boolean(parentNode?.regionId) || isRegionalMusicTitle(parentNode?.title);
 
@@ -3792,6 +3916,8 @@ function cloudAtlasParams() {
   const params = new URLSearchParams({
     limit: "5000",
     atlas: "true",
+    width: String(Math.max(1, Math.round(vw()))),
+    height: String(Math.max(1, Math.round(vh()))),
   });
   if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) params.set("selected_genre_id", cloudSelectedGenreId);
   if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
@@ -6667,6 +6793,27 @@ function renderMapContext(node, context, selectedNode = node, options = {}) {
   }
 }
 
+function mapContextAutoViewFeatureKeys(node, context, selectedNode = node) {
+  const allItems = context?.selectable_regions || context?.items || [];
+  const items = selectableMapItems(allItems);
+  const highlights = context?.context_highlights || [];
+  const selectedRegion = context?.selected_region || null;
+  const fitHighlights = inferredContextCountryFeatures(selectedNode);
+  const inferredHighlights = selectedRegion ? [selectedRegion] : highlights;
+  const selectableFeatures = mapItemFeatureKeys(items);
+  const highlightFeatures = [
+    ...fitHighlights,
+    ...mapItemFeatureKeys(inferredHighlights),
+  ];
+  return selectableFeatures.length ? selectableFeatures : highlightFeatures;
+}
+
+function mapContextHasResolvedAutoViewFeatures(node, context, selectedNode = node) {
+  return normalizeMapAutoViewFeatureKeys(
+    mapContextAutoViewFeatureKeys(node, context, selectedNode)
+  ).length > 0;
+}
+
 async function updateMapCard(node, options = {}) {
   if (!mapCard || !node) return;
   scheduledMapCardUpdateToken++;
@@ -6719,6 +6866,15 @@ async function updateMapCard(node, options = {}) {
       if (node?.genreId === mapNode.genreId) node.parentRelationshipRows = parentRows;
     }
     await ensureCountryMap(result.active_map || "world");
+    if (
+      token === mapToken &&
+      (result.active_map || "world") !== "world" &&
+      !result.is_world_override &&
+      !mapContextHasResolvedAutoViewFeatures(mapNode, result, node)
+    ) {
+      result = worldContextFromSubmap(result, node);
+      await ensureCountryMap("world");
+    }
     if (token !== mapToken) return;
     renderMapContext(mapNode, result, node, { autoView: options.autoView });
     if (showLoading) mapCard.classList.remove("map-card-loading");
@@ -10445,6 +10601,29 @@ function graphEdgeKey(edge) {
   return edge.key || `${edge.from}|${edge.to}`;
 }
 
+function edgeClassNames(edge, spine, activeTraceParents, traceAnchors) {
+  const target = nodes.get(edge.to);
+  const isTraceActive =
+    Boolean(edge.isTracePath || edge.isTraceLink) &&
+    hasCurrentTraceAnchor(edge) &&
+    (!edge.isTraceLink || traceAnchors.has(edge.to));
+  const isSpine =
+    isTraceActive ||
+    (spine.has(edge.from) && (spine.has(edge.to) || isBacktraceParentNode(target, spine, activeTraceParents)));
+  const isFaded = spine.has(edge.from) && edge.from !== currentKey && !spine.has(edge.to);
+  if (isSpine) edge.isTrimming = false;
+
+  const classes = ["edge"];
+  if (isSpine) classes.push("spine-edge");
+  if (isFaded) classes.push("faded");
+  if (!isSpine && (target?.isRevealed === false || edge.isRevealed === false)) classes.push("pending");
+  if (edge.isTrimming) classes.push("trimming");
+  if (Boolean(edge.isUnresolved)) classes.push("unresolved-edge");
+  if (edge.isTracePath || edge.isTraceLink) classes.push("trace-edge");
+  if (edge.isTraceLink) classes.push("trace-link");
+  return classes.join(" ");
+}
+
 function renderQuantum() {
   const dpr = Number(window.devicePixelRatio) || 1;
   return 1 / Math.max(1, dpr);
@@ -10974,27 +11153,10 @@ function fullRender() {
   const activeTraceParents = activeTraceParentKeys(spine);
   const traceAnchors = activeTraceAnchorKeys();
   for (const e of edges) {
-    const target = nodes.get(e.to);
-    const isTraceActive =
-      Boolean(e.isTracePath || e.isTraceLink) &&
-      hasCurrentTraceAnchor(e) &&
-      (!e.isTraceLink || traceAnchors.has(e.to));
-    const isSpine =
-      isTraceActive ||
-      (spine.has(e.from) && (spine.has(e.to) || isBacktraceParentNode(target, spine, activeTraceParents)));
-    const isFaded = spine.has(e.from) && e.from !== currentKey && !spine.has(e.to);
-    if (isSpine) e.isTrimming = false;
-    const classes = ["edge"];
-    if (isSpine) classes.push("spine-edge");
-    if (isFaded) classes.push("faded");
-    if (!isSpine && (target?.isRevealed === false || e.isRevealed === false)) classes.push("pending");
-    if (e.isTrimming) classes.push("trimming");
-    if (Boolean(e.isUnresolved)) classes.push("unresolved-edge");
-    if (e.isTracePath || e.isTraceLink) classes.push("trace-edge");
-    if (e.isTraceLink) classes.push("trace-link");
-    const line = svgEl("line", { class: classes.join(" ") });
+    const edgeKey = graphEdgeKey(e);
+    const line = svgEl("line", { class: edgeClassNames(e, spine, activeTraceParents, traceAnchors) });
     edgesG.appendChild(line);
-    edgeEls.set(graphEdgeKey(e), line);
+    edgeEls.set(edgeKey, line);
   }
   syncEdgeGradients(spine, activeTraceParents);
 
@@ -12101,6 +12263,28 @@ function cloudAtlasSignature() {
   ].join("|");
 }
 
+function cloudAtlasSelectedGenreId(signature = cloudScene?.atlasSignature || "") {
+  const selectedId = String(signature || "").split("|")[2] || "";
+  return selectedId || null;
+}
+
+function cloudBackgroundContextSignature() {
+  return [
+    cloudRootGenreId || "",
+    cloudRegionId || "",
+    Math.max(1, Math.round(vw())),
+    Math.max(1, Math.round(vh())),
+    "background",
+  ].join("|");
+}
+
+function clearCloudBackgroundCache() {
+  cloudBackgroundCache = null;
+  cloudBackgroundBuildSignature = "";
+  window.clearTimeout(cloudBackgroundBuildTimer);
+  cloudBackgroundBuildTimer = 0;
+}
+
 function prepareCloudSceneForReload(options = {}) {
   const atlasSignature = options.atlasSignature || cloudAtlasSignature();
   if (!options.preserveView || !cloudScene?.nodesById?.size) {
@@ -12123,8 +12307,13 @@ function prepareCloudSceneForReload(options = {}) {
 function resetCloudScaleLayersForSignature(atlasSignature = cloudAtlasSignature()) {
   if (!cloudScene) return;
   if (cloudScene.atlasSignature === atlasSignature && !cloudScene.pendingAtlasSignature) return;
+  const backgroundContext = cloudBackgroundContextSignature();
   cloudScene.pendingAtlasSignature = atlasSignature;
+  cloudScene.awaitingScaleLayer = true;
   cloudScene.complete = false;
+  if (cloudBackgroundCache?.contextSignature && cloudBackgroundCache.contextSignature !== backgroundContext) {
+    clearCloudBackgroundCache();
+  }
 }
 
 function activateCloudScaleLayersForSignature(atlasSignature = cloudAtlasSignature()) {
@@ -12138,7 +12327,7 @@ function activateCloudScaleLayersForSignature(atlasSignature = cloudAtlasSignatu
   cloudScene.loadedLayers = new Set();
   cloudScene.atlasSignature = atlasSignature;
   cloudScene.pendingAtlasSignature = "";
-  cloudScene.awaitingScaleLayer = false;
+  cloudScene.awaitingScaleLayer = true;
   cloudRenderedLayerScale = null;
   cloudRenderedWindowSignature = "";
 }
@@ -12165,10 +12354,7 @@ function resetCloudScene(stats = {}) {
 			    cloudHoverUnderlineAlphaById = new Map();
 			    cloudRelationshipAlphaById = new Map();
   cancelCloudFadeFrame();
-  cloudBackgroundCache = null;
-  cloudBackgroundBuildSignature = "";
-  window.clearTimeout(cloudBackgroundBuildTimer);
-  cloudBackgroundBuildTimer = 0;
+  clearCloudBackgroundCache();
   cloudLabelSpriteCache = new Map();
   cloudHoveredNodeId = null;
   cloudSelectedMarker = null;
@@ -12461,6 +12647,7 @@ function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
   const packetCandidateIds = cloudTilePacketCandidateIds(scene, activeScale);
   if (!packetCandidateIds) return null;
   const layerIds = cloudActiveLayerIds(scene, activeScale);
+  const lodSelectedGenreId = cloudLodSelectedGenreId();
   const nextNodeIds = new Set();
   let hiddenForViewport = 0;
   let missingCandidates = 0;
@@ -12476,8 +12663,8 @@ function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
     }
     nextNodeIds.add(node.id);
   }
-  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
-    nextNodeIds.add(cloudSelectedGenreId);
+  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
+    nextNodeIds.add(lodSelectedGenreId);
   } else {
     nextNodeIds.add(ROOT_KEY);
   }
@@ -12495,11 +12682,12 @@ function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
 function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
   const packetTarget = cloudPacketLodTarget(scene, activeScale);
   if (packetTarget) return packetTarget;
+  const lodSelectedGenreId = cloudLodSelectedGenreId();
   const layerIds = cloudActiveLayerIds(scene, activeScale);
   const candidateIds = cloudViewportCandidateIds(scene, activeScale);
   candidateIds.add(ROOT_KEY);
-  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
-    candidateIds.add(cloudSelectedGenreId);
+  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
+    candidateIds.add(lodSelectedGenreId);
   }
 
   const orderedIds = [];
@@ -12509,8 +12697,8 @@ function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
     queuedIds.add(nodeId);
     orderedIds.push(nodeId);
   };
-  if (cloudSelectedGenreId && scene?.nodesById?.has(cloudSelectedGenreId)) {
-    addOrderedId(cloudSelectedGenreId);
+  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
+    addOrderedId(lodSelectedGenreId);
   }
   addOrderedId(ROOT_KEY);
   for (const nodeId of layerIds) {
@@ -12533,7 +12721,7 @@ function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
       hiddenForViewport += 1;
       continue;
     }
-    const forceVisible = node.id === cloudSelectedGenreId || (node.id === ROOT_KEY && !cloudSelectedGenreId);
+    const forceVisible = node.id === lodSelectedGenreId || (node.id === ROOT_KEY && !lodSelectedGenreId);
     const rect = cloudNodeLodScreenRect(node);
     if (!forceVisible && cloudRectOverlapsOccupied(rect, occupiedBuckets)) {
       hiddenForOverlap += 1;
@@ -13049,56 +13237,80 @@ function generateGenreBackgroundField(nodes, canvasWidth, canvasHeight, options 
   return canvas;
 }
 
-function ensureCloudBackgroundField(width, height, options = {}) {
-  if (!cloudMode || !cloudScene?.nodesById?.size) return null;
-  const nodes = cloudBackgroundNodes(Array.from(cloudScene.nodesById.values()));
-  if (nodes.length < 3) return null;
-  const totalNodes = Number(cloudScene.stats?.total_nodes || nodes.length);
-  const warmupNodeCount = Math.min(260, Math.max(3, Math.floor(totalNodes * 0.16)));
-  if (!cloudScene.complete && nodes.length < warmupNodeCount) return cloudBackgroundCache;
-  if (!cloudScene.complete && cloudBackgroundCache?.createdAt && Date.now() - cloudBackgroundCache.createdAt < 900) {
-    return cloudBackgroundCache;
+function applyCloudBackgroundPacket(packet) {
+  if (!packet || packet.encoding !== "rgba-base64" || !packet.rgba) return false;
+  const width = Math.max(1, Math.round(Number(packet.width) || 0));
+  const height = Math.max(1, Math.round(Number(packet.height) || 0));
+  const boundsPayload = packet.bounds || {};
+  const bounds = {
+    minX: Number(boundsPayload.minX ?? boundsPayload.min_x),
+    maxX: Number(boundsPayload.maxX ?? boundsPayload.max_x),
+    minY: Number(boundsPayload.minY ?? boundsPayload.min_y),
+    maxY: Number(boundsPayload.maxY ?? boundsPayload.max_y),
+  };
+  if (
+    ![bounds.minX, bounds.maxX, bounds.minY, bounds.maxY].every(Number.isFinite) ||
+    bounds.minX === bounds.maxX ||
+    bounds.minY === bounds.maxY
+  ) {
+    return false;
   }
-  const bounds = cloudBackgroundBounds(nodes);
-  if (!bounds) return null;
-  const theme = cloudBackgroundTheme();
-  const signature = cloudBackgroundSignature(nodes, bounds, theme, width, height);
-  if (cloudBackgroundCache?.signature === signature) return cloudBackgroundCache;
-  if (!options.allowBuild) {
-    scheduleCloudBackgroundBuild(width, height, signature);
-    return cloudBackgroundCache;
+  let binary = "";
+  try {
+    binary = atob(packet.rgba);
+  } catch {
+    return false;
   }
-  const canvas = generateGenreBackgroundField(nodes, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, {
-    ...CLOUD_BACKGROUND_OPTIONS,
+  const expectedLength = width * height * 4;
+  if (binary.length !== expectedLength) return false;
+  const pixels = new Uint8ClampedArray(expectedLength);
+  for (let index = 0; index < expectedLength; index += 1) {
+    pixels[index] = binary.charCodeAt(index);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return false;
+  ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  const processedCanvas = document.createElement("canvas");
+  processedCanvas.width = width;
+  processedCanvas.height = height;
+  const processedCtx = processedCanvas.getContext("2d");
+  if (!processedCtx) return false;
+  const blurPx = Math.max(0, Number(packet.postprocess?.blurPx) || 0);
+  const overlayAlpha = clamp(Number(packet.postprocess?.overlayAlpha ?? 0), 0, 1);
+  processedCtx.globalAlpha = 1;
+  processedCtx.filter = blurPx > 0 ? `blur(${blurPx}px)` : "none";
+  processedCtx.drawImage(canvas, 0, 0);
+  processedCtx.filter = "none";
+  if (overlayAlpha > 0) {
+    processedCtx.globalAlpha = overlayAlpha;
+    processedCtx.drawImage(canvas, 0, 0);
+  }
+  processedCtx.globalAlpha = 1;
+  cloudBackgroundCache = {
+    signature: packet.signature || `server:${width}x${height}`,
+    contextSignature: packet.context_signature || cloudBackgroundContextSignature(),
+    canvas: processedCanvas,
     bounds,
-    theme,
-  });
-  cloudBackgroundCache = canvas ? {
-    signature,
-    canvas,
-    bounds,
-    theme,
-    density: canvas.__genreBackgroundDensity || null,
+    theme: "dark",
+    density: packet.density || null,
     createdAt: Date.now(),
-  } : null;
+    source: "server",
+  };
+  cloudBackgroundBuildSignature = "";
+  window.clearTimeout(cloudBackgroundBuildTimer);
+  cloudBackgroundBuildTimer = 0;
+  return true;
+}
+
+function ensureCloudBackgroundField(width, height, options = {}) {
   return cloudBackgroundCache;
 }
 
 function scheduleCloudBackgroundBuild(width, height, signature = "") {
-  if (!cloudMode || cloudBackgroundBuildSignature === signature) return;
-  cloudBackgroundBuildSignature = signature;
-  window.clearTimeout(cloudBackgroundBuildTimer);
-  cloudBackgroundBuildTimer = window.setTimeout(() => {
-    cloudBackgroundBuildTimer = 0;
-    if (!cloudMode) return;
-    if (cloudFadeFrame || cloudCanvasFrame || cloudRenderFrame) {
-      cloudBackgroundBuildSignature = "";
-      scheduleCloudBackgroundBuild(width, height, signature);
-      return;
-    }
-    ensureCloudBackgroundField(width, height, { allowBuild: true });
-    scheduleCloudCanvasRender();
-  }, cloudScene?.complete ? 70 : 140);
+  return;
 }
 
 function cloudBackgroundZoomOpacity() {
@@ -13163,9 +13375,16 @@ function cloudNodeRelationshipTargetAlpha(node) {
 
 function cloudRelationshipSelectedGenreId() {
   if (cloudRelationshipSwitchPending()) {
-    return cloudScene?.stats?.selected_genre_id || null;
+    return cloudAtlasSelectedGenreId(cloudScene?.atlasSignature);
   }
   return cloudScene?.stats?.selected_genre_id || cloudSelectedGenreId || null;
+}
+
+function cloudLodSelectedGenreId() {
+  if (cloudRelationshipSwitchPending()) {
+    return cloudAtlasSelectedGenreId(cloudScene?.atlasSignature);
+  }
+  return cloudSelectedGenreId || null;
 }
 
 function cloudRelationshipSwitchPending() {
@@ -13557,7 +13776,6 @@ function updateCloudCanvasFadeTargets(nodes, options = {}) {
   cloudCanvasVisibleIds = targetIds;
   applyCloudPresentationTargets(nodes, {
     noFade,
-    hydrateNew: Boolean(options.hydrateNew),
     now,
     signature,
   });
@@ -13569,8 +13787,20 @@ function cloudPresentationSelectedTarget(nodeId) {
 
 function cloudPresentationRecordEntry(record) {
   if (!record?.node) return null;
+  const currentX = Number.isFinite(Number(record.currentX)) ? Number(record.currentX) : Number(record.node.x);
+  const currentY = Number.isFinite(Number(record.currentY)) ? Number(record.currentY) : Number(record.node.y);
+  const node = (
+    Number.isFinite(currentX) &&
+    Number.isFinite(currentY) &&
+    (
+      Math.abs(currentX - Number(record.node.x || 0)) > 0.001 ||
+      Math.abs(currentY - Number(record.node.y || 0)) > 0.001
+    )
+  )
+    ? { ...record.node, x: currentX, y: currentY }
+    : record.node;
   return {
-    node: record.node,
+    node,
     alpha: clamp(Number(record.alpha) || 0, 0, 1),
     relationshipAlpha: clamp(Number(record.relationshipAlpha ?? cloudNodeRelationshipTargetAlpha(record.node)), 0, 1),
     selectedAlpha: clamp(Number(record.selectedAlpha) || 0, 0, 1),
@@ -13587,6 +13817,14 @@ function cloudPresentationMaxDelta() {
       Math.abs(Number(record.alpha || 0) - Number(record.targetAlpha || 0)),
       Math.abs(Number(record.selectedAlpha || 0) - Number(record.targetSelectedAlpha || 0)),
       Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)),
+      clamp(
+        Math.hypot(
+          Number(record.currentX || 0) - Number(record.targetX ?? record.currentX ?? 0),
+          Number(record.currentY || 0) - Number(record.targetY ?? record.currentY ?? 0),
+        ) * Math.max(0.001, viewScale) / 140,
+        0,
+        1,
+      ),
     );
   }
   return maxDelta;
@@ -13596,12 +13834,70 @@ function cloudPresentationAnimating() {
   return cloudPresentationMaxDelta() > CLOUD_PRESENTATION_EPSILON;
 }
 
+function cloudPendingRelationshipTargetAlpha(nodeId, node) {
+  if (nodeId === String(cloudSelectedGenreId || "")) return 1;
+  const currentTarget = cloudNodeRelationshipTargetAlpha(node);
+  const activeRelationshipId = cloudRelationshipSelectedGenreId();
+  if (!activeRelationshipId || activeRelationshipId === ROOT_KEY) return currentTarget;
+  return clamp(
+    currentTarget * CLOUD_PENDING_RELATIONSHIP_DIM_MULTIPLIER,
+    CLOUD_RELATIONSHIP_ALPHA_FLOOR,
+    1,
+  );
+}
+
+function updateCloudSelectedPresentationOnly(genreId = cloudSelectedGenreId, options = {}) {
+  const selectedId = String(genreId || "");
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : performance.now();
+  const dimCurrentNodes = Boolean(selectedId && (options.dimCurrentNodes || cloudRelationshipSwitchPending()));
+  if (cloudPresentationById.size) stepCloudPresentation(now);
+  if (!cloudPresentationLastAt) cloudPresentationLastAt = now;
+  let needsFrame = false;
+  const ensureSelectedRecord = selectedId ? cloudScene?.nodesById?.get(selectedId) : null;
+  if (ensureSelectedRecord && !cloudPresentationById.has(selectedId)) {
+    cloudPresentationById.set(selectedId, {
+      node: ensureSelectedRecord,
+      alpha: 1,
+      targetAlpha: 1,
+      selectedAlpha: 0,
+      targetSelectedAlpha: 1,
+      relationshipAlpha: cloudNodeRelationshipTargetAlpha(ensureSelectedRecord),
+      targetRelationshipAlpha: cloudNodeRelationshipTargetAlpha(ensureSelectedRecord),
+      currentX: Number(ensureSelectedRecord.x) || 0,
+      currentY: Number(ensureSelectedRecord.y) || 0,
+      fromX: Number(ensureSelectedRecord.x) || 0,
+      fromY: Number(ensureSelectedRecord.y) || 0,
+      targetX: Number(ensureSelectedRecord.x) || 0,
+      targetY: Number(ensureSelectedRecord.y) || 0,
+      positionStartedAt: now,
+      fadeInMs: CLOUD_CANVAS_FADE_IN_MS,
+      fadeOutMs: CLOUD_CANVAS_FADE_OUT_MS,
+      active: true,
+    });
+    needsFrame = true;
+  }
+  for (const [nodeId, record] of cloudPresentationById.entries()) {
+    record.targetSelectedAlpha = nodeId === selectedId ? 1 : 0;
+    record.targetRelationshipAlpha = dimCurrentNodes
+      ? cloudPendingRelationshipTargetAlpha(nodeId, record.node)
+      : cloudNodeRelationshipTargetAlpha(record.node);
+    if (
+      Math.abs(Number(record.selectedAlpha || 0) - Number(record.targetSelectedAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
+      Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)) > CLOUD_PRESENTATION_EPSILON
+    ) {
+      needsFrame = true;
+    }
+  }
+  if (needsFrame && !prefersReducedMotion()) scheduleCloudFade();
+  scheduleCloudCanvasRender();
+}
+
 function applyCloudPresentationTargets(nodes, options = {}) {
   const now = Number(options.now) || performance.now();
   const noFade = Boolean(options.noFade);
-  const hydrateNew = Boolean(options.hydrateNew);
   const targetIds = new Set();
   let needsFrame = false;
+  if (cloudPresentationById.size) stepCloudPresentation(now);
   if (!cloudPresentationLastAt) cloudPresentationLastAt = now;
 
   for (const node of nodes || []) {
@@ -13609,10 +13905,12 @@ function applyCloudPresentationTargets(nodes, options = {}) {
     const nodeId = String(node.id);
     targetIds.add(nodeId);
     const targetSelectedAlpha = cloudPresentationSelectedTarget(nodeId);
-    const targetRelationshipAlpha = cloudNodeRelationshipTargetAlpha(node);
+    const targetX = Number(node.x) || 0;
+    const targetY = Number(node.y) || 0;
     let record = cloudPresentationById.get(nodeId);
+    const targetRelationshipAlpha = cloudNodeRelationshipTargetAlpha(node);
     if (!record) {
-      const initialAlpha = noFade || hydrateNew ? 1 : 0;
+      const initialAlpha = noFade ? 1 : 0;
       record = {
         node,
         alpha: initialAlpha,
@@ -13621,6 +13919,13 @@ function applyCloudPresentationTargets(nodes, options = {}) {
         targetSelectedAlpha,
         relationshipAlpha: noFade ? targetRelationshipAlpha : targetRelationshipAlpha,
         targetRelationshipAlpha,
+        currentX: targetX,
+        currentY: targetY,
+        fromX: targetX,
+        fromY: targetY,
+        targetX,
+        targetY,
+        positionStartedAt: now,
         fadeInMs: CLOUD_CANVAS_FADE_IN_MS,
         fadeOutMs: CLOUD_CANVAS_FADE_OUT_MS,
         active: true,
@@ -13629,22 +13934,45 @@ function applyCloudPresentationTargets(nodes, options = {}) {
       if (!noFade) needsFrame = true;
       continue;
     }
+    const currentX = Number.isFinite(Number(record.currentX)) ? Number(record.currentX) : Number(record.node?.x ?? targetX);
+    const currentY = Number.isFinite(Number(record.currentY)) ? Number(record.currentY) : Number(record.node?.y ?? targetY);
+    const positionChanged =
+      Math.abs(Number(record.targetX ?? currentX) - targetX) > 0.001 ||
+      Math.abs(Number(record.targetY ?? currentY) - targetY) > 0.001;
+    if (positionChanged) {
+      record.currentX = currentX;
+      record.currentY = currentY;
+      record.fromX = currentX;
+      record.fromY = currentY;
+      record.positionStartedAt = now;
+    }
     record.node = node;
     record.active = true;
     record.targetAlpha = 1;
     record.targetSelectedAlpha = targetSelectedAlpha;
     record.targetRelationshipAlpha = targetRelationshipAlpha;
+    record.targetX = targetX;
+    record.targetY = targetY;
     record.fadeInMs = CLOUD_CANVAS_FADE_IN_MS;
     record.fadeOutMs = CLOUD_CANVAS_FADE_OUT_MS;
     if (noFade) {
       record.alpha = record.targetAlpha;
       record.selectedAlpha = record.targetSelectedAlpha;
       record.relationshipAlpha = record.targetRelationshipAlpha;
+      record.currentX = record.targetX;
+      record.currentY = record.targetY;
+      record.fromX = record.targetX;
+      record.fromY = record.targetY;
+      record.positionStartedAt = now;
     }
     if (
       Math.abs(Number(record.alpha || 0) - record.targetAlpha) > CLOUD_PRESENTATION_EPSILON ||
       Math.abs(Number(record.selectedAlpha || 0) - record.targetSelectedAlpha) > CLOUD_PRESENTATION_EPSILON ||
-      Math.abs(Number(record.relationshipAlpha || 0) - record.targetRelationshipAlpha) > CLOUD_PRESENTATION_EPSILON
+      Math.abs(Number(record.relationshipAlpha || 0) - record.targetRelationshipAlpha) > CLOUD_PRESENTATION_EPSILON ||
+      Math.hypot(
+        Number(record.currentX || 0) - Number(record.targetX ?? record.currentX ?? 0),
+        Number(record.currentY || 0) - Number(record.targetY ?? record.currentY ?? 0),
+      ) * Math.max(0.001, viewScale) > 0.15
     ) {
       needsFrame = true;
     }
@@ -13656,6 +13984,8 @@ function applyCloudPresentationTargets(nodes, options = {}) {
     record.targetAlpha = 0;
     record.targetSelectedAlpha = 0;
     record.targetRelationshipAlpha = Number(record.relationshipAlpha ?? record.targetRelationshipAlpha ?? 1);
+    record.targetX = Number.isFinite(Number(record.currentX)) ? Number(record.currentX) : Number(record.node?.x || 0);
+    record.targetY = Number.isFinite(Number(record.currentY)) ? Number(record.currentY) : Number(record.node?.y || 0);
     record.fadeOutMs = CLOUD_CANVAS_FADE_OUT_MS;
     if (noFade) {
       cloudPresentationById.delete(nodeId);
@@ -13685,6 +14015,15 @@ function cloudPresentationApproach(current, target, maxStep) {
   return value + Math.sign(delta) * Math.min(Math.abs(delta), maxStep);
 }
 
+function cloudPresentationPositionValue(from, target, startedAt, now) {
+  const start = Number(from) || 0;
+  const next = Number(target) || 0;
+  const elapsed = Math.max(0, Number(now) - Number(startedAt || now));
+  const progress = clamp(elapsed / Math.max(1, CLOUD_CANVAS_TRANSITION_MS), 0, 1);
+  const eased = easeInOutCubic(progress);
+  return start + (next - start) * eased;
+}
+
 function stepCloudPresentation(now = performance.now()) {
   if (!cloudPresentationById.size) {
     cloudPresentationLastAt = now;
@@ -13704,10 +14043,34 @@ function stepCloudPresentation(now = performance.now()) {
     record.alpha = cloudPresentationApproach(record.alpha, record.targetAlpha, alphaStep);
     record.selectedAlpha = cloudPresentationApproach(record.selectedAlpha, record.targetSelectedAlpha, selectedStep);
     record.relationshipAlpha = cloudPresentationApproach(record.relationshipAlpha, record.targetRelationshipAlpha, relationshipStep);
+    record.currentX = cloudPresentationPositionValue(
+      record.fromX ?? record.currentX ?? record.node?.x,
+      record.targetX ?? record.node?.x,
+      record.positionStartedAt,
+      now,
+    );
+    record.currentY = cloudPresentationPositionValue(
+      record.fromY ?? record.currentY ?? record.node?.y,
+      record.targetY ?? record.node?.y,
+      record.positionStartedAt,
+      now,
+    );
+    const positionAnimating = Math.hypot(
+      Number(record.currentX || 0) - Number(record.targetX ?? record.currentX ?? 0),
+      Number(record.currentY || 0) - Number(record.targetY ?? record.currentY ?? 0),
+    ) * Math.max(0.001, viewScale) > 0.15;
+    if (!positionAnimating) {
+      record.currentX = Number(record.targetX ?? record.currentX ?? 0);
+      record.currentY = Number(record.targetY ?? record.currentY ?? 0);
+      record.fromX = record.currentX;
+      record.fromY = record.currentY;
+      record.positionStartedAt = now;
+    }
     const isAnimating =
       Math.abs(Number(record.alpha || 0) - Number(record.targetAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
       Math.abs(Number(record.selectedAlpha || 0) - Number(record.targetSelectedAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
-      Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)) > CLOUD_PRESENTATION_EPSILON;
+      Math.abs(Number(record.relationshipAlpha || 0) - Number(record.targetRelationshipAlpha || 0)) > CLOUD_PRESENTATION_EPSILON ||
+      positionAnimating;
     active = active || isAnimating;
     if (
       !record.active &&
@@ -14298,6 +14661,22 @@ function mergeCloudLayerSnapshot(snapshot, options = {}) {
   const data = normalizedCloudData(snapshot);
   if (!cloudScene) resetCloudScene(data.stats || {});
   const snapshotSignature = options.atlasSignature || cloudLastFetchSignature || cloudAtlasSignature();
+  if (data.stream?.kind === "background") {
+    cloudScene.stats = {
+      ...cloudScene.stats,
+      ...(data.stats || {}),
+    };
+    if (applyCloudBackgroundPacket(data.background)) {
+      scheduleCloudCanvasRender();
+      if (cloudInitialRenderPending) finishCloudInitialLoadingAfterPaint();
+    }
+    cloudData = {
+      ...data,
+      nodes: Array.from(cloudScene.nodesById.values()),
+      stats: cloudScene.stats,
+    };
+    return data;
+  }
   if (
     data.stream?.kind === "scale_layer" &&
     snapshotSignature &&
@@ -14353,7 +14732,7 @@ function mergeCloudLayerSnapshot(snapshot, options = {}) {
 	      }
 	      cloudScene.layerScales = [];
       cloudScene.layerScales = cloudSortedLayerScales(cloudScene);
-      cloudScene.awaitingScaleLayer = false;
+      cloudScene.awaitingScaleLayer = !cloudActiveLayerCaughtUp(cloudScene);
     }
   }
   cloudScene.loadedLayers.add(layer);
@@ -14563,6 +14942,28 @@ function updateCloudLodVisibility(options = {}) {
     cloudRenderFrame = null;
     if (!cloudMode || !cloudScene) return;
     prepareCloudSceneDom();
+    const selectionAtlasPending = cloudRelationshipSwitchPending();
+    const selectedAtlasCatchingUp = Boolean(
+      !selectionAtlasPending &&
+      cloudScene.awaitingScaleLayer &&
+      !cloudActiveLayerCaughtUp(cloudScene)
+    );
+    if ((selectionAtlasPending || selectedAtlasCatchingUp) && !options.allowPendingAtlas) {
+      updateCloudSelectedPresentationOnly(cloudSelectedGenreId, { now });
+      cloudRenderedTextScale = viewScale;
+      if (window.__wikiGenresCloudCullDebug) {
+        window.__wikiGenresCloudCullDebug = {
+          ...window.__wikiGenresCloudCullDebug,
+          zoom: viewScale,
+          selectionAtlasPending: true,
+          selectionAtlasCatchingUp: selectedAtlasCatchingUp,
+          pendingAtlasSignature: cloudScene.pendingAtlasSignature || "",
+          presentationDelta: cloudPresentationMaxDelta(),
+        };
+      }
+      scheduleCloudCanvasRender();
+      return;
+    }
 
     const inverseScale = 1 / Math.max(0.001, viewScale);
     let nextNodeIds = new Set();
@@ -14616,13 +15017,14 @@ function updateCloudLodVisibility(options = {}) {
 	      activeLayerReady,
 	      cloudLoading: cloudInitialRenderPending,
 	      lodTargetSource: lodTarget.source,
+	      selectionAtlasPending,
+	      pendingAtlasSignature: selectionAtlasPending ? cloudScene.pendingAtlasSignature : "",
 	    };
     cloudCanvasNodes = Array.from(nextNodeIds)
       .map(nodeId => cloudScene.nodesById.get(nodeId))
       .filter(Boolean);
     updateCloudCanvasFadeTargets(cloudCanvasNodes, {
       noFade: options.noFade || cloudInitialRenderPending,
-      hydrateNew: options.hydrateNew,
       now,
     });
     const drawableNodes = cloudDrawableNodes();
@@ -14633,7 +15035,7 @@ function updateCloudLodVisibility(options = {}) {
     cloudRenderedTextScale = viewScale;
     cloudRenderedWindowSignature = windowSignature;
     scheduleCloudCanvasRender();
-    if (cloudInitialRenderPending && cloudActiveLayerCaughtUp(cloudScene)) {
+    if (cloudInitialRenderPending && cloudInitialSceneReady()) {
       finishCloudInitialLoadingAfterPaint();
     }
     setStatus(`${nextNodeIds.size} visible of ${total} cloud genres${loaded < total ? ` (${loaded} preloaded)` : ""}`);
@@ -14662,6 +15064,8 @@ async function loadCloudMode(options = {}) {
     viewTx = focusX();
     viewTy = focusY();
     writeWorldTransform();
+    cloudInitialBackgroundContext = cloudBackgroundContextSignature();
+    cloudInitialBackgroundSettled = false;
     setCloudInitialLoading(true);
   } else if (!cloudInitialRenderPending) {
     setCloudInitialLoading(false);
@@ -14692,7 +15096,6 @@ async function loadCloudMode(options = {}) {
         }
         updateCloudLodVisibility({
           noFade: options.noFade,
-          hydrateNew: options.preserveView && !options.initial,
           immediate: !renderedInitialSnapshot,
         });
         renderedInitialSnapshot = true;
@@ -14707,7 +15110,6 @@ async function loadCloudMode(options = {}) {
       cloudScene.complete = false;
       updateCloudLodVisibility({
         noFade: options.noFade,
-        hydrateNew: options.preserveView && !options.initial,
         immediate: true,
       });
       return;
@@ -14733,7 +15135,6 @@ async function loadCloudMode(options = {}) {
       finishCloudInitialLoadingAfterPaint();
       updateCloudLodVisibility({
         noFade: options.noFade,
-        hydrateNew: options.preserveView && !options.initial,
         immediate: true,
       });
     } catch (fallbackErr) {
@@ -14741,7 +15142,6 @@ async function loadCloudMode(options = {}) {
         console.warn("[wiki-genres] cloud fallback failed; keeping partial atlas", fallbackErr);
         updateCloudLodVisibility({
           noFade: options.noFade,
-          hydrateNew: options.preserveView && !options.initial,
           immediate: true,
         });
         return;
@@ -14764,6 +15164,7 @@ async function loadCloudMode(options = {}) {
     }
   }
   if (token !== cloudRequestToken || !cloudMode || !cloudScene) return;
+  cloudInitialBackgroundSettled = true;
   finishCloudInitialLoadingAfterPaint();
   cloudData = {
     nodes: Array.from(cloudScene.nodesById.values()),
@@ -14819,7 +15220,7 @@ async function openCloudGenre(genreId, options = {}) {
   setDetailCardNodeKey(detailKeyForCloudNodeId(genreId));
   updateDetailCardVisibility();
   updateUrlState({ push: true });
-  updateCloudLodVisibility({ immediate: true });
+  updateCloudSelectedPresentationOnly(genreId, { dimCurrentNodes: true });
   const cloudNode = cloudNodeById.get(genreId);
   if (cloudNode) {
     updateCard(cloudNodeFromPayload(cloudNode));
@@ -14983,10 +15384,7 @@ function setCloudMode(enabled, options = {}) {
 			    cloudHoverUnderlineAlphaById = new Map();
 			    cloudRelationshipAlphaById = new Map();
 	    cancelCloudFadeFrame();
-		    cloudBackgroundCache = null;
-	    cloudBackgroundBuildSignature = "";
-	    window.clearTimeout(cloudBackgroundBuildTimer);
-	    cloudBackgroundBuildTimer = 0;
+	    clearCloudBackgroundCache();
 	    cloudLabelSpriteCache = new Map();
 	    cloudHoveredNodeId = null;
 	    cloudSelectedMarker = null;
@@ -15077,10 +15475,7 @@ function setTimelineMode(enabled, options = {}) {
 	    cloudSelectedLabelAlphaById = new Map();
 	    cloudRelationshipAlphaById = new Map();
     cancelCloudFadeFrame();
-    cloudBackgroundCache = null;
-    cloudBackgroundBuildSignature = "";
-    window.clearTimeout(cloudBackgroundBuildTimer);
-    cloudBackgroundBuildTimer = 0;
+    clearCloudBackgroundCache();
     cloudLabelSpriteCache = new Map();
     cloudHoveredNodeId = null;
     cloudSelectedMarker = null;
@@ -17418,15 +17813,12 @@ function renderCardContent(g, options = {}) {
 
 function cancelDetailCardContentSwap() {
   window.clearTimeout(detailCardContentSwapTimer);
-  window.clearTimeout(detailCardHeightResetTimer);
   window.clearTimeout(detailCardTransitionCleanupTimer);
   detailCardContentSwapTimer = 0;
-  detailCardHeightResetTimer = 0;
   detailCardTransitionCleanupTimer = 0;
   detailCardContentSwapToken++;
   detailCard?.classList.remove("card-content-fading");
   detailCard?.classList.remove("detail-card-entering");
-  detailCard?.classList.remove("detail-card-height-animating");
   detailCardSlot?.classList.remove("detail-card-swap-transitioning");
   detailCardTransitionClone?.remove();
   detailCardTransitionClone = null;
@@ -17440,24 +17832,6 @@ function commitCardContent(g, options, nextKey) {
   renderCardContent(g, options);
   detailCardRenderedKey = nextKey || detailCardRenderedKey;
   syncDetailNodeIndicators();
-}
-
-function shouldAnimateDetailCardHeight() {
-  return Boolean(
-    detailCard &&
-    window.matchMedia("(max-width: 899px)").matches &&
-    document.body.classList.contains("detail-card-visible") &&
-    !document.body.classList.contains("mobile-cards-hidden")
-  );
-}
-
-function measuredDetailCardAutoHeight() {
-  if (!detailCard) return 0;
-  const previousHeight = detailCard.style.height;
-  detailCard.style.height = "auto";
-  const height = Math.ceil(detailCard.getBoundingClientRect().height || 0);
-  detailCard.style.height = previousHeight;
-  return height;
 }
 
 function cleanupDetailCardTransition(token = detailCardContentSwapToken) {
@@ -17519,42 +17893,15 @@ function swapCardContent(g, options, nextKey, shouldFade) {
 
   const token = ++detailCardContentSwapToken;
   window.clearTimeout(detailCardContentSwapTimer);
-  window.clearTimeout(detailCardHeightResetTimer);
   detailCardContentSwapTimer = 0;
-  detailCardHeightResetTimer = 0;
 
-  const previousHeight = detailCard?.getBoundingClientRect().height || 0;
-  const animateHeight = shouldAnimateDetailCardHeight() && previousHeight > 0;
-  if (animateHeight) {
-    detailCard.classList.add("detail-card-height-animating");
+  if (detailCard) {
     detailCard.style.minHeight = "";
-    detailCard.style.height = `${Math.ceil(previousHeight)}px`;
-    detailCard.getBoundingClientRect();
+    detailCard.style.height = "";
   }
   beginDetailCardTransition(token);
   commitCardContent(g, options, nextKey);
 
-  if (detailCard && animateHeight) {
-    const nextHeight = measuredDetailCardAutoHeight();
-    detailCard.style.height = `${Math.ceil(previousHeight)}px`;
-    requestAnimationFrame(() => {
-      if (token !== detailCardContentSwapToken) return;
-      detailCard.style.height = `${Math.max(1, nextHeight)}px`;
-    });
-    detailCardHeightResetTimer = window.setTimeout(() => {
-      if (token !== detailCardContentSwapToken) return;
-      detailCardHeightResetTimer = 0;
-      detailCard.classList.remove("detail-card-height-animating");
-      detailCard.style.height = "";
-    }, DETAIL_CARD_HEIGHT_ANIMATION_MS + 40);
-  } else if (detailCard && previousHeight > 0) {
-    detailCard.style.minHeight = `${Math.ceil(previousHeight)}px`;
-    detailCardHeightResetTimer = window.setTimeout(() => {
-      if (token !== detailCardContentSwapToken) return;
-      detailCardHeightResetTimer = 0;
-      detailCard.style.minHeight = "";
-    }, DETAIL_CARD_HEIGHT_STABILIZE_MS);
-  }
   window.requestAnimationFrame(() => {
     if (token !== detailCardContentSwapToken) return;
     detailCard?.classList.remove("card-content-fading");
@@ -17935,14 +18282,25 @@ footerZoom?.addEventListener("keydown", event => {
   setZoomFromFooterProgress(nextProgress);
 });
 
+footerReset?.addEventListener("click", event => {
+  event.preventDefault();
+  event.stopPropagation();
+  resetCameraToModeDefault();
+});
+
+footerReset?.addEventListener("keydown", event => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  resetCameraToModeDefault();
+});
+
 document.addEventListener("pointermove", event => {
   setActivePointerButtons(event.buttons);
   updateLastPointerPosition(event.clientX, event.clientY);
   if (activePointerButtons > 0 && manualMovementGesture) {
     markManualUiMovingAfterGestureThreshold(event.clientX, event.clientY);
   }
-  uiHovering = isUiHoverTarget(event.target) || Boolean(liveUiHoverRoot());
-  if (uiHovering) triggerUiHoverRestoreHold();
+  updateUiHoverFromPoint(event.clientX, event.clientY);
   if (manualUiDimPending) updateManualUiDimClass();
 }, { passive: true });
 
@@ -17957,6 +18315,7 @@ document.addEventListener("pointerdown", event => {
 function clearActivePointerButtons() {
   setActivePointerButtons(0);
   clearManualMovementGesture();
+  updateUiHoverFromPoint();
   updateManualUiDimClass();
 }
 
@@ -17965,15 +18324,14 @@ window.addEventListener("pointercancel", clearActivePointerButtons, true);
 window.addEventListener("blur", clearActivePointerButtons);
 
 document.addEventListener("pointerover", event => {
-  if (!isUiHoverTarget(event.target)) return;
-  uiHovering = true;
-  triggerUiHoverRestoreHold();
+  updateLastPointerPosition(event.clientX, event.clientY);
+  if (!updateUiHoverFromPoint(event.clientX, event.clientY)) return;
   updateManualUiDimClass();
 }, true);
 
 document.addEventListener("pointerout", event => {
-  if (!isUiHoverTarget(event.target)) return;
-  if (isUiHoverTarget(event.relatedTarget)) return;
+  updateLastPointerPosition(event.clientX, event.clientY);
+  if (uiHoverRootAtPoint(event.clientX, event.clientY)) return;
   uiHovering = false;
   triggerUiHoverRestoreHold();
   updateManualUiDimClass();
