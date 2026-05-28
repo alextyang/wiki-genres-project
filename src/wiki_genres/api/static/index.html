@@ -23,11 +23,14 @@
     rel="stylesheet"
     href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0"
   />
-  <link rel="stylesheet" href="styles.css?v=542" />
+  <link rel="stylesheet" href="styles.css?v=548" />
 </head>
 <body class="app-booting">
   <div id="boot-loading" aria-live="polite" aria-hidden="true">
-    <div class="boot-loading-spinner"></div>
+    <div class="boot-loading-content">
+      <div class="boot-loading-title">The Genre Project<span class="title-bang">!</span></div>
+      <div class="boot-loading-spinner"></div>
+    </div>
   </div>
   <script>
     window.__wikiGenresBootWatchdog = window.setTimeout(function () {
@@ -50,11 +53,15 @@
           <path d="M9 18l6-6-6-6"></path>
         </svg>
       </button>
-      <button id="cloud-toggle-button" type="button" class="mode-toggle-button" aria-label="Open word cloud">
+      <button id="graph-toggle-button" type="button" class="mode-toggle-button" aria-label="Show graph" aria-pressed="true">
+        <span class="material-symbols-rounded mode-symbol" aria-hidden="true">polyline</span>
+        <span class="mode-toggle-label">Graph</span>
+      </button>
+      <button id="cloud-toggle-button" type="button" class="mode-toggle-button" aria-label="Show cloud" aria-pressed="false">
         <span class="material-symbols-rounded mode-symbol" aria-hidden="true">mist</span>
         <span class="mode-toggle-label">Cloud</span>
       </button>
-      <button id="timeline-toggle-button" type="button" class="mode-toggle-button" aria-label="Open timeline map">
+      <button id="timeline-toggle-button" type="button" class="mode-toggle-button" aria-label="Show timeline" aria-pressed="false">
         <span class="material-symbols-rounded mode-symbol" aria-hidden="true">clock_arrow_down</span>
         <span class="mode-toggle-label">Timeline</span>
       </button>
@@ -96,7 +103,7 @@
       <button id="mobile-map-tab" type="button">Radio</button>
     </div>
     <aside id="map-card" aria-label="Regional map">
-      <button id="map-world-button" type="button" hidden>Return to global</button>
+      <button id="map-world-button" type="button" hidden>Globe</button>
       <div id="map-toolbar" aria-label="Map view controls">
         <button id="map-list-button" type="button" aria-label="Show variations list" aria-pressed="false" data-tooltip="Show variations list" hidden>
           <span class="material-symbols-rounded mode-symbol" aria-hidden="true">format_list_bulleted</span>
@@ -331,20 +338,35 @@
     </div>
 
     <footer id="footer">
-      <span id="footer-depth"></span>
-      <span id="footer-zoom-value">Zoom x1.00</span>
-      <span id="footer-zoom" class="zoom-progress-track" tabindex="0">
-        <span id="footer-zoom-fill" class="zoom-progress-fill"></span>
-      </span>
-      <span id="footer-reset" role="button" tabindex="0" aria-label="Recenter view">
-        <span class="footer-reset-label">Recenter</span>
-        <span class="material-symbols-rounded footer-reset-icon" aria-hidden="true">my_location</span>
-      </span>
-      <span id="footer-hint"></span>
+      <div class="footer-brand">
+        <span>The Genre Project<span class="title-bang">!</span></span>
+        <span class="footer-credit-dot" aria-hidden="true">·</span>
+        <a class="footer-credit-link" href="#about">About</a>
+      </div>
+      <div class="footer-controls">
+        <span id="footer-depth"></span>
+        <span id="footer-zoom-value">Zoom x1.00</span>
+        <span id="footer-zoom" class="zoom-progress-track" tabindex="0">
+          <span id="footer-zoom-fill" class="zoom-progress-fill"></span>
+        </span>
+        <span id="footer-reset" role="button" tabindex="0" aria-label="Recenter view">
+          <span class="footer-reset-label">Recenter</span>
+          <span class="material-symbols-rounded footer-reset-icon" aria-hidden="true">my_location</span>
+        </span>
+        <span id="footer-hint"></span>
+      </div>
+      <div class="footer-attributions" aria-label="Project attributions">
+        <a class="footer-credit-link" href="https://donate.wikimedia.org/" target="_blank" rel="noopener noreferrer">
+          <span>Powered by Wikipedia</span>
+          <span class="footer-credit-icon" aria-hidden="true">↗</span>
+        </a>
+        <span class="footer-credit-dot" aria-hidden="true">·</span>
+        <span>Made with ♥ by <a class="footer-credit-link footer-credit-name" href="https://alexya.ng/" target="_blank" rel="noopener noreferrer">Alexander Yang</a></span>
+      </div>
     </footer>
 
   </div>
 
-  <script type="module" src="app.js?v=607"></script>
+  <script type="module" src="app.js?v=631"></script>
 </body>
 </html>

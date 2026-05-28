@@ -276,6 +276,22 @@ function setModeButtonState(button, { icon, label, ariaLabel }) {
   button.setAttribute("aria-label", ariaLabel || label);
 }
 
+function setModeButtonSelected(button, selected) {
+  if (!button) return;
+  button.classList.toggle("mode-toggle-active", Boolean(selected));
+  button.setAttribute("aria-pressed", String(Boolean(selected)));
+}
+
+function syncModeToggleButtons() {
+  const graphMode = !cloudMode && !timelineMode;
+  setModeButtonState(graphToggleButton, { icon: "polyline", label: "Graph", ariaLabel: "Show graph" });
+  setModeButtonState(cloudToggleButton, { icon: "mist", label: "Cloud", ariaLabel: "Show cloud" });
+  setModeButtonState(timelineToggleButton, { icon: "clockArrowDown", label: "Timeline", ariaLabel: "Show timeline" });
+  setModeButtonSelected(graphToggleButton, graphMode);
+  setModeButtonSelected(cloudToggleButton, cloudMode);
+  setModeButtonSelected(timelineToggleButton, timelineMode);
+}
+
 function readExplorerSelectionState(store = sessionStorage) {
   try {
     const parsed = JSON.parse(store.getItem(EXPLORER_SELECTION_STORAGE_KEY) || "null");
@@ -345,6 +361,7 @@ const searchCard = document.getElementById("search-card");
 const searchInput = document.getElementById("genre-search-input");
 const searchResults = document.getElementById("genre-search-results");
 const randomGenreButton = document.getElementById("random-genre-button");
+const graphToggleButton = document.getElementById("graph-toggle-button");
 const cloudToggleButton = document.getElementById("cloud-toggle-button");
 const navControls = document.getElementById("nav-controls");
 const navBackButton = document.getElementById("nav-back-button");
@@ -463,6 +480,7 @@ let hoveredMapCountries = new Set();
 let mapDefaultLabel = "";
 let mapDefaultVariationCount = 0;
 let mapDisplayedWorldOverride = false;
+let mapDisplayedWorldOverrideKey = null;
 let mapListMode = false;
 let mapListViewState = null;
 let mapListRenderToken = 0;
@@ -510,6 +528,8 @@ let cloudData = null;
 let cloudRootGenreId = null;
 let cloudRegionId = null;
 let cloudSelectedGenreId = null;
+let cloudSelectionController = null;
+let cloudSelectionToken = 0;
 let cloudNodeEls = new Map();
 let cloudTextEls = new Map();
 let cloudNodeById = new Map();
@@ -524,26 +544,28 @@ let cloudCanvasFrame = 0;
 let cloudCanvasDpr = 1;
 let cloudCanvasNodes = [];
 let cloudCanvasHitNodes = [];
-let cloudCanvasVisibleIds = new Set();
-let cloudCanvasAlphaById = new Map();
-let cloudRenderSnapshot = null;
-let cloudRenderTransition = null;
 let cloudPresentationById = new Map();
 let cloudPresentationLastAt = 0;
 let cloudPresentationTargetSignature = "";
-let cloudSelectedLabelAlphaById = new Map();
+let cloudFrameDebug = {
+  candidateEntries: 0,
+  duplicateEntries: 0,
+  duplicateIds: [],
+  visibleSvgCloudNodes: 0,
+  lastSelectionStartedAt: 0,
+  marks: [],
+};
 let cloudHoverUnderlineAlphaById = new Map();
-let cloudRelationshipAlphaById = new Map();
 let cloudBackgroundCache = null;
 let cloudBackgroundBuildTimer = 0;
 let cloudBackgroundBuildSignature = "";
 let cloudFadeFrame = 0;
-let cloudCanvasFadeFrame = 0;
-let cloudSelectedLabelFadeFrame = 0;
-let cloudHoverUnderlineFadeFrame = 0;
-let cloudRelationshipFadeFrame = 0;
 let cloudLabelSpriteCache = new Map();
 let cloudCanvasStyleCache = null;
+let textMeasureCanvas = null;
+let textMeasureCtx = null;
+let measuredTextWidthCache = new Map();
+let appFontFamilyCache = "";
 let cloudHoveredNodeId = null;
 let cloudHoverCardDelayTimer = 0;
 let pendingCloudHoverCardKey = null;
@@ -769,12 +791,11 @@ const CLOUD_VIEWPORT_MARGIN_PX = 180;
 const CLOUD_DOM_WINDOW_MARGIN_PX = 96;
 const CLOUD_DOM_WINDOW_TILE_PX = 220;
 const CLOUD_CANVAS_HIT_PAD_PX = 6;
-const CLOUD_CANVAS_TRANSITION_MS = 520;
-const CLOUD_CANVAS_FADE_IN_MS = CLOUD_CANVAS_TRANSITION_MS;
-const CLOUD_CANVAS_FADE_OUT_MS = 95;
+const CLOUD_INITIAL_OVERVIEW_SCALE = 0.18;
+const CLOUD_CANVAS_TRANSITION_MS = 420;
+const CLOUD_CANVAS_FADE_IN_MS = 260;
+const CLOUD_CANVAS_FADE_OUT_MS = 180;
 const CLOUD_PRESENTATION_EPSILON = 0.006;
-const CLOUD_SELECTED_LABEL_FADE_IN_MS = 220;
-const CLOUD_SELECTED_LABEL_FADE_OUT_MS = 170;
 const CLOUD_RELATIONSHIP_ALPHA_FADE_MS = 320;
 const CLOUD_RELATIONSHIP_ALPHA_FLOOR = 0.0275;
 const CLOUD_PENDING_RELATIONSHIP_DIM_MULTIPLIER = 0.58;
@@ -1082,15 +1103,39 @@ function setCloudInitialLoading(isLoading) {
 
 function cloudInitialBackgroundReady() {
   if (!cloudInitialBackgroundContext) return true;
-  if (cloudBackgroundCache?.contextSignature === cloudInitialBackgroundContext) return true;
-  return cloudInitialBackgroundSettled;
+  return Boolean(
+    cloudBackgroundCache?.canvas &&
+    cloudBackgroundCache?.bounds &&
+    cloudBackgroundCache.contextSignature === cloudInitialBackgroundContext
+  );
+}
+
+function cloudInitialCurrentViewReady() {
+  if (!cloudScene) return false;
+  const activeLayerScale = cloudActiveLayerScale(cloudScene);
+  const layerScales = cloudSortedLayerScales(cloudScene);
+  const maxLoadedLayerScale = layerScales.length ? layerScales[layerScales.length - 1] : null;
+  const requiredLayerScale = maxLoadedLayerScale == null
+    ? clampViewScale(viewScale)
+    : Math.min(clampViewScale(viewScale), maxLoadedLayerScale);
+  if (
+    activeLayerScale == null ||
+    activeLayerScale < requiredLayerScale - CLOUD_LAYER_READY_EPSILON
+  ) {
+    return false;
+  }
+  return Boolean(
+    cloudCanvasNodes.length &&
+    Math.abs(Number(cloudRenderedLayerScale) - Number(activeLayerScale)) < 0.0001 &&
+    Math.abs(Number(cloudRenderedTextScale) - Number(viewScale)) < 0.0005
+  );
 }
 
 function cloudInitialSceneReady() {
   return Boolean(
     cloudMode &&
     cloudScene &&
-    cloudActiveLayerCaughtUp(cloudScene) &&
+    cloudInitialCurrentViewReady() &&
     cloudInitialBackgroundReady()
   );
 }
@@ -1103,6 +1148,7 @@ function finishCloudInitialLoadingAfterPaint() {
     requestAnimationFrame(() => {
       if (cloudMode) scheduleCloudCanvasRender();
       requestAnimationFrame(() => {
+        if (!cloudInitialSceneReady()) return;
         setCloudInitialLoading(false);
       });
     });
@@ -1213,7 +1259,6 @@ function triggerUiHoverRestoreHold(duration = UI_HOVER_RESTORE_HOLD_MS) {
 }
 
 function manualUiDimActive() {
-  if (cloudMode) return false;
   if (!manualUiDimPending) return false;
   return manualUiDimExplicitActive() || !graphIsStill || detailCardMovementActive();
 }
@@ -1939,9 +1984,11 @@ function cloudRelationLine(node) {
   if (!genreId || !contextId) return "";
   if (genreId === contextId) return "Selected genre";
   const cloudNode = cloudNodeById.get(genreId) || cloudScene?.nodesById?.get(genreId) || null;
-  const rawDistance = Number.isFinite(Number(cloudNode?.selected_distance))
+  const rawCloudDistance = cloudNode?.selected_distance;
+  const rawNodeDistance = node.selected_distance;
+  const rawDistance = rawCloudDistance != null && Number.isFinite(Number(rawCloudDistance))
     ? Number(cloudNode.selected_distance)
-    : Number.isFinite(Number(node.selected_distance))
+    : rawNodeDistance != null && Number.isFinite(Number(rawNodeDistance))
       ? Number(node.selected_distance)
       : null;
   if (rawDistance == null) return "";
@@ -3401,6 +3448,41 @@ function positiveMetricValue(...values) {
   return null;
 }
 
+function appFontFamily() {
+  if (appFontFamilyCache) return appFontFamilyCache;
+  try {
+    const styles = getComputedStyle(document.documentElement);
+    appFontFamilyCache = styles.getPropertyValue("--font").trim() || "system-ui, sans-serif";
+  } catch {
+    appFontFamilyCache = "system-ui, sans-serif";
+  }
+  return appFontFamilyCache;
+}
+
+function textMeasureContext() {
+  if (textMeasureCtx) return textMeasureCtx;
+  textMeasureCanvas = document.createElement("canvas");
+  textMeasureCtx = textMeasureCanvas.getContext("2d");
+  return textMeasureCtx;
+}
+
+function realTextWidth(label, fontSize, fontWeight, fontFamily = appFontFamily()) {
+  const text = String(label || "");
+  if (!text) return null;
+  const size = Number(fontSize) || CLOUD_FONT_SIZE;
+  const weight = Number(fontWeight) || 500;
+  const family = fontFamily || appFontFamily();
+  const key = `${weight}|${size}|${family}|${text}`;
+  const cached = measuredTextWidthCache.get(key);
+  if (cached) return cached;
+  const ctx = textMeasureContext();
+  if (!ctx) return null;
+  ctx.font = `${weight} ${size}px ${family}`;
+  const width = Math.ceil(Math.max(0, ctx.measureText(text).width) + 0.5);
+  if (width > 0) measuredTextWidthCache.set(key, width);
+  return width > 0 ? width : null;
+}
+
 function textMetricsFromPayload(payload = {}) {
   return {
     textWidth: positiveMetricValue(payload.text_width, payload.textWidth),
@@ -3906,20 +3988,32 @@ function cloudViewportParams() {
     view_tx: viewTx.toFixed(2),
     view_ty: viewTy.toFixed(2),
   });
-  if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) params.set("selected_genre_id", cloudSelectedGenreId);
   if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
   if (cloudRegionId) params.set("region_id", cloudRegionId);
   return params;
 }
 
 function cloudAtlasParams() {
+  const scale = Math.max(
+    0.001,
+    cloudInitialRenderPending && !cloudSelectedGenreId ? CLOUD_INITIAL_OVERVIEW_SCALE : viewScale
+  );
   const params = new URLSearchParams({
     limit: "5000",
     atlas: "true",
+    scale: scale.toFixed(4),
     width: String(Math.max(1, Math.round(vw()))),
     height: String(Math.max(1, Math.round(vh()))),
   });
-  if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) params.set("selected_genre_id", cloudSelectedGenreId);
+  if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
+  if (cloudRegionId) params.set("region_id", cloudRegionId);
+  return params;
+}
+
+function cloudSelectionParams(genreId = cloudSelectedGenreId) {
+  const params = new URLSearchParams({
+    selected_genre_id: String(genreId || ""),
+  });
   if (cloudRootGenreId) params.set("root_genre_id", cloudRootGenreId);
   if (cloudRegionId) params.set("region_id", cloudRegionId);
   return params;
@@ -3928,6 +4022,11 @@ function cloudAtlasParams() {
 async function getCloudData(options = {}) {
   const params = options.atlas ? cloudAtlasParams() : cloudViewportParams();
   return fetchJson(`/v1/genres/cloud?${params.toString()}`, { signal: options.signal });
+}
+
+async function getCloudSelectionOverlay(genreId, options = {}) {
+  const params = cloudSelectionParams(genreId);
+  return fetchJson(`/v1/genres/cloud/selection?${params.toString()}`, { signal: options.signal });
 }
 
 function cloudStreamUrl() {
@@ -4489,7 +4588,7 @@ function mapParentInfoForNode(node) {
   if (!node?.isMapChild || !node.parentKey) return { label: "", targetKey: null };
   const parent = nodes.get(node.parentKey);
   if (!parent) return { label: "", targetKey: null };
-  if (parent.key === ROOT_KEY) return { label: "Global", targetKey: parent.key };
+  if (parent.key === ROOT_KEY) return { label: "Globe", targetKey: parent.key };
   return {
     label: parent.label || labelFromTitle(parent.title) || "",
     targetKey: parent.key,
@@ -4500,10 +4599,22 @@ function mapParentLabelForNode(node) {
   return mapParentInfoForNode(node).label;
 }
 
+function mapParentInfoForContext(context, selectedNode) {
+  if (
+    !cloudMode &&
+    !selectedNode?.isMapChild &&
+    (context?.active_map || "world") !== "world" &&
+    !context?.is_world_override
+  ) {
+    return { label: "Globe", targetKey: ROOT_KEY };
+  }
+  return null;
+}
+
 function cloudMapParentInfoForContext(context, selectedNode) {
   if (!cloudMode || !cloudRegionId) return null;
   return {
-    label: "Global",
+    label: "Globe",
     cloud: { root: true },
   };
 }
@@ -6724,6 +6835,7 @@ async function selectMapVariant(item) {
     return;
   }
   mapDisplayedWorldOverride = false;
+  mapDisplayedWorldOverrideKey = null;
   const focused = nodes.get(currentKey) || nodes.get(ROOT_KEY);
   const parent = mapMountParentForItem(item, focused);
   if (!parent) return;
@@ -6750,7 +6862,10 @@ function renderMapContext(node, context, selectedNode = node, options = {}) {
   const highlights = context.context_highlights || [];
   const selectedRegion = context.selected_region || null;
   setMapListButtonVisible(items.length > 0);
-  const parentInfo = cloudMapParentInfoForContext(context, selectedNode) || mapParentInfoForNode(selectedNode);
+  const parentInfo =
+    cloudMapParentInfoForContext(context, selectedNode) ||
+    mapParentInfoForContext(context, selectedNode) ||
+    mapParentInfoForNode(selectedNode);
   setMapParentLabel(parentInfo.label, parentInfo.targetKey, { cloud: parentInfo.cloud });
   setMapDefaultLabel(mapVariationLabel(selectedNode, items, context), mapVariationCount(items));
   setMapWorldButtonVisible((context.active_map || "world") !== "world" && !context.is_world_override);
@@ -6764,7 +6879,7 @@ function renderMapContext(node, context, selectedNode = node, options = {}) {
     ...fitHighlights,
     ...mapItemFeatureKeys(inferredHighlights),
   ];
-  const autoViewFeatures = selectableFeatures.length ? selectableFeatures : highlightFeatures;
+  const autoViewFeatures = uniqueStrings([...selectableFeatures, ...highlightFeatures]);
 
   const nextCountryStates = new Map();
   const nextItemsByCountry = new Map();
@@ -6805,7 +6920,7 @@ function mapContextAutoViewFeatureKeys(node, context, selectedNode = node) {
     ...fitHighlights,
     ...mapItemFeatureKeys(inferredHighlights),
   ];
-  return selectableFeatures.length ? selectableFeatures : highlightFeatures;
+  return uniqueStrings([...selectableFeatures, ...highlightFeatures]);
 }
 
 function mapContextHasResolvedAutoViewFeatures(node, context, selectedNode = node) {
@@ -6816,6 +6931,10 @@ function mapContextHasResolvedAutoViewFeatures(node, context, selectedNode = nod
 
 async function updateMapCard(node, options = {}) {
   if (!mapCard || !node) return;
+  if (mapDisplayedWorldOverride && mapDisplayedWorldOverrideKey !== (node.key || null)) {
+    mapDisplayedWorldOverride = false;
+    mapDisplayedWorldOverrideKey = null;
+  }
   scheduledMapCardUpdateToken++;
   const token = ++mapToken;
   const showLoading = options.loading !== false;
@@ -6832,8 +6951,10 @@ async function updateMapCard(node, options = {}) {
 
   try {
     let result = null;
+    let ownResult = null;
     if (selectedMapChild) {
-      result = await getMapContext(node);
+      ownResult = await getMapContext(node);
+      result = ownResult;
       if (token !== mapToken) return;
       if (!mapContextHasSelectableVariants(result.selectable_regions || result.items)) {
         result = null;
@@ -6842,22 +6963,29 @@ async function updateMapCard(node, options = {}) {
     }
 
     if (node?.genreId && !node.isMapChild && node.parentKey && nodes.has(node.parentKey)) {
-      const parent = nodes.get(node.parentKey);
-      const parentResult = await getMapContext(parent);
+      ownResult = await getMapContext(mapNode);
       if (token !== mapToken) return;
-      if ((parentResult.selectable_regions || []).some(item =>
-        item.genre_id === node.genreId || (item.represented_genre_ids || []).includes(node.genreId)
-      )) {
-        result = parentResult;
+      if ((ownResult.active_map || "world") !== "world") {
+        result = ownResult;
+      } else {
+        const parent = nodes.get(node.parentKey);
+        const parentResult = await getMapContext(parent);
+        if (token !== mapToken) return;
+        if ((parentResult.selectable_regions || []).some(item =>
+          item.genre_id === node.genreId || (item.represented_genre_ids || []).includes(node.genreId)
+        )) {
+          result = parentResult;
+        }
       }
     }
 
-    if (!result) result = await getMapContext(mapNode);
+    if (!result) result = ownResult || await getMapContext(mapNode);
     if (token !== mapToken) return;
     if ((cloudMode || mapDisplayedWorldOverride) && (result.active_map || "world") !== "world") {
       result = worldContextFromSubmap(result, node);
     } else {
       mapDisplayedWorldOverride = false;
+      mapDisplayedWorldOverrideKey = null;
     }
     if (mapNode?.genreId && !mapNode.isMapChild) {
       const parentRows = await getReachableParents(mapNode.genreId).catch(() => []);
@@ -9530,7 +9658,10 @@ function scaledDbTextWidth(node, label, fontSize) {
 }
 
 function svgPretextWidth(node, label, fontSize, fontWeight) {
-  return Math.ceil(scaledDbTextWidth(node, label, fontSize));
+  return Math.ceil(
+    realTextWidth(label, fontSize, fontWeight) ||
+    scaledDbTextWidth(node, label, fontSize)
+  );
 }
 
 function pillWidthFromPretext(node, label, fontSize, fontWeight, padX, minWidth, maxWidth) {
@@ -11135,7 +11266,7 @@ function selectedGradientEnd(start, end) {
 
 function fullRender() {
   if (cloudMode) {
-    if (cloudData) renderCloud(cloudData, { preserveView: true });
+    updateCloudLodVisibility({ immediate: true });
     return;
   }
   if (timelineMode) {
@@ -11321,7 +11452,7 @@ function renderTick() {
 
 function updateClasses() {
   if (cloudMode) {
-    if (cloudData) renderCloud(cloudData, { preserveView: true });
+    updateCloudLodVisibility({ immediate: true });
     return;
   }
   if (timelineMode) {
@@ -12063,19 +12194,22 @@ function cloudRenderMetrics(node) {
   }
   if (node.__cloudRenderMetrics) return node.__cloudRenderMetrics;
   const label = node.label || node.wikipedia_title;
-  const textWidth = positiveMetricValue(node.text_width, node.textWidth, node.width) ||
+  const textWidth = realTextWidth(label, CLOUD_FONT_SIZE, 650) ||
+    positiveMetricValue(node.text_width, node.textWidth, node.width) ||
     cloudFallbackTextWidth(label);
+  const selectedTextWidth = realTextWidth(label, CLOUD_FONT_SIZE, 760) || textWidth;
   const textHeight = positiveMetricValue(node.text_height, node.textHeight, node.height) ||
     cloudFallbackTextHeight();
   const boxPadX = positiveMetricValue(node.box_pad_x, node.boxPadX) || CLOUD_LABEL_PAD_PX;
   const boxPadY = positiveMetricValue(node.box_pad_y, node.boxPadY) || CLOUD_LABEL_PAD_Y_PX;
   const metrics = {
     textWidth,
+    selectedTextWidth,
     textHeight,
     boxPadX,
     boxPadY,
-    boxWidth: positiveMetricValue(node.box_width, node.boxWidth) || Math.ceil(textWidth + boxPadX * 2),
-    selectedPillWidth: Math.ceil(textWidth + (boxPadX + CLOUD_SELECTED_LABEL_EXTRA_PAD_PX) * 2),
+    boxWidth: Math.ceil(textWidth + boxPadX * 2),
+    selectedPillWidth: Math.ceil(selectedTextWidth + (boxPadX + CLOUD_SELECTED_LABEL_EXTRA_PAD_PX) * 2),
     boxHeight: positiveMetricValue(node.box_height, node.boxHeight) || Math.ceil(textHeight + boxPadY * 2),
   };
   try {
@@ -12249,23 +12383,144 @@ function createCloudScene(stats = {}) {
     atlasSignature: "",
     pendingAtlasSignature: "",
     awaitingScaleLayer: false,
+    selectedDistanceGenreId: null,
+    selectedDistanceLayoutKey: "",
+    selectedDistanceById: new Map(),
+    selectedLodCandidateCache: new Map(),
     stats: { ...stats },
     complete: false,
   };
+}
+
+function cloudApplySelectionFieldsToNode(node) {
+  if (!node?.id || !cloudScene?.selectedDistanceById) return node;
+  const entry = cloudScene.selectedDistanceById.get(String(node.id));
+  if (!entry) {
+    node.selected_distance = null;
+    node.selected_focus_score = null;
+    return node;
+  }
+  node.selected_distance = Number.isFinite(Number(entry.selected_distance))
+    ? Number(entry.selected_distance)
+    : null;
+  node.selected_focus_score = Number.isFinite(Number(entry.selected_focus_score))
+    ? Number(entry.selected_focus_score)
+    : null;
+  return node;
+}
+
+function syncCloudSelectionStats() {
+  if (!cloudScene?.selectedDistanceGenreId) return;
+  cloudScene.stats = {
+    ...(cloudScene.stats || {}),
+    selected_genre_id: cloudScene.selectedDistanceGenreId,
+    selected_distance_nodes: cloudScene.selectedDistanceById?.size || 0,
+  };
+}
+
+function clearCloudSelectionOverlay() {
+  if (!cloudScene) return;
+  cloudScene.selectedDistanceGenreId = null;
+  cloudScene.selectedDistanceLayoutKey = "";
+  cloudScene.selectedDistanceById = new Map();
+  cloudScene.selectedLodCandidateCache = new Map();
+  cloudScene.stats = {
+    ...(cloudScene.stats || {}),
+    selected_genre_id: null,
+    selected_distance_nodes: 0,
+  };
+  for (const node of cloudScene.nodesById.values()) {
+    node.selected_distance = null;
+    node.selected_focus_score = null;
+  }
+  cloudData = {
+    ...(cloudData || {}),
+    nodes: Array.from(cloudScene.nodesById.values()),
+    stats: cloudScene.stats,
+  };
+  cloudRenderedWindowSignature = "";
+}
+
+function applyCloudSelectionOverlay(payload, options = {}) {
+  if (!cloudScene || !payload) return false;
+  const selectedId = String(payload.selected_genre_id || "");
+  if (!selectedId || selectedId !== String(cloudSelectedGenreId || "")) return false;
+  const layoutKey = String(payload.layout_key || "");
+  const sceneLayoutKey = String(cloudScene.stats?.layout_key || "");
+  if (layoutKey && sceneLayoutKey && layoutKey !== sceneLayoutKey) return false;
+  const distanceById = new Map();
+  for (const row of payload.nodes || []) {
+    const nodeId = String(row?.id || "");
+    if (!nodeId) continue;
+    distanceById.set(nodeId, {
+      selected_distance: Number.isFinite(Number(row.selected_distance))
+        ? Number(row.selected_distance)
+        : null,
+      selected_focus_score: Number.isFinite(Number(row.selected_focus_score))
+        ? Number(row.selected_focus_score)
+        : null,
+    });
+  }
+  cloudScene.selectedDistanceGenreId = selectedId;
+  cloudScene.selectedDistanceLayoutKey = layoutKey;
+  cloudScene.selectedDistanceById = distanceById;
+  cloudScene.selectedLodCandidateCache = new Map();
+  cloudScene.stats = {
+    ...(cloudScene.stats || {}),
+    ...(payload.stats || {}),
+    selected_genre_id: selectedId,
+    selected_distance_nodes: distanceById.size,
+  };
+  for (const node of cloudScene.nodesById.values()) cloudApplySelectionFieldsToNode(node);
+  cloudData = {
+    ...(cloudData || {}),
+    nodes: Array.from(cloudScene.nodesById.values()),
+    stats: cloudScene.stats,
+  };
+  cloudRenderedWindowSignature = "";
+  updateCloudSelectedPresentationOnly(selectedId, { now: options.now || performance.now() });
+  updateCloudLodVisibility({ immediate: true, allowPendingAtlas: true });
+  return true;
+}
+
+async function loadCloudSelectionOverlay(genreId = cloudSelectedGenreId) {
+  const selectedId = String(genreId || "");
+  if (cloudSelectionController) {
+    cloudSelectionController.abort();
+    cloudSelectionController = null;
+  }
+  if (!selectedId || selectedId === ROOT_KEY) {
+    cloudSelectionToken += 1;
+    clearCloudSelectionOverlay();
+    updateCloudLodVisibility({ immediate: true, allowPendingAtlas: true });
+    return;
+  }
+  const token = ++cloudSelectionToken;
+  const controller = new AbortController();
+  cloudSelectionController = controller;
+  markCloudTransition("selection_overlay_start", { genreId: selectedId });
+  try {
+    const payload = await getCloudSelectionOverlay(selectedId, { signal: controller.signal });
+    if (token !== cloudSelectionToken || !cloudMode || cloudSelectedGenreId !== selectedId) return;
+    if (applyCloudSelectionOverlay(payload)) {
+      markCloudTransition("selection_overlay_received", {
+        nodes: Array.isArray(payload?.nodes) ? payload.nodes.length : 0,
+      });
+    }
+  } catch (err) {
+    if (err?.name === "AbortError") return;
+    console.warn("[wiki-genres] cloud selection overlay failed", err);
+  } finally {
+    if (cloudSelectionController === controller) cloudSelectionController = null;
+  }
 }
 
 function cloudAtlasSignature() {
   return [
     cloudRootGenreId || "",
     cloudRegionId || "",
-    cloudSelectedGenreId || "",
     "atlas",
   ].join("|");
-}
-
-function cloudAtlasSelectedGenreId(signature = cloudScene?.atlasSignature || "") {
-  const selectedId = String(signature || "").split("|")[2] || "";
-  return selectedId || null;
 }
 
 function cloudBackgroundContextSignature() {
@@ -12300,7 +12555,8 @@ function prepareCloudSceneForReload(options = {}) {
   cloudScene.complete = false;
   cloudScene.stats = {
     ...(cloudScene.stats || {}),
-    selected_genre_id: cloudSelectedGenreId || null,
+    selected_genre_id: cloudScene.selectedDistanceGenreId || null,
+    selected_distance_nodes: cloudScene.selectedDistanceById?.size || 0,
   };
 }
 
@@ -12341,18 +12597,20 @@ function resetCloudScene(stats = {}) {
   cloudRenderedTextScale = 0;
   cloudRenderedWindowSignature = "";
   cloudNodeById = cloudScene.nodesById;
-		    cloudCanvasNodes = [];
-			    cloudCanvasHitNodes = [];
-				    cloudCanvasVisibleIds = new Set();
-				    cloudCanvasAlphaById = new Map();
-				    cloudRenderSnapshot = null;
-				    cloudRenderTransition = null;
-				    cloudPresentationById = new Map();
-				    cloudPresentationLastAt = 0;
-				    cloudPresentationTargetSignature = "";
-				    cloudSelectedLabelAlphaById = new Map();
-			    cloudHoverUnderlineAlphaById = new Map();
-			    cloudRelationshipAlphaById = new Map();
+  cloudCanvasNodes = [];
+  cloudCanvasHitNodes = [];
+  cloudPresentationById = new Map();
+  cloudPresentationLastAt = 0;
+  cloudPresentationTargetSignature = "";
+  cloudFrameDebug = {
+    candidateEntries: 0,
+    duplicateEntries: 0,
+    duplicateIds: [],
+    visibleSvgCloudNodes: 0,
+    lastSelectionStartedAt: 0,
+    marks: [],
+  };
+  cloudHoverUnderlineAlphaById = new Map();
   cancelCloudFadeFrame();
   clearCloudBackgroundCache();
   cloudLabelSpriteCache = new Map();
@@ -12364,22 +12622,6 @@ function resetCloudScene(stats = {}) {
   window.clearTimeout(cloudClickEnableTimer);
   cloudClickEnableTimer = 0;
   syncCloudClickAffordance();
-	    if (cloudCanvasFadeFrame) {
-	      cancelAnimationFrame(cloudCanvasFadeFrame);
-	      cloudCanvasFadeFrame = 0;
-	    }
-		    if (cloudSelectedLabelFadeFrame) {
-		      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
-		      cloudSelectedLabelFadeFrame = 0;
-		    }
-		    if (cloudHoverUnderlineFadeFrame) {
-		      cancelAnimationFrame(cloudHoverUnderlineFadeFrame);
-		      cloudHoverUnderlineFadeFrame = 0;
-		    }
-		    if (cloudRelationshipFadeFrame) {
-		      cancelAnimationFrame(cloudRelationshipFadeFrame);
-		      cloudRelationshipFadeFrame = 0;
-		    }
   scheduleCloudCanvasRender();
   cloudData = { nodes: [], stats: cloudScene.stats };
 }
@@ -12643,53 +12885,57 @@ function cloudTilePacketCandidateIds(scene = cloudScene, activeScale = cloudActi
   return ids;
 }
 
-function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
-  const packetCandidateIds = cloudTilePacketCandidateIds(scene, activeScale);
-  if (!packetCandidateIds) return null;
-  const layerIds = cloudActiveLayerIds(scene, activeScale);
-  const lodSelectedGenreId = cloudLodSelectedGenreId();
-  const nextNodeIds = new Set();
-  let hiddenForViewport = 0;
-  let missingCandidates = 0;
-  for (const nodeId of packetCandidateIds) {
-    const node = scene?.nodesById?.get(nodeId);
-    if (!node) {
-      missingCandidates += 1;
-      continue;
-    }
-    if (!cloudNodeScreenIntersectsViewport(node, CLOUD_DOM_WINDOW_MARGIN_PX)) {
-      hiddenForViewport += 1;
-      continue;
-    }
-    nextNodeIds.add(node.id);
-  }
-  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
-    nextNodeIds.add(lodSelectedGenreId);
-  } else {
-    nextNodeIds.add(ROOT_KEY);
-  }
-  return {
-    nextNodeIds,
-    candidateIds: packetCandidateIds,
-    layerIds,
-    hiddenForViewport,
-    hiddenForOverlap: 0,
-    missingCandidates,
-    source: "packet_tiles",
-  };
+function cloudSelectedLodDistanceLimit(scale = viewScale) {
+  const normalized = Math.max(0.001, Number(scale) || 0);
+  if (normalized < 0.32) return 1;
+  if (normalized < 0.62) return 2;
+  if (normalized < 0.9) return 3;
+  return 4;
 }
 
-function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
-  const packetTarget = cloudPacketLodTarget(scene, activeScale);
-  if (packetTarget) return packetTarget;
-  const lodSelectedGenreId = cloudLodSelectedGenreId();
-  const layerIds = cloudActiveLayerIds(scene, activeScale);
-  const candidateIds = cloudViewportCandidateIds(scene, activeScale);
-  candidateIds.add(ROOT_KEY);
-  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
-    candidateIds.add(lodSelectedGenreId);
+function cloudSelectedLodCandidateIds(scene = cloudScene, scale = viewScale) {
+  const selectedId = cloudLodSelectedGenreId();
+  const distances = scene?.selectedDistanceById;
+  if (!selectedId || !distances?.size) return [];
+  const maxDistance = cloudSelectedLodDistanceLimit(scale);
+  const cacheKey = [
+    selectedId,
+    maxDistance,
+    scene.nodesById?.size || 0,
+    distances.size,
+  ].join("|");
+  const cache = scene.selectedLodCandidateCache || (scene.selectedLodCandidateCache = new Map());
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+  const rows = [];
+  for (const [nodeId, entry] of distances.entries()) {
+    const node = scene.nodesById.get(nodeId);
+    if (!node) continue;
+    const distance = Number(entry?.selected_distance);
+    if (!Number.isFinite(distance) || distance > maxDistance) continue;
+    rows.push({
+      nodeId,
+      distance,
+      focus: Number(entry?.selected_focus_score) || 0,
+      priority: Number(node.priority) || 0,
+      lodRank: Number.isFinite(Number(node.lod_rank)) ? Number(node.lod_rank) : 999999,
+      title: node.label || node.wikipedia_title || "",
+    });
   }
+  rows.sort((a, b) => (
+    (a.nodeId === selectedId ? 0 : 1) - (b.nodeId === selectedId ? 0 : 1) ||
+    a.distance - b.distance ||
+    b.focus - a.focus ||
+    a.lodRank - b.lodRank ||
+    b.priority - a.priority ||
+    a.title.localeCompare(b.title)
+  ));
+  const result = rows.slice(0, 220).map(row => row.nodeId);
+  cache.set(cacheKey, result);
+  return result;
+}
 
+function cloudOrderedLodIds(primaryIds, candidateIds, scene = cloudScene) {
   const orderedIds = [];
   const queuedIds = new Set();
   const addOrderedId = nodeId => {
@@ -12697,15 +12943,25 @@ function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
     queuedIds.add(nodeId);
     orderedIds.push(nodeId);
   };
-  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
-    addOrderedId(lodSelectedGenreId);
-  }
+  const selectedId = cloudLodSelectedGenreId();
+  if (selectedId && scene?.nodesById?.has(selectedId)) addOrderedId(selectedId);
   addOrderedId(ROOT_KEY);
-  for (const nodeId of layerIds) {
-    if (candidateIds.has(nodeId)) addOrderedId(nodeId);
+  for (const nodeId of cloudSelectedLodCandidateIds(scene)) addOrderedId(nodeId);
+  for (const nodeId of primaryIds || []) {
+    if (!candidateIds || candidateIds.has(nodeId)) addOrderedId(nodeId);
   }
-  for (const nodeId of candidateIds) addOrderedId(nodeId);
+  for (const nodeId of candidateIds || []) addOrderedId(nodeId);
+  return orderedIds;
+}
 
+function cloudResolveLodTargetFromIds({
+  orderedIds,
+  candidateIds,
+  layerIds,
+  source,
+  scene = cloudScene,
+}) {
+  const lodSelectedGenreId = cloudLodSelectedGenreId();
   const nextNodeIds = new Set();
   const occupiedBuckets = new Map();
   let hiddenForViewport = 0;
@@ -12730,7 +12986,6 @@ function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
     nextNodeIds.add(node.id);
     cloudOccupyRect(rect, occupiedBuckets, node);
   }
-
   return {
     nextNodeIds,
     candidateIds,
@@ -12738,8 +12993,46 @@ function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayer
     hiddenForViewport,
     hiddenForOverlap,
     missingCandidates,
-    source: "client_overlap",
+    source,
   };
+}
+
+function cloudPacketLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const packetCandidateIds = cloudTilePacketCandidateIds(scene, activeScale);
+  if (!packetCandidateIds) return null;
+  const layerIds = cloudActiveLayerIds(scene, activeScale);
+  for (const nodeId of cloudSelectedLodCandidateIds(scene)) packetCandidateIds.add(nodeId);
+  packetCandidateIds.add(ROOT_KEY);
+  const selectedId = cloudLodSelectedGenreId();
+  if (selectedId && scene?.nodesById?.has(selectedId)) packetCandidateIds.add(selectedId);
+  return cloudResolveLodTargetFromIds({
+    orderedIds: cloudOrderedLodIds(layerIds, packetCandidateIds, scene),
+    candidateIds: packetCandidateIds,
+    layerIds,
+    source: "packet_tiles",
+    scene,
+  });
+}
+
+function cloudClientLodTarget(scene = cloudScene, activeScale = cloudActiveLayerScale(scene)) {
+  const packetTarget = cloudPacketLodTarget(scene, activeScale);
+  if (packetTarget) return packetTarget;
+  const lodSelectedGenreId = cloudLodSelectedGenreId();
+  const layerIds = cloudActiveLayerIds(scene, activeScale);
+  const candidateIds = cloudViewportCandidateIds(scene, activeScale);
+  candidateIds.add(ROOT_KEY);
+  for (const nodeId of cloudSelectedLodCandidateIds(scene)) candidateIds.add(nodeId);
+  if (lodSelectedGenreId && scene?.nodesById?.has(lodSelectedGenreId)) {
+    candidateIds.add(lodSelectedGenreId);
+  }
+
+  return cloudResolveLodTargetFromIds({
+    orderedIds: cloudOrderedLodIds(layerIds, candidateIds, scene),
+    candidateIds,
+    layerIds,
+    source: "client_overlap",
+    scene,
+  });
 }
 
 function cloudBackgroundNodeColor(node) {
@@ -13361,6 +13654,7 @@ function cloudNodeRelationshipTargetAlpha(node) {
   const relationshipGenreId = cloudRelationshipSelectedGenreId();
   if (!relationshipGenreId || relationshipGenreId === ROOT_KEY) return 1;
   if (!node?.id || node.id === relationshipGenreId) return 1;
+  if (node.selected_distance == null) return CLOUD_RELATIONSHIP_ALPHA_FLOOR;
   const distance = Number(node.selected_distance);
   if (!Number.isFinite(distance)) return CLOUD_RELATIONSHIP_ALPHA_FLOOR;
   const progress = clamp(distance / CLOUD_RELATIONSHIP_ALPHA_DISTANCE_STEPS, 0, 1);
@@ -13374,30 +13668,18 @@ function cloudNodeRelationshipTargetAlpha(node) {
 }
 
 function cloudRelationshipSelectedGenreId() {
-  if (cloudRelationshipSwitchPending()) {
-    return cloudAtlasSelectedGenreId(cloudScene?.atlasSignature);
-  }
   return cloudScene?.stats?.selected_genre_id || cloudSelectedGenreId || null;
 }
 
 function cloudLodSelectedGenreId() {
-  if (cloudRelationshipSwitchPending()) {
-    return cloudAtlasSelectedGenreId(cloudScene?.atlasSignature);
-  }
   return cloudSelectedGenreId || null;
 }
 
-function cloudRelationshipSwitchPending() {
+function cloudAtlasSwitchPending() {
   return Boolean(
     cloudScene?.pendingAtlasSignature &&
     cloudScene.pendingAtlasSignature !== cloudScene.atlasSignature
   );
-}
-
-function cloudNodeRelationshipAlpha(node, now = performance.now()) {
-  const fade = cloudRelationshipAlphaById.get(String(node?.id || ""));
-  if (!fade) return cloudNodeRelationshipTargetAlpha(node);
-  return clamp(cloudCanvasFadeAlpha(fade, now), 0, 1);
 }
 
 function cloudSelectedMarkerColor(node, fallbackColor = "") {
@@ -13770,14 +14052,12 @@ function resizeCloudCanvas() {
 function updateCloudCanvasFadeTargets(nodes, options = {}) {
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : performance.now();
   const noFade = Boolean(options.noFade) || prefersReducedMotion();
-  const targetIds = new Set(nodes.map(node => String(node.id)));
   const signature = cloudRenderTargetSignature(nodes);
-  cloudCanvasAlphaById.clear();
-  cloudCanvasVisibleIds = targetIds;
   applyCloudPresentationTargets(nodes, {
     noFade,
     now,
     signature,
+    dropExiting: Boolean(options.dropExiting),
   });
 }
 
@@ -13849,7 +14129,7 @@ function cloudPendingRelationshipTargetAlpha(nodeId, node) {
 function updateCloudSelectedPresentationOnly(genreId = cloudSelectedGenreId, options = {}) {
   const selectedId = String(genreId || "");
   const now = Number.isFinite(Number(options.now)) ? Number(options.now) : performance.now();
-  const dimCurrentNodes = Boolean(selectedId && (options.dimCurrentNodes || cloudRelationshipSwitchPending()));
+  const dimCurrentNodes = Boolean(selectedId && (options.dimCurrentNodes || cloudAtlasSwitchPending()));
   if (cloudPresentationById.size) stepCloudPresentation(now);
   if (!cloudPresentationLastAt) cloudPresentationLastAt = now;
   let needsFrame = false;
@@ -13895,10 +14175,17 @@ function updateCloudSelectedPresentationOnly(genreId = cloudSelectedGenreId, opt
 function applyCloudPresentationTargets(nodes, options = {}) {
   const now = Number(options.now) || performance.now();
   const noFade = Boolean(options.noFade);
+  const dropExiting = Boolean(options.dropExiting);
   const targetIds = new Set();
   let needsFrame = false;
   if (cloudPresentationById.size) stepCloudPresentation(now);
   if (!cloudPresentationLastAt) cloudPresentationLastAt = now;
+  const signature = options.signature || "";
+  if (!noFade && signature && cloudPresentationTargetSignature && signature !== cloudPresentationTargetSignature) {
+    for (const [nodeId, record] of cloudPresentationById.entries()) {
+      if (record.active === false) cloudPresentationById.delete(nodeId);
+    }
+  }
 
   for (const node of nodes || []) {
     if (!node?.id) continue;
@@ -13980,6 +14267,10 @@ function applyCloudPresentationTargets(nodes, options = {}) {
 
   for (const [nodeId, record] of cloudPresentationById.entries()) {
     if (targetIds.has(nodeId)) continue;
+    if (dropExiting) {
+      cloudPresentationById.delete(nodeId);
+      continue;
+    }
     record.active = false;
     record.targetAlpha = 0;
     record.targetSelectedAlpha = 0;
@@ -14001,9 +14292,7 @@ function applyCloudPresentationTargets(nodes, options = {}) {
     }
   }
 
-  cloudPresentationTargetSignature = options.signature || "";
-  cloudRenderTransition = null;
-  cloudRenderSnapshot = null;
+  cloudPresentationTargetSignature = signature;
   if (needsFrame && !noFade) scheduleCloudFade();
 }
 
@@ -14033,6 +14322,7 @@ function stepCloudPresentation(now = performance.now()) {
   const dt = Math.min(64, Math.max(0, now - previousAt || 16));
   cloudPresentationLastAt = now;
   let active = false;
+  const reduceMotion = prefersReducedMotion();
   for (const [nodeId, record] of cloudPresentationById.entries()) {
     const alphaDuration = Number(record.targetAlpha || 0) < Number(record.alpha || 0)
       ? Number(record.fadeOutMs || CLOUD_CANVAS_FADE_OUT_MS)
@@ -14040,21 +14330,29 @@ function stepCloudPresentation(now = performance.now()) {
     const alphaStep = clamp(dt / Math.max(1, alphaDuration), 0, 1);
     const selectedStep = clamp(dt / Math.max(1, CLOUD_CANVAS_TRANSITION_MS), 0, 1);
     const relationshipStep = clamp(dt / Math.max(1, CLOUD_RELATIONSHIP_ALPHA_FADE_MS), 0, 1);
-    record.alpha = cloudPresentationApproach(record.alpha, record.targetAlpha, alphaStep);
-    record.selectedAlpha = cloudPresentationApproach(record.selectedAlpha, record.targetSelectedAlpha, selectedStep);
-    record.relationshipAlpha = cloudPresentationApproach(record.relationshipAlpha, record.targetRelationshipAlpha, relationshipStep);
-    record.currentX = cloudPresentationPositionValue(
-      record.fromX ?? record.currentX ?? record.node?.x,
-      record.targetX ?? record.node?.x,
-      record.positionStartedAt,
-      now,
-    );
-    record.currentY = cloudPresentationPositionValue(
-      record.fromY ?? record.currentY ?? record.node?.y,
-      record.targetY ?? record.node?.y,
-      record.positionStartedAt,
-      now,
-    );
+    if (reduceMotion) {
+      record.alpha = record.targetAlpha;
+      record.selectedAlpha = record.targetSelectedAlpha;
+      record.relationshipAlpha = record.targetRelationshipAlpha;
+      record.currentX = Number(record.targetX ?? record.currentX ?? record.node?.x ?? 0);
+      record.currentY = Number(record.targetY ?? record.currentY ?? record.node?.y ?? 0);
+    } else {
+      record.alpha = cloudPresentationApproach(record.alpha, record.targetAlpha, alphaStep);
+      record.selectedAlpha = cloudPresentationApproach(record.selectedAlpha, record.targetSelectedAlpha, selectedStep);
+      record.relationshipAlpha = cloudPresentationApproach(record.relationshipAlpha, record.targetRelationshipAlpha, relationshipStep);
+      record.currentX = cloudPresentationPositionValue(
+        record.fromX ?? record.currentX ?? record.node?.x,
+        record.targetX ?? record.node?.x,
+        record.positionStartedAt,
+        now,
+      );
+      record.currentY = cloudPresentationPositionValue(
+        record.fromY ?? record.currentY ?? record.node?.y,
+        record.targetY ?? record.node?.y,
+        record.positionStartedAt,
+        now,
+      );
+    }
     const positionAnimating = Math.hypot(
       Number(record.currentX || 0) - Number(record.targetX ?? record.currentX ?? 0),
       Number(record.currentY || 0) - Number(record.targetY ?? record.currentY ?? 0),
@@ -14081,7 +14379,6 @@ function stepCloudPresentation(now = performance.now()) {
       cloudPresentationById.delete(nodeId);
     }
   }
-  cloudRenderSnapshot = null;
   return active;
 }
 
@@ -14104,148 +14401,55 @@ function cloudRenderTargetSignature(nodes) {
   ].join("|");
 }
 
-function cloudBuildRenderSnapshot(nodes, signature = cloudRenderTargetSignature(nodes), alpha = 1) {
-  const entriesById = new Map();
-  for (const node of nodes) {
-    if (!node?.id) continue;
-    const nodeId = String(node.id);
-    entriesById.set(nodeId, {
-      node,
-      alpha,
-      relationshipAlpha: cloudNodeRelationshipTargetAlpha(node),
-      selectedAlpha: nodeId === String(cloudSelectedGenreId || "") ? 1 : 0,
-    });
-  }
-  return {
-    signature,
-    entriesById,
-  };
-}
-
-function cloudBuildLodRenderTargetSnapshot(nodes, signature, fromSnapshot) {
-  const snapshot = cloudBuildRenderSnapshot(nodes, signature, 1);
-  const targetIds = new Set(nodes.map(node => String(node.id)));
-  for (const [nodeId, entry] of fromSnapshot?.entriesById?.entries?.() || []) {
-    if (targetIds.has(nodeId)) continue;
-    snapshot.entriesById.set(nodeId, {
-      node: entry.node,
-      alpha: 0,
-      relationshipAlpha: entry.relationshipAlpha,
-      selectedAlpha: 0,
-      fadingOut: true,
-    });
-  }
-  return snapshot;
-}
-
-function cloudPrunedRenderSnapshot(snapshot) {
-  if (!snapshot?.entriesById) return snapshot;
-  const entriesById = new Map();
-  for (const [nodeId, entry] of snapshot.entriesById.entries()) {
-    if (Number(entry.alpha) <= 0.01 && Number(entry.selectedAlpha || 0) <= 0.01) continue;
-    entriesById.set(nodeId, entry);
-  }
-  return {
-    ...snapshot,
-    entriesById,
-  };
-}
-
-function cloudRenderTransitionProgress(now = performance.now()) {
-  if (!cloudRenderTransition) return 1;
-  const duration = Math.max(1, Number(cloudRenderTransition.duration) || 1);
-  const progress = clamp((now - Number(cloudRenderTransition.startedAt || 0)) / duration, 0, 1);
-  return easeInOutCubic(progress);
-}
-
-function cloudResolvedRenderEntry(nodeId, now = performance.now()) {
-  const id = String(nodeId);
-  if (!cloudRenderTransition) {
-    return cloudRenderSnapshot?.entriesById?.get(id) || null;
-  }
-  const progress = cloudRenderTransitionProgress(now);
-  const fromEntry = cloudRenderTransition.from.entriesById.get(id);
-  const toEntry = cloudRenderTransition.to.entriesById.get(id);
-  if (!fromEntry && !toEntry) return null;
-  const fromAlpha = Number(fromEntry?.alpha ?? 0);
-  const toAlpha = Number(toEntry?.alpha ?? 0);
-  const fromRelationshipAlpha = Number(fromEntry?.relationshipAlpha ?? toEntry?.relationshipAlpha ?? 1);
-  const toRelationshipAlpha = Number(toEntry?.relationshipAlpha ?? fromEntry?.relationshipAlpha ?? 1);
-  const fromSelectedAlpha = Number(fromEntry?.selectedAlpha ?? 0);
-  const toSelectedAlpha = Number(toEntry?.selectedAlpha ?? 0);
-  return {
-    node: toEntry?.node || fromEntry?.node,
-    alpha: fromAlpha + (toAlpha - fromAlpha) * progress,
-    relationshipAlpha: fromRelationshipAlpha + (toRelationshipAlpha - fromRelationshipAlpha) * progress,
-    selectedAlpha: fromSelectedAlpha + (toSelectedAlpha - fromSelectedAlpha) * progress,
-  };
-}
-
 function cloudCurrentRenderEntries(now = performance.now()) {
-  if (cloudPresentationById.size) {
-    const exitingEntries = [];
-    const activeEntries = [];
-    for (const record of cloudPresentationById.values()) {
-      const entry = cloudPresentationRecordEntry(record);
-      if (!entry || (entry.alpha <= 0.01 && entry.selectedAlpha <= 0.01)) continue;
-      if (entry.active) activeEntries.push(entry);
-      else exitingEntries.push(entry);
+  const exitingEntries = [];
+  const activeEntries = [];
+  for (const record of cloudPresentationById.values()) {
+    const entry = cloudPresentationRecordEntry(record);
+    if (!entry || (entry.alpha <= 0.01 && entry.selectedAlpha <= 0.01)) continue;
+    if (entry.active) activeEntries.push(entry);
+    else exitingEntries.push(entry);
+  }
+  return [...exitingEntries, ...activeEntries];
+}
+
+function markCloudTransition(label, detail = {}) {
+  if (!cloudFrameDebug || typeof cloudFrameDebug !== "object") return;
+  const now = performance.now();
+  cloudFrameDebug.marks = [
+    ...(cloudFrameDebug.marks || []),
+    {
+      label,
+      at: Math.round(now),
+      sinceSelection: cloudFrameDebug.lastSelectionStartedAt
+        ? Math.round(now - cloudFrameDebug.lastSelectionStartedAt)
+        : null,
+      ...detail,
+    },
+  ].slice(-18);
+}
+
+function beginCloudSelectionTrace(genreId) {
+  cloudFrameDebug.lastSelectionStartedAt = performance.now();
+  cloudFrameDebug.marks = [];
+  markCloudTransition("selection_start", { genreId });
+}
+
+function visibleSvgCloudNodeCount() {
+  let count = 0;
+  for (const el of document.querySelectorAll("#nodes-layer > .cloud-node")) {
+    const style = getComputedStyle(el);
+    if (style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0.01) {
+      count += 1;
     }
-    return [...exitingEntries, ...activeEntries];
   }
-  if (!cloudRenderTransition) {
-    return Array.from(cloudRenderSnapshot?.entriesById?.values?.() || []);
-  }
-  const ids = new Set([
-    ...cloudRenderTransition.from.entriesById.keys(),
-    ...cloudRenderTransition.to.entriesById.keys(),
-  ]);
-  const entries = [];
-  for (const nodeId of ids) {
-    const entry = cloudResolvedRenderEntry(nodeId, now);
-    if (entry && (entry.alpha > 0.01 || entry.selectedAlpha > 0.01)) entries.push(entry);
-  }
-  return entries;
+  return count;
 }
 
-function cloudMaterializedRenderSnapshot(now = performance.now()) {
-  const entriesById = new Map();
-  for (const entry of cloudCurrentRenderEntries(now)) {
-    entriesById.set(String(entry.node.id), {
-      node: entry.node,
-      alpha: entry.alpha,
-      relationshipAlpha: entry.relationshipAlpha,
-      selectedAlpha: entry.selectedAlpha,
-    });
-  }
-  return {
-    signature: `materialized:${now}`,
-    entriesById,
-  };
-}
-
-function stepCloudRenderTransition(now = performance.now()) {
-  if (!cloudRenderTransition) return false;
-  const progress = cloudRenderTransitionProgress(now);
-  if (progress < 0.999) return true;
-  cloudRenderSnapshot = cloudPrunedRenderSnapshot(cloudRenderTransition.to);
-  cloudRenderTransition = null;
-  return false;
-}
-
-function cloudCanvasNodeAlpha(nodeId, now = performance.now()) {
+function cloudCanvasNodeAlpha(nodeId) {
   const record = cloudPresentationById.get(String(nodeId));
   if (record) return clamp(Number(record.alpha) || 0, 0, 1);
-  const entry = cloudResolvedRenderEntry(String(nodeId), now);
-  return entry ? entry.alpha : 0;
-}
-
-function updateCloudSelectedLabelFadeTargets(nodes) {
-  cloudSelectedLabelAlphaById.clear();
-}
-
-function startCloudSelectedLabelFade(nodeId, now = performance.now()) {
-  scheduleCloudCanvasRender();
+  return 0;
 }
 
 function updateCloudHoverUnderlineAlphaTargets(nodes) {
@@ -14318,45 +14522,21 @@ function stepCloudFadeMap(map, now, shouldDeleteSettled = () => false) {
 
 function stepCloudFades() {
   cloudFadeFrame = 0;
-  cloudCanvasFadeFrame = 0;
-  cloudSelectedLabelFadeFrame = 0;
-  cloudHoverUnderlineFadeFrame = 0;
-  cloudRelationshipFadeFrame = 0;
   if (!cloudMode) return;
   const now = performance.now();
   const activePresentation = cloudPresentationAnimating();
-  const activeRenderTransition = stepCloudRenderTransition(now);
-  const activeCanvas = stepCloudFadeMap(
-    cloudCanvasAlphaById,
-    now,
-    () => true
-  );
-  const activeSelected = stepCloudFadeMap(
-    cloudSelectedLabelAlphaById,
-    now,
-    fade => fade.target <= 0
-  );
   const activeHover = stepCloudFadeMap(
     cloudHoverUnderlineAlphaById,
     now,
     fade => fade.target <= 0
   );
-  const activeRelationship = stepCloudFadeMap(
-    cloudRelationshipAlphaById,
-    now,
-    fade => fade.target >= 0.995 && (!cloudSelectedGenreId || cloudSelectedGenreId === ROOT_KEY)
-  );
   const hasFadeState =
     cloudPresentationById.size ||
-    Boolean(cloudRenderTransition) ||
-    cloudCanvasAlphaById.size ||
-    cloudSelectedLabelAlphaById.size ||
-    cloudHoverUnderlineAlphaById.size ||
-    cloudRelationshipAlphaById.size;
-  if (hasFadeState || activePresentation || activeRenderTransition || activeCanvas || activeSelected || activeHover || activeRelationship) {
+    cloudHoverUnderlineAlphaById.size;
+  if (hasFadeState || activePresentation || activeHover) {
     scheduleCloudCanvasRender();
   }
-  if (activePresentation || activeRenderTransition || activeCanvas || activeSelected || activeHover || activeRelationship) {
+  if (activePresentation || activeHover) {
     scheduleCloudFade();
   }
 }
@@ -14364,20 +14544,12 @@ function stepCloudFades() {
 function scheduleCloudFade() {
   if (cloudFadeFrame || prefersReducedMotion()) return;
   cloudFadeFrame = requestAnimationFrame(stepCloudFades);
-  cloudCanvasFadeFrame = cloudFadeFrame;
-  cloudSelectedLabelFadeFrame = cloudFadeFrame;
-  cloudHoverUnderlineFadeFrame = cloudFadeFrame;
-  cloudRelationshipFadeFrame = cloudFadeFrame;
 }
 
 function cancelCloudFadeFrame() {
   if (!cloudFadeFrame) return;
   cancelAnimationFrame(cloudFadeFrame);
   cloudFadeFrame = 0;
-  cloudCanvasFadeFrame = 0;
-  cloudSelectedLabelFadeFrame = 0;
-  cloudHoverUnderlineFadeFrame = 0;
-  cloudRelationshipFadeFrame = 0;
 }
 
 function stepCloudHoverUnderlineFades() {
@@ -14388,60 +14560,33 @@ function scheduleCloudHoverUnderlineFade() {
   scheduleCloudFade();
 }
 
-function updateCloudRelationshipAlphaTargets(nodes) {
-  cloudRelationshipAlphaById.clear();
-}
-
-function cloudSelectedLabelAlpha(nodeId, now = performance.now()) {
-  const fade = cloudSelectedLabelAlphaById.get(String(nodeId));
-  if (!fade) return 0;
-  return clamp(cloudCanvasFadeAlpha(fade, now), 0, 1);
-}
-
-function stepCloudSelectedLabelFades() {
-  stepCloudFades();
-}
-
-function scheduleCloudSelectedLabelFade() {
-  scheduleCloudFade();
-}
-
-function stepCloudRelationshipFades() {
-  stepCloudFades();
-}
-
-function scheduleCloudRelationshipFade() {
-  scheduleCloudFade();
-}
-
-function stepCloudCanvasFades() {
-  stepCloudFades();
-}
-
-function scheduleCloudCanvasFade() {
-  scheduleCloudFade();
-}
-
 function cloudDrawableNodes(now = performance.now()) {
   return cloudDrawableEntries(now).map(entry => entry.node);
 }
 
 function cloudDrawableEntries(now = performance.now()) {
-  const entries = [];
-  const seen = new Set();
+  const entriesById = new Map();
+  const entryPriority = entry => {
+    if (!entry) return 0;
+    let priority = entry.active === false ? 1 : 2;
+    if (String(entry.node?.id || "") === String(cloudSelectedGenreId || "")) priority += 3;
+    if (Number(entry.selectedAlpha || 0) > 0.01) priority += 1;
+    return priority;
+  };
   const addEntry = entry => {
     const node = entry?.node;
     if (!node?.id) return;
     const nodeId = String(node.id);
-    if (seen.has(nodeId)) return;
     const selectedAlpha = clamp(Number(entry.selectedAlpha) || 0, 0, 1);
     const hoverAlpha = cloudHoverUnderlineAlpha(nodeId, now);
     if (entry.alpha <= 0.01 && selectedAlpha <= 0.01 && hoverAlpha <= 0.01) return;
-    seen.add(nodeId);
-    entries.push(entry);
+    const existing = entriesById.get(nodeId);
+    if (!existing || entryPriority(entry) >= entryPriority(existing)) {
+      entriesById.set(nodeId, entry);
+    }
   };
   for (const entry of cloudCurrentRenderEntries(now)) addEntry(entry);
-  if (cloudSelectedGenreId && !seen.has(String(cloudSelectedGenreId))) {
+  if (cloudSelectedGenreId && !entriesById.has(String(cloudSelectedGenreId))) {
     const node = cloudScene?.nodesById?.get(cloudSelectedGenreId);
     if (node) {
       addEntry({
@@ -14449,10 +14594,11 @@ function cloudDrawableEntries(now = performance.now()) {
         alpha: 0,
         relationshipAlpha: cloudNodeRelationshipTargetAlpha(node),
         selectedAlpha: 1,
+        active: true,
       });
     }
   }
-  return entries;
+  return Array.from(entriesById.values());
 }
 
 function renderCloudCanvasNow(frameNow = performance.now()) {
@@ -14480,8 +14626,6 @@ function renderCloudCanvasNow(frameNow = performance.now()) {
   if (
     !cloudCanvasNodes.length &&
     !cloudPresentationById.size &&
-    !cloudRenderSnapshot?.entriesById?.size &&
-    !cloudRenderTransition &&
     !selectedSceneNode
   ) {
     cloudCanvasHitNodes = [];
@@ -14576,6 +14720,7 @@ function renderCloudCanvasNow(frameNow = performance.now()) {
       node: selectedNode,
       alpha: 0,
       relationshipAlpha: cloudNodeRelationshipTargetAlpha(selectedNode),
+      selectedAlpha: 1,
     });
   }
   cloudSelectedMarker = null;
@@ -14586,20 +14731,35 @@ function renderCloudCanvasNow(frameNow = performance.now()) {
 	  if (window.__wikiGenresCloudCullDebug) {
 	    const presentationDelta = cloudPresentationMaxDelta();
 	    const exitingPresentationNodes = drawableEntries.length - activeDrawableEntries.length;
-	    window.__wikiGenresCloudCullDebug.canvasFadeNodes = cloudCanvasAlphaById.size;
+	    window.__wikiGenresCloudCullDebug.canvasFadeNodes = 0;
 	    window.__wikiGenresCloudCullDebug.presentationNodes = cloudPresentationById.size;
 	    window.__wikiGenresCloudCullDebug.exitingPresentationNodes = exitingPresentationNodes;
 	    window.__wikiGenresCloudCullDebug.presentationDelta = presentationDelta;
 	    window.__wikiGenresCloudCullDebug.drawableNodes = drawableEntries.length;
+    window.__wikiGenresCloudCullDebug.cloudFrame = {
+      candidateEntries: drawableEntries.length,
+      duplicateEntries: 0,
+      duplicateIds: [],
+      visibleSvgCloudNodes: cloudFrameDebug.visibleSvgCloudNodes,
+      marks: cloudFrameDebug.marks || [],
+    };
     window.__wikiGenresCloudCullDebug.canvasHitNodes = cloudCanvasHitNodes.length;
     window.__wikiGenresCloudCullDebug.clickEnabled = cloudCanClickNodes();
     window.__wikiGenresCloudCullDebug.hoveredNodeId = cloudHoveredNodeId;
     window.__wikiGenresCloudCullDebug.selectedMarker = null;
-    window.__wikiGenresCloudCullDebug.renderTransitionActive = presentationDelta > CLOUD_PRESENTATION_EPSILON || Boolean(cloudRenderTransition);
-    window.__wikiGenresCloudCullDebug.renderTransitionProgress = cloudRenderTransition
-      ? cloudRenderTransitionProgress(now)
-      : 1 - clamp(presentationDelta, 0, 1);
+    window.__wikiGenresCloudCullDebug.renderTransitionActive = presentationDelta > CLOUD_PRESENTATION_EPSILON;
+    window.__wikiGenresCloudCullDebug.renderTransitionProgress = 1 - clamp(presentationDelta, 0, 1);
     window.__wikiGenresCloudCullDebug.renderMs = performance.now() - renderStartedAt;
+  }
+  if (
+    cloudFrameDebug.lastSelectionStartedAt &&
+    !(cloudFrameDebug.marks || []).some(mark => mark.label === "first_canvas_paint")
+  ) {
+    markCloudTransition("first_canvas_paint", {
+      drawableNodes: drawableEntries.length,
+      duplicateEntries: 0,
+      renderMs: Math.round((performance.now() - renderStartedAt) * 10) / 10,
+    });
   }
 }
 
@@ -14666,9 +14826,13 @@ function mergeCloudLayerSnapshot(snapshot, options = {}) {
       ...cloudScene.stats,
       ...(data.stats || {}),
     };
+    syncCloudSelectionStats();
     if (applyCloudBackgroundPacket(data.background)) {
       scheduleCloudCanvasRender();
-      if (cloudInitialRenderPending) finishCloudInitialLoadingAfterPaint();
+      if (cloudInitialRenderPending) {
+        updateCloudLodVisibility({ immediate: true, allowPendingAtlas: true });
+        finishCloudInitialLoadingAfterPaint();
+      }
     }
     cloudData = {
       ...data,
@@ -14688,49 +14852,53 @@ function mergeCloudLayerSnapshot(snapshot, options = {}) {
     ...cloudScene.stats,
     ...(data.stats || {}),
   };
+  syncCloudSelectionStats();
   const layer = data.stream?.layer || `tier:${data.stream?.lod_tier ?? "unknown"}`;
   const tier = Number.isFinite(Number(data.stream?.lod_tier)) ? Number(data.stream.lod_tier) : 0;
   const layerIds = cloudScene.layersByTier.get(tier) || new Set();
   for (const node of data.nodes || []) {
-    cloudScene.nodesById.set(node.id, node);
-    layerIds.add(node.id);
+    const nextNode = cloudApplySelectionFieldsToNode(node);
+    cloudScene.nodesById.set(nextNode.id, nextNode);
+    layerIds.add(nextNode.id);
   }
   cloudScene.layersByTier.set(tier, layerIds);
   if (data.stream?.kind === "scale_layer") {
     const scale = Number(data.stream.scale);
     if (Number.isFinite(scale)) {
       let ids = cloudScene.layerIdsByScale.get(scale);
-      if (!ids) {
+      if (data.stream.replace) {
+        ids = new Set();
+      } else if (!ids) {
         const previousScales = cloudSortedLayerScales(cloudScene).filter(existingScale => existingScale < scale);
         const previousScale = previousScales.length ? previousScales[previousScales.length - 1] : null;
         ids = new Set(previousScale == null ? [] : cloudScene.layerIdsByScale.get(previousScale) || []);
       }
-	      const addIds = data.stream.delta
-	        ? data.stream.add_node_ids || data.stream.visible_node_ids || []
-	        : data.stream.visible_node_ids || [];
-	      for (const nodeId of addIds) ids.add(String(nodeId));
-	      for (const nodeId of data.stream.remove_node_ids || []) ids.delete(String(nodeId));
-	      for (const node of data.nodes || []) ids.add(String(node.id));
-	      cloudScene.layerIdsByScale.set(scale, ids);
-	      cloudScene.layerSpatialByScale?.delete(scale);
-	      if (Array.isArray(data.stream.tiles) && data.stream.tiles.length) {
-	        const cells = new Map();
-	        for (const tile of data.stream.tiles) {
-	          const tileX = Number(tile?.x);
-	          const tileY = Number(tile?.y);
-	          if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) continue;
-	          const nodeIds = Array.isArray(tile?.node_ids)
-	            ? tile.node_ids.map(nodeId => String(nodeId))
-	            : [];
-	          cells.set(`${tileX}:${tileY}`, nodeIds);
-	        }
-	        cloudScene.layerTilesByScale?.set(scale, {
-	          scale,
-	          tileSize: Number(data.stream.tile_size) || CLOUD_DOM_WINDOW_TILE_PX,
-	          cells,
-	        });
-	      }
-	      cloudScene.layerScales = [];
+      const addIds = data.stream.delta
+        ? data.stream.add_node_ids || data.stream.visible_node_ids || []
+        : data.stream.visible_node_ids || [];
+      for (const nodeId of addIds) ids.add(String(nodeId));
+      for (const nodeId of data.stream.remove_node_ids || []) ids.delete(String(nodeId));
+      for (const node of data.nodes || []) ids.add(String(node.id));
+      cloudScene.layerIdsByScale.set(scale, ids);
+      cloudScene.layerSpatialByScale?.delete(scale);
+      if (Array.isArray(data.stream.tiles) && data.stream.tiles.length) {
+        const cells = new Map();
+        for (const tile of data.stream.tiles) {
+          const tileX = Number(tile?.x);
+          const tileY = Number(tile?.y);
+          if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) continue;
+          const nodeIds = Array.isArray(tile?.node_ids)
+            ? tile.node_ids.map(nodeId => String(nodeId))
+            : [];
+          cells.set(`${tileX}:${tileY}`, nodeIds);
+        }
+        cloudScene.layerTilesByScale?.set(scale, {
+          scale,
+          tileSize: Number(data.stream.tile_size) || CLOUD_DOM_WINDOW_TILE_PX,
+          cells,
+        });
+      }
+      cloudScene.layerScales = [];
       cloudScene.layerScales = cloudSortedLayerScales(cloudScene);
       cloudScene.awaitingScaleLayer = !cloudActiveLayerCaughtUp(cloudScene);
     }
@@ -14942,21 +15110,21 @@ function updateCloudLodVisibility(options = {}) {
     cloudRenderFrame = null;
     if (!cloudMode || !cloudScene) return;
     prepareCloudSceneDom();
-    const selectionAtlasPending = cloudRelationshipSwitchPending();
-    const selectedAtlasCatchingUp = Boolean(
-      !selectionAtlasPending &&
+    const atlasSwitchPending = cloudAtlasSwitchPending();
+    const atlasCatchingUp = Boolean(
+      !atlasSwitchPending &&
       cloudScene.awaitingScaleLayer &&
       !cloudActiveLayerCaughtUp(cloudScene)
     );
-    if ((selectionAtlasPending || selectedAtlasCatchingUp) && !options.allowPendingAtlas) {
+    if ((atlasSwitchPending || atlasCatchingUp) && !options.allowPendingAtlas) {
       updateCloudSelectedPresentationOnly(cloudSelectedGenreId, { now });
       cloudRenderedTextScale = viewScale;
       if (window.__wikiGenresCloudCullDebug) {
         window.__wikiGenresCloudCullDebug = {
           ...window.__wikiGenresCloudCullDebug,
           zoom: viewScale,
-          selectionAtlasPending: true,
-          selectionAtlasCatchingUp: selectedAtlasCatchingUp,
+          atlasSwitchPending: true,
+          atlasCatchingUp,
           pendingAtlasSignature: cloudScene.pendingAtlasSignature || "",
           presentationDelta: cloudPresentationMaxDelta(),
         };
@@ -14997,6 +15165,17 @@ function updateCloudLodVisibility(options = {}) {
 	    const total = cloudScene.stats?.total_nodes || cloudScene.nodesById.size;
 	    const loaded = cloudScene.nodesById.size;
 	    const activeLayerReady = cloudActiveLayerCaughtUp(cloudScene);
+    const selectedLodCandidateIds = cloudSelectedLodCandidateIds(cloudScene);
+    let visibleSelectedDistanceNodes = 0;
+    let visibleDimmedNodes = 0;
+    for (const nodeId of nextNodeIds) {
+      const node = cloudScene.nodesById.get(nodeId);
+      if (!node) continue;
+      if (node.selected_distance != null && Number.isFinite(Number(node.selected_distance))) {
+        visibleSelectedDistanceNodes += 1;
+      }
+      if (cloudNodeRelationshipTargetAlpha(node) < 0.9) visibleDimmedNodes += 1;
+    }
 	    window.__wikiGenresCloudCullDebug = {
       visible: nextNodeIds.size,
       total,
@@ -15011,26 +15190,28 @@ function updateCloudLodVisibility(options = {}) {
       windowSignature,
       renderBackend: "canvas",
 	      canvasNodes: nextNodeIds.size,
-	      canvasFadeNodes: cloudCanvasAlphaById.size,
+	      canvasFadeNodes: 0,
 	      loadedLayerScales: cloudSortedLayerScales(cloudScene),
 	      lodBaselineScale: cloudLodBaselineScale(),
 	      activeLayerReady,
 	      cloudLoading: cloudInitialRenderPending,
 	      lodTargetSource: lodTarget.source,
-	      selectionAtlasPending,
-	      pendingAtlasSignature: selectionAtlasPending ? cloudScene.pendingAtlasSignature : "",
+	      selectedLodCandidates: selectedLodCandidateIds.length,
+	      visibleSelectedDistanceNodes,
+	      visibleDimmedNodes,
+	      atlasSwitchPending,
+	      pendingAtlasSignature: atlasSwitchPending ? cloudScene.pendingAtlasSignature : "",
 	    };
     cloudCanvasNodes = Array.from(nextNodeIds)
       .map(nodeId => cloudScene.nodesById.get(nodeId))
       .filter(Boolean);
     updateCloudCanvasFadeTargets(cloudCanvasNodes, {
       noFade: options.noFade || cloudInitialRenderPending,
+      dropExiting: Boolean(options.dropExiting),
       now,
     });
     const drawableNodes = cloudDrawableNodes();
-    updateCloudSelectedLabelFadeTargets(drawableNodes);
     updateCloudHoverUnderlineAlphaTargets(drawableNodes);
-    updateCloudRelationshipAlphaTargets(drawableNodes);
     cloudRenderedLayerScale = activeLayerScale;
     cloudRenderedTextScale = viewScale;
     cloudRenderedWindowSignature = windowSignature;
@@ -15050,11 +15231,24 @@ function updateCloudNodeScale() {
   if (Math.abs(cloudRenderedTextScale - viewScale) < 0.0005) return;
   cloudRenderedTextScale = viewScale;
 	  if (cloudCanvasNodes.length) {
-	    updateCloudSelectedLabelFadeTargets(cloudCanvasNodes);
 	    updateCloudHoverUnderlineAlphaTargets(cloudCanvasNodes);
-	    updateCloudRelationshipAlphaTargets(cloudCanvasNodes);
 	  }
   scheduleCloudCanvasRender();
+}
+
+function shouldRenderCloudStreamSnapshot(data, hasRenderedSnapshot) {
+  if (!hasRenderedSnapshot) return true;
+  const kind = data?.stream?.kind || "";
+  if (kind === "background") return true;
+  if (kind === "catalog") return !cloudScene?.layerIdsByScale?.size;
+  if (kind !== "scale_layer") return true;
+  const snapshotScale = Number(data.stream.scale);
+  const activeScale = cloudActiveLayerScale(cloudScene);
+  return (
+    Number.isFinite(snapshotScale) &&
+    Number.isFinite(activeScale) &&
+    Math.abs(snapshotScale - activeScale) < 0.0001
+  );
 }
 
 async function loadCloudMode(options = {}) {
@@ -15080,24 +15274,42 @@ async function loadCloudMode(options = {}) {
   let fittedInitialView = false;
   let renderedInitialSnapshot = false;
   prepareCloudSceneForReload({ ...options, atlasSignature });
+  markCloudTransition("stream_start", {
+    atlasSignature,
+    initial: Boolean(options.initial),
+    preserveView: Boolean(options.preserveView),
+    scale: Math.round(viewScale * 10000) / 10000,
+  });
   try {
     await streamNdjson(cloudStreamUrl(), {
       signal: controller.signal,
       onSnapshot: snapshot => {
         if (token !== cloudRequestToken || !cloudMode) return;
         const data = mergeCloudLayerSnapshot(snapshot, { atlasSignature });
+        if (data?.stream?.kind === "scale_layer" && cloudActiveLayerCaughtUp(cloudScene)) {
+          markCloudTransition("active_layer_received", {
+            scale: data.stream.scale,
+            nodes: Array.isArray(data.nodes) ? data.nodes.length : 0,
+          });
+        }
         if (options.initial && !fittedInitialView) {
           fitCloudView(cloudData, {
             selectedGenreId: cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY
               ? cloudSelectedGenreId
-              : null,
+            : null,
           });
           fittedInitialView = true;
         }
-        updateCloudLodVisibility({
-          noFade: options.noFade,
-          immediate: !renderedInitialSnapshot,
-        });
+        if (shouldRenderCloudStreamSnapshot(data, renderedInitialSnapshot)) {
+          updateCloudLodVisibility({
+            noFade: options.noFade,
+            immediate: !renderedInitialSnapshot,
+          });
+          markCloudTransition("lod_visibility_requested", {
+            kind: data?.stream?.kind || "",
+            immediate: !renderedInitialSnapshot,
+          });
+        }
         renderedInitialSnapshot = true;
       },
     });
@@ -15121,7 +15333,10 @@ async function loadCloudMode(options = {}) {
       resetCloudScene(data.stats || {});
       cloudScene.atlasSignature = atlasSignature;
       cloudScene.pendingAtlasSignature = "";
-      for (const node of data.nodes || []) cloudScene.nodesById.set(node.id, node);
+      for (const node of data.nodes || []) {
+        const nextNode = cloudApplySelectionFieldsToNode(node);
+        cloudScene.nodesById.set(nextNode.id, nextNode);
+      }
       cloudScene.complete = true;
       cloudNodeById = cloudScene.nodesById;
       cloudData = data;
@@ -15172,7 +15387,7 @@ async function loadCloudMode(options = {}) {
   };
 }
 
-function scheduleCloudFetch(delay = 90) {
+function scheduleCloudFetch(delay = 90, options = {}) {
   if (!cloudMode) return;
   const signature = cloudAtlasSignature();
   if (cloudScene?.complete && signature === cloudLastFetchSignature) {
@@ -15184,11 +15399,23 @@ function scheduleCloudFetch(delay = 90) {
   if (cloudStreamController) {
     cloudQueuedFetch = true;
     cloudQueuedFetchSignature = signature;
+    if (options.abortActive || signature !== cloudLastFetchSignature) {
+      cloudStreamController.abort();
+    }
     return;
   }
-  if (cloudFetchTimer) return;
+  if (cloudFetchTimer) {
+    if (options.immediate || signature !== cloudLastFetchSignature) {
+      window.clearTimeout(cloudFetchTimer);
+      cloudFetchTimer = 0;
+    } else {
+      return;
+    }
+  }
   const elapsed = Date.now() - cloudLastFetchAt;
-  const wait = Math.max(delay, 280 - elapsed, 0);
+  const wait = options.immediate || signature !== cloudLastFetchSignature
+    ? Math.max(delay, 0)
+    : Math.max(delay, 280 - elapsed, 0);
   cloudFetchTimer = window.setTimeout(() => {
     cloudFetchTimer = 0;
     void loadCloudMode({ preserveView: true }).catch(err => {
@@ -15200,35 +15427,38 @@ function scheduleCloudFetch(delay = 90) {
 
 async function openCloudGenre(genreId, options = {}) {
   if (!genreId) return;
+  beginCloudSelectionTrace(genreId);
   if (cloudSelectedGenreId === genreId && genreId !== ROOT_KEY && !options.forceOpen) {
     cloudSelectedGenreId = null;
-    resetCloudScaleLayersForSignature();
+    clearCloudSelectionOverlay();
     setDetailCardNodeKey(null);
     hoverCardToken++;
     setStatus("");
     updateDetailCardVisibility();
     updateUrlState({ push: true });
-    updateCloudLodVisibility({ immediate: true });
-    scheduleCloudFetch(0);
+    updateCloudSelectedPresentationOnly(null);
+    updateCloudLodVisibility({ immediate: true, allowPendingAtlas: true });
     void updateMapCard(nodes.get(ROOT_KEY));
     return;
   }
   allowDetailCardForManualSelection();
   cloudSelectedGenreId = genreId;
-  startCloudSelectedLabelFade(genreId);
-  resetCloudScaleLayersForSignature();
   setDetailCardNodeKey(detailKeyForCloudNodeId(genreId));
   updateDetailCardVisibility();
   updateUrlState({ push: true });
   updateCloudSelectedPresentationOnly(genreId, { dimCurrentNodes: true });
+  void loadCloudSelectionOverlay(genreId);
   const cloudNode = cloudNodeById.get(genreId);
   if (cloudNode) {
     updateCard(cloudNodeFromPayload(cloudNode));
     updateYoutubeCardForSelection(cloudNodeFromPayload(cloudNode));
   }
   panToSelectedCenterTarget({ holdDetailCard: true });
-  scheduleCloudFetch(0);
+  if (!cloudScene?.nodesById?.size || (!cloudScene.complete && !cloudStreamController)) {
+    scheduleCloudFetch(0, { immediate: true });
+  }
   if (genreId === ROOT_KEY) {
+    clearCloudSelectionOverlay();
     void updateMapCard(nodes.get(ROOT_KEY));
     return;
   }
@@ -15254,7 +15484,6 @@ function openRegionalCloud(item) {
   cloudRootGenreId = null;
   cloudRegionId = item.region_id;
   cloudSelectedGenreId = item.genre_id;
-  startCloudSelectedLabelFade(item.genre_id);
   setDetailCardNodeKey(detailKeyForCloudNodeId(item.genre_id));
   updateUrlState({ push: true });
   void loadCloudMode({ initial: true }).then(() => {
@@ -15301,11 +15530,7 @@ function setCloudMode(enabled, options = {}) {
   cloudMode = wantsCloud;
   document.body.classList.toggle("cloud-mode", cloudMode);
   updateManualUiDimClass();
-  cloudToggleButton?.classList.remove("active");
-  setModeButtonState(cloudToggleButton, cloudMode
-    ? { icon: "polyline", label: "Graph", ariaLabel: "Return to graph" }
-    : { icon: "mist", label: "Cloud", ariaLabel: "Open word cloud" }
-  );
+  syncModeToggleButtons();
   if (cloudMode) {
     if (panAnimTimer) {
       clearInterval(panAnimTimer);
@@ -15371,18 +15596,12 @@ function setCloudMode(enabled, options = {}) {
 	    cloudRenderedLayerScale = null;
 	    cloudRenderedTextScale = 0;
 	    cloudRenderedWindowSignature = "";
-		    cloudCanvasNodes = [];
-			    cloudCanvasHitNodes = [];
-			    cloudCanvasVisibleIds = new Set();
-			    cloudCanvasAlphaById = new Map();
-			    cloudRenderSnapshot = null;
-			    cloudRenderTransition = null;
-			    cloudPresentationById = new Map();
-			    cloudPresentationLastAt = 0;
-			    cloudPresentationTargetSignature = "";
-				    cloudSelectedLabelAlphaById = new Map();
-			    cloudHoverUnderlineAlphaById = new Map();
-			    cloudRelationshipAlphaById = new Map();
+	    cloudCanvasNodes = [];
+	    cloudCanvasHitNodes = [];
+	    cloudPresentationById = new Map();
+	    cloudPresentationLastAt = 0;
+	    cloudPresentationTargetSignature = "";
+	    cloudHoverUnderlineAlphaById = new Map();
 	    cancelCloudFadeFrame();
 	    clearCloudBackgroundCache();
 	    cloudLabelSpriteCache = new Map();
@@ -15394,28 +15613,17 @@ function setCloudMode(enabled, options = {}) {
 	    window.clearTimeout(cloudClickEnableTimer);
 	    cloudClickEnableTimer = 0;
 	    syncCloudClickAffordance();
-	    if (cloudCanvasFadeFrame) {
-	      cancelAnimationFrame(cloudCanvasFadeFrame);
-	      cloudCanvasFadeFrame = 0;
-	    }
-		    if (cloudSelectedLabelFadeFrame) {
-		      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
-		      cloudSelectedLabelFadeFrame = 0;
-		    }
-		    if (cloudHoverUnderlineFadeFrame) {
-		      cancelAnimationFrame(cloudHoverUnderlineFadeFrame);
-		      cloudHoverUnderlineFadeFrame = 0;
-		    }
-		    if (cloudRelationshipFadeFrame) {
-		      cancelAnimationFrame(cloudRelationshipFadeFrame);
-		      cloudRelationshipFadeFrame = 0;
-		    }
 	    scheduleCloudCanvasRender();
 	    window.clearTimeout(cloudFetchTimer);
 	    cloudFetchTimer = 0;
 	    cloudQueuedFetch = false;
 	    cloudQueuedFetchSignature = "";
 	    cloudRequestToken += 1;
+	    cloudSelectionToken += 1;
+	    if (cloudSelectionController) {
+	      cloudSelectionController.abort();
+	      cloudSelectionController = null;
+	    }
 	    if (cloudStreamController) {
 	      cloudStreamController.abort();
 	      cloudStreamController = null;
@@ -15424,8 +15632,9 @@ function setCloudMode(enabled, options = {}) {
 	      cancelAnimationFrame(cloudRenderFrame);
 	      cloudRenderFrame = null;
 	    }
-	    document.body.classList.remove("cloud-mode");
-	    restoreGraphLayoutForModeExit();
+    document.body.classList.remove("cloud-mode");
+    syncModeToggleButtons();
+    restoreGraphLayoutForModeExit();
 	    viewScale = defaultScale();
 	    const cur = nodes.get(currentKey) || nodes.get(ROOT_KEY);
 	    if (cur) {
@@ -15463,17 +15672,12 @@ function setTimelineMode(enabled, options = {}) {
     cloudRenderedLayerScale = null;
     cloudRenderedTextScale = 0;
     cloudRenderedWindowSignature = "";
-	    cloudCanvasNodes = [];
-	    cloudCanvasHitNodes = [];
-	    cloudCanvasVisibleIds = new Set();
-	    cloudCanvasAlphaById = new Map();
-	    cloudRenderSnapshot = null;
-	    cloudRenderTransition = null;
-	    cloudPresentationById = new Map();
-	    cloudPresentationLastAt = 0;
-	    cloudPresentationTargetSignature = "";
-	    cloudSelectedLabelAlphaById = new Map();
-	    cloudRelationshipAlphaById = new Map();
+    cloudCanvasNodes = [];
+    cloudCanvasHitNodes = [];
+    cloudPresentationById = new Map();
+    cloudPresentationLastAt = 0;
+    cloudPresentationTargetSignature = "";
+    cloudHoverUnderlineAlphaById = new Map();
     cancelCloudFadeFrame();
     clearCloudBackgroundCache();
     cloudLabelSpriteCache = new Map();
@@ -15485,40 +15689,29 @@ function setTimelineMode(enabled, options = {}) {
     window.clearTimeout(cloudClickEnableTimer);
     cloudClickEnableTimer = 0;
     syncCloudClickAffordance();
-    if (cloudCanvasFadeFrame) {
-      cancelAnimationFrame(cloudCanvasFadeFrame);
-      cloudCanvasFadeFrame = 0;
-    }
-    if (cloudSelectedLabelFadeFrame) {
-      cancelAnimationFrame(cloudSelectedLabelFadeFrame);
-      cloudSelectedLabelFadeFrame = 0;
-    }
-    if (cloudRelationshipFadeFrame) {
-      cancelAnimationFrame(cloudRelationshipFadeFrame);
-      cloudRelationshipFadeFrame = 0;
-    }
     scheduleCloudCanvasRender();
     window.clearTimeout(cloudFetchTimer);
     cloudFetchTimer = 0;
     cloudQueuedFetch = false;
     cloudQueuedFetchSignature = "";
+    cloudSelectionToken += 1;
+    if (cloudSelectionController) {
+      cloudSelectionController.abort();
+      cloudSelectionController = null;
+    }
     if (cloudStreamController) {
       cloudStreamController.abort();
       cloudStreamController = null;
     }
     document.body.classList.remove("cloud-mode");
-    cloudToggleButton?.classList.remove("active");
+    syncModeToggleButtons();
   }
   const timelineSelectedBeforeExit = timelineSelectedGenreId || selectedBeforeSwap || null;
 
   timelineMode = Boolean(enabled);
   document.body.classList.toggle("timeline-mode", timelineMode);
   if (timelinePanel) timelinePanel.hidden = true;
-  timelineToggleButton?.classList.remove("active");
-  setModeButtonState(timelineToggleButton, timelineMode
-    ? { icon: "scatterPlot", label: "Graph", ariaLabel: "Return to graph" }
-    : { icon: "clockArrowDown", label: "Timeline", ariaLabel: "Open timeline map" }
-  );
+  syncModeToggleButtons();
   if (timelineMode) {
     // Stop any in-flight camera motion from graph mode so timeline opens at
     // a stable default.
@@ -18063,8 +18256,7 @@ async function init() {
     followMode = false;
     viewScale = defaultScale();
     placeRoot();
-    setModeButtonState(cloudToggleButton, { icon: "mist", label: "Cloud", ariaLabel: "Open word cloud" });
-    setModeButtonState(timelineToggleButton, { icon: "clockArrowDown", label: "Timeline", ariaLabel: "Open timeline map" });
+    syncModeToggleButtons();
     await expand(ROOT_KEY);
     let restored = false;
     if (!wantsTimeline && !wantsCloud) {
@@ -18151,7 +18343,6 @@ async function applyModeFromUrl(resolvedState = resolvedExplorerUrlState()) {
     cloudRootGenreId = cloudRoot;
     cloudRegionId = cloudRegion;
     cloudSelectedGenreId = selectedCloud || cloudRoot || null;
-    if (cloudSelectedGenreId && cloudSelectedGenreId !== ROOT_KEY) startCloudSelectedLabelFade(cloudSelectedGenreId);
     void loadCloudMode({ initial: true }).then(() => {
       if (!cloudMode) return;
       if (cloudSelectedGenreId) {
@@ -18215,14 +18406,14 @@ async function applyModeFromUrl(resolvedState = resolvedExplorerUrlState()) {
 }
 
 window.addEventListener("resize", () => {
-  resizeCloudCanvas();
   refitMapAutoView({ animate: false });
   if (cloudMode) {
     cloudRenderedWindowSignature = "";
-    updateCloudLodVisibility();
+    updateCloudLodVisibility({ immediate: true });
     syncYoutubeVolumePanelPosition();
     return;
   }
+  resizeCloudCanvas();
   recomputeLayout();
   fullRender();
   rebuildSim();
@@ -18363,6 +18554,8 @@ function setMobilePanel(panel) {
   document.body.classList.remove("mobile-map-active");
   mobileDetailTab?.classList.toggle("active", !showRadio);
   mobileMapTab?.classList.toggle("active", showRadio);
+  mobileDetailTab?.setAttribute("aria-pressed", String(!showRadio));
+  mobileMapTab?.setAttribute("aria-pressed", String(showRadio));
   updateDetailCardVisibility();
 }
 
@@ -18495,8 +18688,15 @@ youtubeCloseButton?.addEventListener("click", () => {
 randomGenreButton?.addEventListener("click", () => {
   void openRandomTraversableGenre();
 });
+graphToggleButton?.addEventListener("click", () => {
+  if (timelineMode) {
+    setTimelineMode(false);
+  } else if (cloudMode) {
+    setCloudMode(false);
+  }
+});
 cloudToggleButton?.addEventListener("click", () => {
-  setCloudMode(!cloudMode);
+  if (!cloudMode) setCloudMode(true);
 });
 setYoutubeVolume(youtubeVolume, { persist: false });
 youtubeVolumeControl?.addEventListener("pointerenter", openYoutubeVolumePanel);
@@ -18788,6 +18988,7 @@ mapWorldButton?.addEventListener("click", event => {
   }
   mapDisplayedWorldOverride = true;
   const node = currentMapNodeForMode();
+  mapDisplayedWorldOverrideKey = node?.key || null;
   void updateMapCard(node);
 });
 mapListButton?.addEventListener("click", event => {
@@ -18838,7 +19039,7 @@ cardCloseButton?.addEventListener("pointerdown", event => {
 });
 cardCloseButton?.addEventListener("click", closeDetailFromButton);
 timelineToggleButton?.addEventListener("click", () => {
-  setTimelineMode(!timelineMode);
+  if (!timelineMode) setTimelineMode(true);
 });
 timelineCloseButton?.addEventListener("click", () => {
   setTimelineMode(false);

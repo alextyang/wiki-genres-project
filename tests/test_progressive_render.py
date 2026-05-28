@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+import wiki_genres.api.routes.render as render_routes
 from wiki_genres.api.routes.render import (
     _cloud_background_packet,
     _cloud_snapshots,
@@ -21,12 +26,21 @@ def test_cloud_snapshots_are_layered_and_prioritized() -> None:
         "stats": {"total_nodes": 4},
     }
 
-    snapshots = _cloud_snapshots(data, selected_genre_id="selected", chunk_size=2)
+    snapshots = _cloud_snapshots(
+        data,
+        selected_genre_id="selected",
+        chunk_size=2,
+        preferred_scale=0.12,
+    )
 
     assert {node["id"] for node in snapshots[0]["nodes"]} == {"__music_root__", "selected"}
     assert snapshots[0]["stream"]["atlas"] is True
-    assert snapshots[0]["stream"]["kind"] == "catalog"
-    assert snapshots[1]["stream"]["kind"] == "catalog"
+    assert snapshots[0]["stream"]["kind"] == "scale_layer"
+    assert snapshots[0]["stream"]["replace"] is True
+    catalog_snapshots = [
+        snapshot for snapshot in snapshots if snapshot["stream"].get("kind") == "catalog"
+    ]
+    assert catalog_snapshots[0]["stream"]["kind"] == "catalog"
     scale_snapshots = [
         snapshot for snapshot in snapshots if snapshot["stream"].get("kind") == "scale_layer"
     ]
@@ -50,6 +64,33 @@ def test_cloud_snapshots_are_layered_and_prioritized() -> None:
     }
     assert snapshots[-1]["stream"]["complete"] is True
     assert snapshots[-1]["stats"]["scale_layers"][-1] == {"scale": 1.0, "nodes": 4}
+
+
+def test_cloud_base_snapshots_ignore_selection_metadata_without_selected_context() -> None:
+    data = {
+        "nodes": [
+            {"id": "selected", "label": "Selected", "selected_distance": 0, "lod_tier": 5, "lod_rank": 50, "lod_score": 0},
+            {"id": "__music_root__", "label": "Music", "lod_tier": 0, "lod_rank": -1, "lod_score": 1},
+            {"id": "high", "label": "High", "selected_distance": 1, "lod_tier": 0, "lod_rank": 0, "lod_score": 1},
+        ],
+        "stats": {"total_nodes": 3},
+    }
+
+    snapshots = _cloud_snapshots(
+        data,
+        selected_genre_id=None,
+        chunk_size=3,
+        preferred_scale=0.12,
+    )
+
+    catalog_snapshot = next(
+        snapshot for snapshot in snapshots if snapshot["stream"].get("kind") == "catalog"
+    )
+    assert [node["id"] for node in catalog_snapshot["nodes"]] == [
+        "__music_root__",
+        "high",
+        "selected",
+    ]
 
 
 def test_cloud_snapshots_keep_anchors_before_selected_relationship_tiers() -> None:
@@ -129,9 +170,17 @@ def test_cloud_snapshots_keep_anchors_before_selected_relationship_tiers() -> No
         "stats": {"total_nodes": 6},
     }
 
-    snapshots = _cloud_snapshots(data, selected_genre_id="selected", chunk_size=5)
+    snapshots = _cloud_snapshots(
+        data,
+        selected_genre_id="selected",
+        chunk_size=5,
+        preferred_scale=0.12,
+    )
 
-    assert [node["id"] for node in snapshots[0]["nodes"]] == [
+    catalog_snapshot = next(
+        snapshot for snapshot in snapshots if snapshot["stream"].get("kind") == "catalog"
+    )
+    assert [node["id"] for node in catalog_snapshot["nodes"]] == [
         "selected",
         "__music_root__",
         "direct-over-root",
@@ -150,6 +199,60 @@ def test_cloud_snapshots_keep_anchors_before_selected_relationship_tiers() -> No
         for node_id in tile["node_ids"]
     }
     assert first_layer_tile_ids == set(first_scale_snapshot["stream"]["add_node_ids"])
+
+
+@pytest.mark.asyncio
+async def test_cloud_stream_ignores_deprecated_selected_genre_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_get_genre_cloud(**kwargs):
+        captured.update(kwargs)
+        return {
+            "nodes": [
+                {
+                    "id": "__music_root__",
+                    "label": "Music",
+                    "x": 0,
+                    "y": 0,
+                    "box_width": 80,
+                    "box_height": 28,
+                    "lod_tier": 0,
+                    "lod_rank": -1,
+                    "lod_score": 1,
+                }
+            ],
+            "stats": {"total_nodes": 1},
+        }
+
+    monkeypatch.setattr(render_routes, "get_genre_cloud", fake_get_genre_cloud)
+
+    response = await render_routes.stream_cloud_render(
+        limit=5000,
+        x_min=None,
+        x_max=None,
+        y_min=None,
+        y_max=None,
+        selected_genre_id="selected",
+        chunk_size=25,
+        scale=0.12,
+        view_tx=0,
+        view_ty=0,
+        root_genre_id=None,
+        region_id=None,
+        width=320,
+        height=240,
+    )
+
+    snapshots = []
+    async for chunk in response.body_iterator:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+        packet = json.loads(text)
+        if packet.get("type") == "snapshot":
+            snapshots.append(packet)
+            break
+
+    assert captured["selected_genre_id"] is None
+    assert snapshots
 
 
 def test_cloud_background_packet_contains_server_rgba_field() -> None:

@@ -40,3 +40,5 @@ Thumbs.db
 postgres-data/
 src/wiki_genres/api/static/generated/cloud-backgrounds/
 .venv/
+exports/
+db_snapshots/

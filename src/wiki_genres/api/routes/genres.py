@@ -58,6 +58,43 @@ RELATED_RELATION = "related_genre"
 MUSIC_ROOT_ID = "__music_root__"
 REGIONAL_SCENE_RELATION = "regional_scene"
 REGIONAL_SCENE_EVIDENCE_RELATION = "regional_scene_of"
+_CLOUD_BASE_CACHE_LIMIT = 8
+_CLOUD_EDGE_CACHE_LIMIT = 8
+_CLOUD_BASE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+_CLOUD_EDGE_CACHE: dict[str, list[dict[str, Any]]] = {}
+
+
+def _remember_limited_cache(cache: dict[Any, Any], key: Any, value: Any, limit: int) -> None:
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > limit:
+        cache.pop(next(iter(cache)))
+
+
+async def _cached_cloud_semantic_edges(layout_key: str) -> list[dict[str, Any]]:
+    cached = _CLOUD_EDGE_CACHE.get(layout_key)
+    if cached is not None:
+        return cached
+    async with session_scope() as session:
+        rows = (
+            (
+                await session.execute(
+                    text("""
+                        SELECT from_genre_id, to_genre_id, weight
+                        FROM wg_genre_semantic_edges
+                        WHERE layout_key = :layout_key
+                    """),
+                    {"layout_key": layout_key},
+                )
+            )
+            .mappings()
+            .fetchall()
+        )
+    edges = [dict(row) for row in rows]
+    _remember_limited_cache(_CLOUD_EDGE_CACHE, layout_key, edges, _CLOUD_EDGE_CACHE_LIMIT)
+    return edges
+
+
 REGION_PARENT_RELATIONS = (
     *DISPLAY_RELATIONS,
     REGIONAL_SCENE_RELATION,
@@ -2977,6 +3014,69 @@ async def get_genre_cloud(
 ) -> GenreCloudResult:
     """Server-culled label cloud for the current explorer viewport."""
     layout_key = layout_key_for_root(root_genre_id, region_id=region_id)
+    base_cache_key = (layout_key, root_genre_id or "", region_id or "")
+    base_data = _CLOUD_BASE_CACHE.get(base_cache_key)
+    if base_data is not None:
+        semantic_edges = (
+            await _cached_cloud_semantic_edges(layout_key)
+            if selected_genre_id and selected_genre_id != _CLOUD_ROOT_ID
+            else []
+        )
+        distance_map = _cloud_selected_distance_map(
+            semantic_edges,
+            selected_genre_id=selected_genre_id,
+        )
+        laid_out = _apply_cloud_selected_distances(base_data["laid_out"], distance_map)
+        radial_layout = base_data["layout_source"] in {"radial_compacted", "cloud_display_cache"}
+        center_id = base_data["center_id"]
+        if atlas:
+            visible_nodes = _viewport_cloud_nodes(
+                laid_out,
+                x_min=None,
+                x_max=None,
+                y_min=None,
+                y_max=None,
+                scale=scale,
+                selected_genre_id=selected_genre_id or root_genre_id or center_id,
+                limit=limit,
+            )
+        else:
+            visible_nodes = _cull_cloud_nodes(
+                laid_out,
+                x_min=x_min,
+                x_max=x_max,
+                y_min=y_min,
+                y_max=y_max,
+                scale=scale,
+                view_tx=view_tx,
+                view_ty=view_ty,
+                selected_genre_id=selected_genre_id or root_genre_id or center_id,
+                limit=None if radial_layout and not atlas else limit,
+            )
+        return GenreCloudResult(
+            nodes=[GenreCloudNodeOut(**node) for node in visible_nodes],
+            stats={
+                "nodes": len(visible_nodes),
+                "total_nodes": len(laid_out),
+                "bounds": base_data["bounds"],
+                "layout_key": layout_key,
+                "layout_source": base_data["layout_source"],
+                "region_id": region_id,
+                "center_genre_id": center_id if center_id != _CLOUD_ROOT_ID else None,
+                "display_cache_nodes": base_data["display_cache_nodes"],
+                "materialized_nodes": base_data["materialized_nodes"],
+                "radial_nodes": base_data["radial_nodes"],
+                "selected_genre_id": selected_genre_id,
+                "selected_distance_nodes": len(distance_map),
+                "lod": {
+                    "scale": scale,
+                    "score_version": "stable-lod-v1",
+                    "atlas": atlas,
+                    "radial_layout": radial_layout,
+                    "base_cache": "hit",
+                },
+            },
+        )
     async with session_scope() as session:
         if region_id:
             rows = await _region_cloud_rows(session, region_id=region_id)
@@ -3160,6 +3260,12 @@ async def get_genre_cloud(
                 .mappings()
                 .fetchall()
             )
+            _remember_limited_cache(
+                _CLOUD_EDGE_CACHE,
+                layout_key,
+                [dict(row) for row in semantic_edges],
+                _CLOUD_EDGE_CACHE_LIMIT,
+            )
 
     row_dicts = [dict(row) for row in rows]
     display_dicts = [dict(row) for row in display_rows]
@@ -3226,8 +3332,22 @@ async def get_genre_cloud(
             )
             materialized_applied = 0
             radial_applied = 0
-    laid_out = _apply_cloud_selected_distances(laid_out, distance_map)
     bounds = _cloud_bounds(laid_out)
+    _remember_limited_cache(
+        _CLOUD_BASE_CACHE,
+        base_cache_key,
+        {
+            "laid_out": laid_out,
+            "bounds": bounds,
+            "layout_source": layout_source,
+            "center_id": center_id,
+            "display_cache_nodes": len(display_dicts),
+            "materialized_nodes": materialized_applied,
+            "radial_nodes": radial_applied,
+        },
+        _CLOUD_BASE_CACHE_LIMIT,
+    )
+    laid_out = _apply_cloud_selected_distances(laid_out, distance_map)
     radial_layout = layout_source in {"radial_compacted", "cloud_display_cache"}
     if atlas:
         visible_nodes = _viewport_cloud_nodes(
@@ -3282,6 +3402,42 @@ async def get_genre_cloud(
             },
         },
     )
+
+
+@router.get("/cloud/selection")
+async def get_genre_cloud_selection(
+    selected_genre_id: str = Query(..., min_length=1),
+    root_genre_id: str | None = Query(None),
+    region_id: str | None = Query(None),
+) -> dict[str, Any]:
+    """Relationship-distance overlay for an already-loaded cloud layout."""
+    layout_key = layout_key_for_root(root_genre_id, region_id=region_id)
+    semantic_edges = (
+        await _cached_cloud_semantic_edges(layout_key)
+        if selected_genre_id and selected_genre_id != _CLOUD_ROOT_ID
+        else []
+    )
+    distance_map = _cloud_selected_distance_map(
+        semantic_edges,
+        selected_genre_id=selected_genre_id,
+    )
+    nodes = [
+        {
+            "id": genre_id,
+            "selected_distance": int(distance["distance"]),
+            "selected_focus_score": float(distance["score"]),
+        }
+        for genre_id, distance in distance_map.items()
+    ]
+    return {
+        "selected_genre_id": selected_genre_id,
+        "layout_key": layout_key,
+        "nodes": nodes,
+        "stats": {
+            "selected_genre_id": selected_genre_id,
+            "selected_distance_nodes": len(nodes),
+        },
+    }
 
 
 # ------------------------------------------------------------------ #

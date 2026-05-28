@@ -1066,6 +1066,57 @@ def _cloud_layer_tiles(
     ]
 
 
+def _cloud_atlas_scale_for_view(scale: float | None) -> float:
+    if not isinstance(scale, int | float) or not math.isfinite(scale):
+        return _CLOUD_ATLAS_SCALES[-1]
+    clamped = _clamp_float(float(scale), _CLOUD_ATLAS_SCALES[0], _CLOUD_ATLAS_SCALES[-1])
+    eligible = [atlas_scale for atlas_scale in _CLOUD_ATLAS_SCALES if atlas_scale <= clamped + 1e-9]
+    return eligible[-1] if eligible else _CLOUD_ATLAS_SCALES[0]
+
+
+def _cloud_prioritized_atlas_scales(preferred_scale: float | None) -> tuple[float, ...]:
+    active_scale = _cloud_atlas_scale_for_view(preferred_scale)
+    remaining = [scale for scale in _CLOUD_ATLAS_SCALES if scale != active_scale]
+    return (active_scale, *sorted(remaining, key=lambda scale: (abs(scale - active_scale), scale)))
+
+
+def _cloud_scale_layer(
+    nodes: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    *,
+    scale: float,
+) -> dict[str, Any]:
+    if scale >= 1.0:
+        layer_ids = [str(node["id"]) for node in nodes if node.get("id") is not None]
+        return {
+            "scale": scale,
+            "node_ids": layer_ids,
+            "tile_size": _CLOUD_ATLAS_TILE_PX,
+            "tiles": _cloud_layer_tiles(nodes_by_id, layer_ids, scale=scale),
+        }
+
+    occupied = _CloudLayerSpatialIndex()
+    layer_ids: list[str] = []
+    layer_id_set: set[str] = set()
+    for node in nodes:
+        node_id = str(node.get("id"))
+        if node.get("id") is None or node_id in layer_id_set:
+            continue
+        rect = _cloud_scaled_rect(node, scale)
+        if occupied.collides(rect):
+            continue
+        occupied.add(rect)
+        layer_ids.append(node_id)
+        layer_id_set.add(node_id)
+
+    return {
+        "scale": scale,
+        "node_ids": layer_ids,
+        "tile_size": _CLOUD_ATLAS_TILE_PX,
+        "tiles": _cloud_layer_tiles(nodes_by_id, layer_ids, scale=scale),
+    }
+
+
 def _cloud_rects_overlap(
     a: tuple[float, float, float, float],
     b: tuple[float, float, float, float],
@@ -1863,8 +1914,16 @@ def _cloud_snapshots(
     *,
     selected_genre_id: str | None,
     chunk_size: int,
+    preferred_scale: float | None = None,
 ) -> list[dict[str, Any]]:
-    return list(_iter_cloud_snapshots(data, selected_genre_id=selected_genre_id, chunk_size=chunk_size))
+    return list(
+        _iter_cloud_snapshots(
+            data,
+            selected_genre_id=selected_genre_id,
+            chunk_size=chunk_size,
+            preferred_scale=preferred_scale,
+        )
+    )
 
 
 def _iter_cloud_snapshots(
@@ -1872,58 +1931,47 @@ def _iter_cloud_snapshots(
     *,
     selected_genre_id: str | None,
     chunk_size: int,
+    preferred_scale: float | None = None,
 ) -> Iterable[dict[str, Any]]:
     nodes = sorted(
-        list(data.get("nodes") or []),
+        data.get("nodes") or [],
         key=lambda node: _cloud_node_sort_key(node, selected_genre_id),
     )
     stats = dict(data.get("stats") or {})
+    nodes_by_id = {str(node["id"]): node for node in nodes if node.get("id") is not None}
+    scale_layer_counts: dict[float, int] = {}
     emitted = False
-    for start in range(0, len(nodes), chunk_size):
-        batch = nodes[start : start + chunk_size]
-        emitted = True
-        yield {
-            **data,
-            "nodes": batch,
-            "stats": {
-                **stats,
-                "stream_nodes": min(start + len(batch), len(nodes)),
-                "layer_nodes": len(batch),
-            },
-                "stream": {
-                    "atlas": True,
-                    "atlas_version": "cloud-render-atlas-v2",
-                    "kind": "catalog",
-                    "layer": "catalog",
-                    "complete": False,
-            },
+
+    def current_layer_stats() -> dict[str, Any]:
+        return {
+            **stats,
+            "scale_layers": [
+                {"scale": scale, "nodes": scale_layer_counts.get(scale, 0)}
+                for scale in _CLOUD_ATLAS_SCALES
+            ],
         }
 
-    scale_layers = _cloud_scale_layers(nodes, selected_genre_id=selected_genre_id)
-    layer_stats = {
-        **stats,
-        "scale_layers": [
-            {"scale": layer["scale"], "nodes": len(layer["node_ids"])}
-            for layer in scale_layers
-        ],
-    }
-
-    def scale_layer_snapshots(layer: dict[str, Any], previous_ids: set[str]) -> tuple[set[str], list[dict[str, Any]]]:
-        node_ids = layer["node_ids"]
-        layer_id_set = set(node_ids)
-        add_node_ids = [node_id for node_id in node_ids if node_id not in previous_ids]
-        remove_node_ids = sorted(previous_ids - layer_id_set)
+    def independent_scale_layer_snapshots(
+        layer: dict[str, Any],
+        *,
+        include_nodes: bool,
+    ) -> Iterable[dict[str, Any]]:
+        node_ids = [str(node_id) for node_id in layer["node_ids"]]
         scale = float(layer["scale"])
-        delta_ids = add_node_ids or []
-        snapshots: list[dict[str, Any]] = []
-        for start in range(0, max(1, len(delta_ids)), chunk_size):
-            batch_ids = delta_ids[start : start + chunk_size]
-            snapshots.append({
+        scale_layer_counts[scale] = len(node_ids)
+        for start in range(0, max(1, len(node_ids)), chunk_size):
+            batch_ids = node_ids[start : start + chunk_size]
+            batch_nodes = (
+                [nodes_by_id[node_id] for node_id in batch_ids if node_id in nodes_by_id]
+                if include_nodes
+                else []
+            )
+            yield {
                 **data,
-                "nodes": [],
+                "nodes": batch_nodes,
                 "stats": {
-                    **layer_stats,
-                    "stream_nodes": len(nodes),
+                    **current_layer_stats(),
+                    "stream_nodes": len(nodes_by_id),
                     "layer_nodes": len(batch_ids),
                 },
                 "stream": {
@@ -1935,23 +1983,50 @@ def _iter_cloud_snapshots(
                     "tile_size": layer.get("tile_size", _CLOUD_ATLAS_TILE_PX),
                     "tiles": layer.get("tiles", []) if start == 0 else [],
                     "delta": True,
-                    "base": not previous_ids,
+                    "base": start == 0,
+                    "replace": start == 0,
                     "add_node_ids": batch_ids,
-                    "remove_node_ids": remove_node_ids if start == 0 else [],
-                    "visible_node_ids": batch_ids if not previous_ids else [],
+                    "remove_node_ids": [],
+                    "visible_node_ids": batch_ids if start == 0 else [],
                     "total_visible_nodes": len(node_ids),
                     "complete": False,
                 },
-            })
-        return layer_id_set, snapshots
+            }
 
-    previous_layer_ids: set[str] = set()
-    for layer in scale_layers:
-        previous_layer_ids, layer_snapshots = scale_layer_snapshots(layer, previous_layer_ids)
-        for snapshot in layer_snapshots:
+    prioritized_scales = _cloud_prioritized_atlas_scales(preferred_scale)
+    active_scale = prioritized_scales[0] if prioritized_scales else _CLOUD_ATLAS_SCALES[-1]
+    active_layer = _cloud_scale_layer(nodes, nodes_by_id, scale=active_scale)
+    for snapshot in independent_scale_layer_snapshots(active_layer, include_nodes=True):
+        emitted = True
+        yield snapshot
+
+    for start in range(0, len(nodes), chunk_size):
+        batch = nodes[start : start + chunk_size]
+        emitted = True
+        yield {
+            **data,
+            "nodes": batch,
+            "stats": {
+                **current_layer_stats(),
+                "stream_nodes": min(start + len(batch), len(nodes)),
+                "layer_nodes": len(batch),
+            },
+            "stream": {
+                "atlas": True,
+                "atlas_version": "cloud-render-atlas-v2",
+                "kind": "catalog",
+                "layer": "catalog",
+                "complete": False,
+            },
+        }
+
+    for scale in prioritized_scales[1:]:
+        layer = _cloud_scale_layer(nodes, nodes_by_id, scale=scale)
+        for snapshot in independent_scale_layer_snapshots(layer, include_nodes=False):
             emitted = True
             yield snapshot
 
+    layer_stats = current_layer_stats()
     if not emitted:
         yield {
             **data,
@@ -2009,7 +2084,10 @@ async def stream_cloud_render(
     view_ty: float = Query(0.0),
     root_genre_id: str | None = Query(None),
     region_id: str | None = Query(None),
-    selected_genre_id: str | None = Query(None),
+    selected_genre_id: str | None = Query(
+        None,
+        description="Deprecated for cloud streams; selection metadata is delivered by /v1/genres/cloud/selection.",
+    ),
     width: float | None = Query(None, ge=1),
     height: float | None = Query(None, ge=1),
     chunk_size: int = Query(120, ge=25, le=500),
@@ -2036,12 +2114,17 @@ async def stream_cloud_render(
             view_ty=view_ty,
             root_genre_id=root_genre_id,
             region_id=region_id,
-            selected_genre_id=selected_genre_id,
+            selected_genre_id=None,
             atlas=True,
         )
         data = jsonable_encoder(result)
         count = 0
-        for snapshot in _iter_cloud_snapshots(data, selected_genre_id=selected_genre_id, chunk_size=chunk_size):
+        for snapshot in _iter_cloud_snapshots(
+            data,
+            selected_genre_id=None,
+            chunk_size=chunk_size,
+            preferred_scale=scale,
+        ):
             yield _line({
                 "type": "snapshot",
                 "mode": "cloud",
